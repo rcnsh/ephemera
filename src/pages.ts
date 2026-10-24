@@ -2,8 +2,10 @@ import { contentType, type PageFile, validateBundle } from "./files.ts";
 import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
 
 /**
- * The page store. D1 holds one row per page; R2 holds its files under
- * `pages/<id>/<version>/<path>`. A page is live until it's deleted or its
+ * The page store. D1 holds one row per page and one per version it keeps;
+ * R2 holds the files under `pages/<id>/<version>/<path>`. Updating a page
+ * adds a version and keeps the last `LIMITS.keptVersions`; rolling back
+ * points the page at an older one. A page is live until it's deleted or its
  * `expires_at` passes (NULL means permanent). After that it's "gone": the
  * Worker answers 410 for `LIMITS.goneGrace`, the sweep purges its files, and
  * once the grace period is over the row is dropped and the id answers 404.
@@ -24,8 +26,25 @@ interface PageRow {
 	expires_at: number | null;
 	deleted_at: number | null;
 	version: number;
+	latest_version: number;
 	size: number;
 	file_count: number;
+}
+
+interface VersionRow {
+	version: number;
+	created_at: number;
+	size: number;
+	file_count: number;
+}
+
+export interface Version {
+	version: number;
+	createdAt: number;
+	size: number;
+	fileCount: number;
+	/** The version the page is serving. */
+	current: boolean;
 }
 
 export interface Page {
@@ -37,14 +56,17 @@ export interface Page {
 	/** Null for permanent pages. */
 	expiresAt: number | null;
 	permanent: boolean;
+	/** Of the version being served. */
 	size: number;
 	fileCount: number;
 	version: number;
+	latestVersion: number;
 }
 
 export interface Usage {
 	temporaryPages: number;
 	permanentPages: number;
+	/** Every kept version of every live page. */
 	bytes: number;
 }
 
@@ -52,6 +74,8 @@ export type Lookup = { state: "live"; page: Page } | { state: "gone" } | { state
 
 const LIVE = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)";
 const GONE_AT = "COALESCE(deleted_at, expires_at)";
+/** Bytes stored for live pages, all their kept versions included. Takes `now`. */
+const STORED_BYTES = `SELECT COALESCE(SUM(versions.size), 0) FROM versions JOIN pages ON pages.id = versions.page_id WHERE ${LIVE}`;
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 export const ID_PATTERN = /^[a-z2-7]{12}$/;
@@ -73,6 +97,7 @@ function toPage(row: PageRow): Page {
 		size: row.size,
 		fileCount: row.file_count,
 		version: row.version,
+		latestVersion: row.latest_version,
 	};
 }
 
@@ -131,15 +156,16 @@ export class Pages {
 	}
 
 	async usage(): Promise<Usage> {
+		const now = this.now();
 		const row = await this.db
 			.prepare(
 				`SELECT
 					COUNT(CASE WHEN expires_at IS NOT NULL THEN 1 END) AS temporary,
 					COUNT(CASE WHEN expires_at IS NULL THEN 1 END) AS permanent,
-					COALESCE(SUM(size), 0) AS bytes
+					(${STORED_BYTES}) AS bytes
 				FROM pages WHERE ${LIVE}`,
 			)
-			.bind(this.now())
+			.bind(now, now)
 			.first<{ temporary: number; permanent: number; bytes: number }>();
 		return { temporaryPages: row!.temporary, permanentPages: row!.permanent, bytes: row!.bytes };
 	}
@@ -169,13 +195,13 @@ export class Pages {
 	/**
 	 * `checkRoom` as a SQL condition, for the statement that takes the room.
 	 * D1 runs one statement at a time, so two requests racing for the last
-	 * slot can't both get it. `except` leaves a page out of the byte count.
+	 * slot can't both get it.
 	 */
-	private roomFor(kind: "temporary" | "permanent" | null, extraBytes: number, except = ""): { sql: string; params: unknown[] } {
+	private roomFor(kind: "temporary" | "permanent" | null, extraBytes: number): { sql: string; params: unknown[] } {
 		const now = this.now();
 		const params: unknown[] = [];
-		let sql = `(SELECT COALESCE(SUM(size), 0) FROM pages WHERE ${LIVE} AND id != ?) + ? <= ?`;
-		params.push(now, except, extraBytes, LIMITS.totalBytes);
+		let sql = `(${STORED_BYTES}) + ? <= ?`;
+		params.push(now, extraBytes, LIMITS.totalBytes);
 		if (kind) {
 			const permanent = kind === "permanent" ? "IS NULL" : "IS NOT NULL";
 			sql += ` AND (SELECT COUNT(*) FROM pages WHERE ${LIVE} AND expires_at ${permanent}) < ?`;
@@ -220,20 +246,23 @@ export class Pages {
 			expires_at: input.ttl === "permanent" ? null : now + input.ttl,
 			deleted_at: null,
 			version: 1,
+			latest_version: 1,
 			size,
 			file_count: files.length,
 		};
 		try {
 			await this.writeFiles(row.id, row.version, files);
 			const room = this.roomFor(input.ttl === "permanent" ? "permanent" : "temporary", size);
-			const result = await this.db
-				.prepare(
-					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, size, file_count)
-					SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
-				)
-				.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.size, row.file_count, ...room.params)
-				.run();
-			if (result.meta.changes !== 1) {
+			const [result] = await this.db.batch([
+				this.db
+					.prepare(
+						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count)
+						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
+					)
+					.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.latest_version, row.size, row.file_count, ...room.params),
+				this.addVersion(row.id, row.version, now, size, files.length),
+			]);
+			if (result!.meta.changes !== 1) {
 				// Another publish took the room while the files were uploading.
 				await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
 				throw new PageError(409, "Out of room; try again");
@@ -245,19 +274,29 @@ export class Pages {
 		return toPage(row);
 	}
 
+	/** Records a version, if the page row it belongs to exists by then (it's batched after the write that creates or moves it). */
+	private addVersion(id: string, version: number, now: number, size: number, fileCount: number): D1PreparedStatement {
+		return this.db
+			.prepare(
+				`INSERT INTO versions (page_id, version, created_at, size, file_count)
+				SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM pages WHERE id = ? AND version = ?)`,
+			)
+			.bind(id, version, now, size, fileCount, id, version);
+	}
+
 	/**
-	 * Swaps a page's files in one step: the new version is written alongside
-	 * the old, the row is pointed at it, then the old version is deleted in
-	 * the background.
+	 * Adds a version and serves it, in one step: its files are written
+	 * alongside the old ones, then the row is pointed at it. Versions beyond
+	 * the last `LIMITS.keptVersions` are deleted in the background.
 	 */
 	async update(id: string, input: PageFile[]): Promise<Page> {
 		const { files, size } = validateBundle(input);
 		const page = await this.get(id);
 		const usage = await this.usage();
-		if (usage.bytes - page.size + size > LIMITS.totalBytes) {
+		if (usage.bytes + size > LIMITS.totalBytes) {
 			throw new PageError(507, `This update would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
 		}
-		const version = page.version + 1;
+		const version = page.latestVersion + 1;
 		try {
 			await this.writeFiles(id, version, files);
 		} catch (error) {
@@ -265,17 +304,81 @@ export class Pages {
 			throw error;
 		}
 		const now = this.now();
-		const room = this.roomFor(null, size, id);
-		const result = await this.db
-			.prepare(`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ? WHERE id = ? AND version = ? AND ${LIVE} AND ${room.sql}`)
-			.bind(version, size, files.length, now, id, page.version, now, ...room.params)
-			.run();
-		if (result.meta.changes !== 1) {
+		const room = this.roomFor(null, size);
+		const [result] = await this.db.batch([
+			this.db
+				.prepare(
+					`UPDATE pages SET version = ?, latest_version = ?, size = ?, file_count = ?, updated_at = ?
+					WHERE id = ? AND latest_version = ? AND ${LIVE} AND ${room.sql}`,
+				)
+				.bind(version, version, size, files.length, now, id, page.latestVersion, now, ...room.params),
+			this.addVersion(id, version, now, size, files.length),
+		]);
+		if (result!.meta.changes !== 1) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
-		this.defer(this.deletePrefix(`pages/${id}/${page.version}/`));
-		return { ...page, version, size, fileCount: files.length, updatedAt: now };
+		this.defer(this.prune(id));
+		return { ...page, version, latestVersion: version, size, fileCount: files.length, updatedAt: now };
+	}
+
+	/** The versions a live page keeps, newest first. */
+	async versions(id: string): Promise<Version[]> {
+		const page = await this.get(id);
+		const { results } = await this.db
+			.prepare("SELECT version, created_at, size, file_count FROM versions WHERE page_id = ? ORDER BY version DESC")
+			.bind(id)
+			.all<VersionRow>();
+		return results.map((row) => ({
+			version: row.version,
+			createdAt: row.created_at,
+			size: row.size,
+			fileCount: row.file_count,
+			current: row.version === page.version,
+		}));
+	}
+
+	/** Serves an older (or newer) kept version again. Later updates still get new numbers. */
+	async rollback(id: string, version: number): Promise<Page> {
+		const page = await this.get(id);
+		if (version === page.version) return page;
+		const target = await this.db
+			.prepare("SELECT version, created_at, size, file_count FROM versions WHERE page_id = ? AND version = ?")
+			.bind(id, version)
+			.first<VersionRow>();
+		if (!target) throw new PageError(404, `Page ${id} has no version ${version}; list_versions shows the ones it keeps`);
+		const now = this.now();
+		const result = await this.db
+			.prepare(
+				`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
+				WHERE id = ? AND version = ? AND ${LIVE} AND EXISTS (SELECT 1 FROM versions WHERE page_id = ? AND version = ?)`,
+			)
+			.bind(version, target.size, target.file_count, now, id, page.version, now, id, version)
+			.run();
+		if (result.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
+		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now };
+	}
+
+	/**
+	 * Deletes the versions past the newest `LIMITS.keptVersions`, never the one
+	 * being served. The row goes first, so a rollback can't pick a version whose
+	 * files are half gone; files left by a failure here go when the page does.
+	 */
+	private async prune(id: string): Promise<void> {
+		const { results } = await this.db
+			.prepare(
+				`SELECT version FROM versions WHERE page_id = ?
+				AND version NOT IN (SELECT version FROM versions WHERE page_id = ? ORDER BY version DESC LIMIT ?)`,
+			)
+			.bind(id, id, LIMITS.keptVersions)
+			.all<{ version: number }>();
+		for (const { version } of results) {
+			const deleted = await this.db
+				.prepare("DELETE FROM versions WHERE page_id = ? AND version = ? AND version != (SELECT version FROM pages WHERE id = ?)")
+				.bind(id, version, id)
+				.run();
+			if (deleted.meta.changes === 1) await this.deletePrefix(`pages/${id}/${version}/`);
+		}
 	}
 
 	/**
@@ -338,10 +441,12 @@ export class Pages {
 			.bind(now)
 			.all<{ id: string }>();
 		for (const { id } of results) await this.purge(id);
-		const forgotten = await this.db
-			.prepare(`DELETE FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?`)
-			.bind(now - LIMITS.goneGrace)
-			.run();
-		return { purged: results.length, forgotten: forgotten.meta.changes };
+		const [, forgotten] = await this.db.batch([
+			this.db
+				.prepare(`DELETE FROM versions WHERE page_id IN (SELECT id FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?)`)
+				.bind(now - LIMITS.goneGrace),
+			this.db.prepare(`DELETE FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?`).bind(now - LIMITS.goneGrace),
+		]);
+		return { purged: results.length, forgotten: forgotten!.meta.changes };
 	}
 }

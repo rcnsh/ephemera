@@ -63,7 +63,7 @@ function server(ops: Operations): McpServer {
 	mcp.registerTool(
 		"update_page",
 		{
-			description: "Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh.",
+			description: `Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh. The previous files are kept as a version (the last ${LIMITS.keptVersions}) that rollback_page can bring back.`,
 			inputSchema: z.object({ id, files }),
 		},
 		(input) => run(() => ops.update(input.id, decodeInlineFiles(input.files))),
@@ -87,6 +87,25 @@ function server(ops: Operations): McpServer {
 			annotations: { destructiveHint: true },
 		},
 		(input) => run(() => ops.delete(input.id)),
+	);
+
+	mcp.registerTool(
+		"list_versions",
+		{
+			description: `List the versions a page keeps (the last ${LIMITS.keptVersions}, newest first), and which one it's serving.`,
+			inputSchema: z.object({ id }),
+			annotations: { readOnlyHint: true },
+		},
+		(input) => run(() => ops.versions(input.id)),
+	);
+
+	mcp.registerTool(
+		"rollback_page",
+		{
+			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top.",
+			inputSchema: z.object({ id, version: z.number().int().describe("A version number from list_versions") }),
+		},
+		(input) => run(() => ops.rollback(input.id, input.version)),
 	);
 
 	mcp.registerTool(

@@ -1,4 +1,4 @@
-import { pageUrl, parseTtl } from "./domain.ts";
+import { PageError, pageUrl, parseTtl } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import type { Page, Pages } from "./pages.ts";
@@ -16,6 +16,7 @@ export function pageView(page: Page, host: string) {
 		permanent: page.permanent,
 		size: page.size,
 		fileCount: page.fileCount,
+		version: page.version,
 	};
 }
 
@@ -58,6 +59,15 @@ export class Operations {
 	async delete(id: string) {
 		await this.pages.delete(id);
 		return { id, deleted: true };
+	}
+
+	async versions(id: string) {
+		return { id, versions: await this.pages.versions(id) };
+	}
+
+	async rollback(id: string, version: unknown) {
+		if (typeof version !== "number" || !Number.isInteger(version)) throw new PageError(400, "version must be a whole number; list_versions shows the ones a page keeps");
+		return pageView(await this.pages.rollback(id, version), this.host);
 	}
 
 	async get(id: string) {

@@ -35,10 +35,10 @@ describe("MCP endpoint", () => {
 		expect((await rpc("tools/list", {}, "wrong")).status).toBe(401);
 	});
 
-	it("lists the five tools", async () => {
+	it("lists the tools", async () => {
 		const response = await rpc("tools/list");
 		const text = await response.text();
-		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages"]) {
+		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page"]) {
 			expect(text).toContain(name);
 		}
 	});
@@ -58,6 +58,12 @@ describe("MCP endpoint", () => {
 		const updated = await tool("update_page", { id, files: [{ path: "index.html", content: "PHA+djI8L3A+", encoding: "base64" }] });
 		expect(updated.data.expiresAt).toBe(published.data.expiresAt);
 		expect(await (await call(published.data.url)).text()).toBe("<p>v2</p>");
+
+		const versions = await tool("list_versions", { id });
+		expect(versions.data.versions.map((v: { version: number }) => v.version)).toEqual([2, 1]);
+		const rolledBack = await tool("rollback_page", { id, version: 1 });
+		expect(rolledBack.data.version).toBe(1);
+		expect(await (await call(published.data.url)).text()).toBe("<p>from mcp</p>");
 
 		const extended = await tool("extend_page", { id, ttl: "permanent" });
 		expect(extended.data.permanent).toBe(true);

@@ -36,13 +36,21 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
  *   PUT    /api/pages/:id    replace its files (JSON or zip)
  *   PATCH  /api/pages/:id    { ttl }: extend, or "permanent"
  *   DELETE /api/pages/:id    delete now
+ *   GET    /api/pages/:id/versions   the versions it keeps
+ *   POST   /api/pages/:id/rollback   { version }: serve that version again
  */
 export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
-	const match = /^\/api\/pages(?:\/([^/]+))?\/?$/.exec(url.pathname);
+	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback))?)?\/?$/.exec(url.pathname);
 	if (!match) return json({ error: "Not found" }, 404);
-	const id = match[1];
-	if (!id) {
+	const [, id, sub] = match;
+	if (id && sub) {
+		if (sub === "versions" && request.method === "GET") return json(await ops.versions(id));
+		if (sub === "rollback" && request.method === "POST") {
+			const body = (await request.json().catch(() => ({}))) as { version?: unknown };
+			return json(await ops.rollback(id, body.version));
+		}
+	} else if (!id) {
 		if (request.method === "GET") return json(await ops.list());
 		if (request.method === "POST") return json(await ops.publish(await readBundle(request, url)), 201);
 	} else {
