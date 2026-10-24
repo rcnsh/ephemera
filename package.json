@@ -1,0 +1,26 @@
+{
+	"name": "ephemera",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "cf dev",
+		"build": "cf build",
+		"deploy": "cf deploy",
+		"typecheck": "cf workers types && tsc && tsc -p test",
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "beta",
+		"@cloudflare/vitest-plugin": "^1.4.7",
+		"cf": "^1.0.0-beta.20",
+		"typescript": "^7.0.2",
+		"vite": "^8.3.0",
+		"vitest": "^4.1.12"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/server": "2.0.0",
+		"agents": "^0.30.1",
+		"fflate": "^0.8.3",
+		"zod": "^4.6.7"
+	}
+}

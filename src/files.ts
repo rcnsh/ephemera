@@ -1,0 +1,138 @@
+import { unzipSync } from "fflate";
+import { LIMITS, PageError } from "./limits.ts";
+
+export interface PageFile {
+	path: string;
+	body: Uint8Array;
+}
+
+export interface InlineFile {
+	path: string;
+	content: string;
+	encoding?: "utf8" | "base64";
+}
+
+/**
+ * Turns a user-supplied path into the canonical key used in storage, or throws.
+ * Canonical paths are relative, `/`-separated and never escape the page.
+ */
+export function normalizePath(raw: string): string {
+	let path = raw.trim();
+	while (path.startsWith("./")) path = path.slice(2);
+	path = path.replace(/^\/+/, "");
+	if (!path || path.length > LIMITS.pathLength) throw new PageError(400, `Invalid file path "${raw}"`);
+	if (/[\\\u0000-\u001f\u007f]/.test(path)) throw new PageError(400, `Invalid characters in file path "${raw}"`);
+	for (const segment of path.split("/")) {
+		if (segment === "" || segment === "." || segment === "..") {
+			throw new PageError(400, `Invalid file path "${raw}"`);
+		}
+	}
+	return path;
+}
+
+export function decodeInlineFiles(files: InlineFile[]): PageFile[] {
+	const encoder = new TextEncoder();
+	return files.map((file) => {
+		const path = normalizePath(file.path);
+		if (file.encoding === "base64") {
+			try {
+				return { path, body: Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0)) };
+			} catch {
+				throw new PageError(400, `File "${path}" is not valid base64`);
+			}
+		}
+		return { path, body: encoder.encode(file.content) };
+	});
+}
+
+const JUNK = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/;
+
+/**
+ * Unpacks a zip bundle. Sizes are checked from the zip headers before anything
+ * is inflated, so a zip bomb is rejected without being expanded. When every
+ * file sits under one top-level folder and there's no root index.html (what
+ * `zip -r site.zip site/` produces), that folder is stripped.
+ */
+export function unzipFiles(zip: Uint8Array): PageFile[] {
+	let declaredBytes = 0;
+	let declaredFiles = 0;
+	let entries: Record<string, Uint8Array>;
+	try {
+		entries = unzipSync(zip, {
+			filter(file) {
+				if (file.name.endsWith("/") || JUNK.test(file.name)) return false;
+				declaredBytes += file.originalSize;
+				declaredFiles += 1;
+				if (declaredBytes > LIMITS.pageBytes) throw new PageError(413, "Zip contents exceed the 25 MB page limit");
+				if (declaredFiles > LIMITS.pageFiles) throw new PageError(413, `Zip has more than ${LIMITS.pageFiles} files`);
+				return true;
+			},
+		});
+	} catch (error) {
+		if (error instanceof PageError) throw error;
+		throw new PageError(400, "Upload is not a valid zip file");
+	}
+
+	let names = Object.keys(entries);
+	const roots = new Set(names.map((name) => name.split("/")[0]));
+	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/"))) {
+		const prefix = `${[...roots][0]}/`;
+		entries = Object.fromEntries(names.map((name) => [name.slice(prefix.length), entries[name]!]));
+		names = Object.keys(entries);
+	}
+	return names.map((name) => ({ path: normalizePath(name), body: entries[name]! }));
+}
+
+/** Checks a bundle against the per-page limits and returns its total size. */
+export function validateBundle(files: PageFile[]): number {
+	if (files.length === 0) throw new PageError(400, "A page needs at least one file");
+	if (files.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
+	const seen = new Set<string>();
+	let size = 0;
+	for (const file of files) {
+		if (seen.has(file.path)) throw new PageError(400, `Duplicate file path "${file.path}"`);
+		seen.add(file.path);
+		size += file.body.byteLength;
+	}
+	if (!seen.has("index.html")) throw new PageError(400, "A page needs an index.html at its root");
+	if (size > LIMITS.pageBytes) throw new PageError(413, "A page can be at most 25 MB");
+	return size;
+}
+
+const TYPES: Record<string, string> = {
+	html: "text/html; charset=utf-8",
+	htm: "text/html; charset=utf-8",
+	css: "text/css; charset=utf-8",
+	js: "text/javascript; charset=utf-8",
+	mjs: "text/javascript; charset=utf-8",
+	json: "application/json; charset=utf-8",
+	map: "application/json; charset=utf-8",
+	txt: "text/plain; charset=utf-8",
+	md: "text/markdown; charset=utf-8",
+	csv: "text/csv; charset=utf-8",
+	xml: "application/xml; charset=utf-8",
+	svg: "image/svg+xml",
+	png: "image/png",
+	jpg: "image/jpeg",
+	jpeg: "image/jpeg",
+	gif: "image/gif",
+	webp: "image/webp",
+	avif: "image/avif",
+	ico: "image/x-icon",
+	woff: "font/woff",
+	woff2: "font/woff2",
+	ttf: "font/ttf",
+	otf: "font/otf",
+	mp3: "audio/mpeg",
+	wav: "audio/wav",
+	ogg: "audio/ogg",
+	mp4: "video/mp4",
+	webm: "video/webm",
+	pdf: "application/pdf",
+	wasm: "application/wasm",
+};
+
+export function contentType(path: string): string {
+	const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+	return TYPES[ext] ?? "application/octet-stream";
+}

@@ -1,0 +1,48 @@
+# ephemera
+
+Temporary web pages for agents. An agent publishes a bundle of HTML, CSS, JS and images and gets back `https://p.rcn.sh/<id>/`. The page is deleted when its TTL runs out (24 hours by default, 5 minutes to 30 days, or permanent).
+
+One Cloudflare Worker serves three things:
+
+| Where | What | Auth |
+| --- | --- | --- |
+| `p.rcn.sh/<id>/` | the pages, sandboxed (`CSP: sandbox` without `allow-same-origin`), `noindex`, `no-store` | none |
+| `p.rcn.sh/api`, `p.rcn.sh/mcp` | HTTP API and remote MCP server | `Authorization: Bearer $EPHEMERA_TOKEN` |
+| `ephemera.rcn.sh` | dashboard: list, extend, make permanent or temporary, delete | Cloudflare Access |
+
+`p.rcn.sh/` itself shows a random cat from [cataas](https://cataas.com).
+
+Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). Every request checks the expiry, so a page stops working the moment it expires; it then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
+
+Limits: 25 MB and 200 files per page, 100 temporary pages, 25 permanent pages, 2 GB in total.
+
+## Publishing
+
+With MCP, the tools are `publish_page`, `update_page`, `extend_page`, `delete_page` and `list_pages`.
+
+With the API:
+
+```sh
+# inline files
+curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" \
+  -d '{"files":[{"path":"index.html","content":"<h1>hi</h1>"}],"ttl":"2h","label":"demo"}'
+
+# a folder, as a zip
+(cd site && zip -qr - .) | curl -X POST "https://p.rcn.sh/api/pages?ttl=7d&label=site" \
+  -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
+```
+
+`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage.
+
+Pages should link to their own files with relative paths. Root-relative links in HTML attributes are rewritten to stay inside the page; ones in CSS or JS can't be, so publishing returns a warning for each one it finds.
+
+## Development
+
+```sh
+pnpm install
+pnpm test        # vitest in workerd
+pnpm typecheck
+pnpm deploy      # cf deploy
+```
+
+The token is a Worker secret (`EPHEMERA_TOKEN`). `ACCESS_AUD` in `cloudflare.config.ts` is the audience tag of the Access application that protects `ephemera.rcn.sh`. The dashboard refuses any request that Access didn't authenticate for that application.
