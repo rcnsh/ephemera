@@ -1,5 +1,5 @@
 import { PageError } from "./domain.ts";
-import { decodeInlineFiles, type InlineFile, unzipFiles } from "./files.ts";
+import { type BundleInput, bundleFrom, type InlineFile, unzipFiles } from "./files.ts";
 import type { Operations, PublishInput, TtlInput } from "./operations.ts";
 
 const MAX_BODY = 40 * 1024 * 1024;
@@ -17,14 +17,23 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 		const ttl = url.searchParams.get("ttl");
 		return { files, ttl: ttl && /^\d+$/.test(ttl) ? Number(ttl) : ttl, label: url.searchParams.get("label"), agent: url.searchParams.get("agent") };
 	}
-	let body: { files?: InlineFile[]; ttl?: string | number; label?: string; agent?: string };
+	let body: BundleInput & { ttl?: string | number; label?: string; agent?: string };
 	try {
 		body = await request.json();
 	} catch {
-		throw new PageError(400, "Body must be JSON ({ files, ttl, label, agent }) or a zip file");
+		throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent }) or a zip file");
 	}
-	if (!Array.isArray(body.files)) throw new PageError(400, "files must be an array of { path, content, encoding }");
-	return { files: decodeInlineFiles(body.files), ttl: body.ttl, label: body.label, agent: body.agent };
+	return { files: bundleFrom(body, body.label), ttl: body.ttl, label: body.label, agent: body.agent };
+}
+
+async function readJson<T>(request: Request): Promise<Partial<T>> {
+	return (await request.json().catch(() => ({}))) as Partial<T>;
+}
+
+/** PUT /upload/<token>: replaces the files of the page the token is for. The caller has checked the token. */
+export async function handleUpload(request: Request, ops: Operations, id: string): Promise<Response> {
+	if (request.method !== "PUT" && request.method !== "POST") return json({ error: "Method not allowed; PUT a zip" }, 405);
+	return json(await ops.update(id, (await readBundle(request, new URL(request.url))).files));
 }
 
 /**
@@ -38,17 +47,29 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
  *   DELETE /api/pages/:id    delete now
  *   GET    /api/pages/:id/versions   the versions it keeps
  *   POST   /api/pages/:id/rollback   { version }: serve that version again
+ *   POST   /api/pages/:id/files      { files, remove }: change single files
+ *   POST   /api/uploads              { id?, ttl, label, agent }: an upload URL for a zip
  */
 export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
-	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback))?)?\/?$/.exec(url.pathname);
+	if (url.pathname === "/api/uploads" && request.method === "POST") {
+		return json(await ops.uploadUrl(await readJson<{ id: string; ttl: TtlInput; label: string; agent: string }>(request)), 201);
+	}
+	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files))?)?\/?$/.exec(url.pathname);
 	if (!match) return json({ error: "Not found" }, 404);
 	const [, id, sub] = match;
 	if (id && sub) {
 		if (sub === "versions" && request.method === "GET") return json(await ops.versions(id));
 		if (sub === "rollback" && request.method === "POST") {
-			const body = (await request.json().catch(() => ({}))) as { version?: unknown };
+			const body = await readJson<{ version: unknown }>(request);
 			return json(await ops.rollback(id, body.version));
+		}
+		if (sub === "files" && request.method === "POST") {
+			const body = await readJson<{ files: InlineFile[]; remove: string[] }>(request);
+			if (body.remove !== undefined && !(Array.isArray(body.remove) && body.remove.every((path) => typeof path === "string"))) {
+				throw new PageError(400, "remove must be an array of paths");
+			}
+			return json(await ops.patch(id, body.files ? bundleFrom({ files: body.files }) : [], body.remove ?? []));
 		}
 	} else if (!id) {
 		if (request.method === "GET") return json(await ops.list());
@@ -59,10 +80,8 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 				return json(await ops.get(id));
 			case "PUT":
 				return json(await ops.update(id, (await readBundle(request, url)).files));
-			case "PATCH": {
-				const body = (await request.json().catch(() => ({}))) as { ttl?: TtlInput };
-				return json(await ops.extend(id, body.ttl));
-			}
+			case "PATCH":
+				return json(await ops.extend(id, (await readJson<{ ttl: TtlInput }>(request)).ttl));
 			case "DELETE":
 				return json(await ops.delete(id));
 		}

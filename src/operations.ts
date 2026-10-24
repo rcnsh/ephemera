@@ -1,3 +1,4 @@
+import { uploadToken } from "./auth.ts";
 import { PageError, pageUrl, parseTtl } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
@@ -35,10 +36,23 @@ export interface PublishInput {
  * MCP). Takes input as agents send it and returns what they should see back;
  * failures are thrown as `PageError`s.
  */
+const UPLOAD_WINDOW = 60 * 60 * 1000;
+
+/** What a page shows until its first upload arrives. */
+const WAITING = `<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<title>Waiting for upload</title>
+<p style="font: 16px system-ui, sans-serif; margin: 2rem; color: #888">Waiting for the files to be uploaded…</p>
+`;
+
 export class Operations {
 	constructor(
 		private readonly pages: Pages,
 		private readonly host: string,
+		/** Signs upload URLs. */
+		private readonly secret: string,
+		private readonly now: () => number = Date.now,
 	) {}
 
 	async publish(input: PublishInput) {
@@ -50,6 +64,36 @@ export class Operations {
 	async update(id: string, files: PageFile[]) {
 		const page = await this.pages.update(id, files);
 		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
+	}
+
+	/** Adds, replaces and removes single files, keeping the rest. */
+	async patch(id: string, files: PageFile[], remove: string[]) {
+		const page = await this.pages.patch(id, { files, remove });
+		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
+	}
+
+	/**
+	 * An upload URL that replaces the files of page `id` with a zip, for an
+	 * hour. Without `id`, publishes a placeholder page first, so the agent
+	 * gets the final URL before uploading.
+	 */
+	async uploadUrl(input: { id?: string | null; ttl?: TtlInput; label?: string | null; agent?: string | null }) {
+		const page = input.id
+			? await this.pages.get(input.id)
+			: await this.pages.publish({
+					files: [{ path: "index.html", body: new TextEncoder().encode(WAITING) }],
+					ttl: parseTtl(input.ttl),
+					label: input.label,
+					agent: input.agent,
+				});
+		const expiresAt = this.now() + UPLOAD_WINDOW;
+		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, expiresAt)}`;
+		return {
+			...pageView(page, this.host),
+			uploadUrl,
+			uploadExpiresAt: expiresAt,
+			command: `(cd <folder> && zip -qr - .) | curl -fsS -X PUT -H "content-type: application/zip" --data-binary @- "${uploadUrl}"`,
+		};
 	}
 
 	async extend(id: string, ttl: TtlInput) {

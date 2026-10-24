@@ -18,7 +18,7 @@ Limits: 25 MB and 200 files per page, 100 temporary pages, 25 permanent pages, 2
 
 ## Publishing
 
-With MCP, the tools are `publish_page`, `update_page`, `extend_page`, `delete_page`, `list_pages`, `list_versions` and `rollback_page`.
+With MCP, the tools are `publish_page`, `update_page`, `patch_page`, `upload_url`, `extend_page`, `delete_page`, `list_pages`, `list_versions` and `rollback_page`. `publish_page` and `update_page` take `files`, or a single `html` or `markdown` document. `upload_url` returns a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call.
 
 With the API:
 
@@ -27,12 +27,15 @@ With the API:
 curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" \
   -d '{"files":[{"path":"index.html","content":"<h1>hi</h1>"}],"ttl":"2h","label":"demo"}'
 
+# one Markdown document, rendered
+curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" -d '{"markdown":"# Report","ttl":"1d"}'
+
 # a folder, as a zip
 (cd site && zip -qr - .) | curl -X POST "https://p.rcn.sh/api/pages?ttl=7d&label=site" \
   -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
 ```
 
-`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage. `GET /api/pages/:id/versions` lists the kept versions and `POST /api/pages/:id/rollback` with `{"version":2}` serves one again.
+`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage. `GET /api/pages/:id/versions` lists the kept versions and `POST /api/pages/:id/rollback` with `{"version":2}` serves one again. `POST /api/pages/:id/files` with `{"files":[…],"remove":["old.css"]}` changes single files and keeps the rest. `POST /api/uploads` (optionally with `{"id":…}`) returns an upload URL: `PUT` a zip to it within an hour, without the token, to replace that page's files.
 
 Pages should link to their own files with relative paths. Root-relative links in HTML attributes are rewritten to stay inside the page; ones in CSS or JS can't be, so publishing returns a warning for each one it finds.
 

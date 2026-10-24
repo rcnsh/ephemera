@@ -1,5 +1,5 @@
-import { handleApi } from "./api.ts";
-import { hasToken } from "./auth.ts";
+import { handleApi, handleUpload } from "./api.ts";
+import { checkUploadToken, hasToken } from "./auth.ts";
 import { cat, rootPage } from "./cat.ts";
 import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
@@ -74,11 +74,16 @@ async function servePage(request: Request, pages: Pages, id: string, rest: strin
 	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id) : response;
 }
 
-/** Routes for agents: they need the token, and get errors back as JSON. */
+/** Routes for agents: they need the token (or an upload URL), and get errors back as JSON. */
 async function handleAgent(request: Request, env: Env, ctx: ExecutionContext, pages: Pages, pathname: string): Promise<Response> {
-	if (!(await hasToken(request, env.EPHEMERA_TOKEN))) return Response.json({ error: "Missing or wrong bearer token" }, { status: 401 });
-	const ops = new Operations(pages, env.PAGES_HOST);
+	const ops = new Operations(pages, env.PAGES_HOST, env.EPHEMERA_TOKEN);
 	try {
+		if (pathname.startsWith("/upload/")) {
+			const id = await checkUploadToken(env.EPHEMERA_TOKEN, pathname.slice("/upload/".length));
+			if (!id) return Response.json({ error: "This upload URL is wrong or has expired; ask for a new one" }, { status: 403 });
+			return await handleUpload(request, ops, id);
+		}
+		if (!(await hasToken(request, env.EPHEMERA_TOKEN))) return Response.json({ error: "Missing or wrong bearer token" }, { status: 401 });
 		return pathname === "/mcp" ? await handleMcp(request, env, ctx, ops) : await handleApi(request, ops);
 	} catch (error) {
 		if (error instanceof PageError) return Response.json({ error: error.message }, { status: error.status });
@@ -88,7 +93,9 @@ async function handleAgent(request: Request, env: Env, ctx: ExecutionContext, pa
 
 async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext, pages: Pages): Promise<Response> {
 	const { pathname } = new URL(request.url);
-	if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/mcp") return handleAgent(request, env, ctx, pages, pathname);
+	if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/mcp" || pathname.startsWith("/upload/")) {
+		return handleAgent(request, env, ctx, pages, pathname);
+	}
 	if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed\n", 405);
 	if (pathname === "/") return rootPage();
 	if (pathname === "/cat.jpg") return cat();
