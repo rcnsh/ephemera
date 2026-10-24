@@ -17,7 +17,7 @@ export default defineConfig({
 			PAGES_HOST: bindings.text("p.rcn.sh"),
 			ADMIN_HOST: bindings.text("ephemera.rcn.sh"),
 			// Audience tag of the Access application guarding ADMIN_HOST.
-			ACCESS_AUD: bindings.text("set-after-access-app-is-created"),
+			ACCESS_AUD: bindings.text("b7ad86d15465a5788e12e6c7d717aa15512f7536c86f6958ebf48402169adcdd"),
 		},
 	},
 });
