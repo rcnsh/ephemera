@@ -118,6 +118,28 @@ describe("page lifecycle", () => {
 	});
 });
 
+describe("limits", () => {
+	it("holds when publishes race for the last slot", async () => {
+		const { pages } = store();
+		await Promise.all(Array.from({ length: LIMITS.permanentPages - 1 }, () => pages.publish({ files: INDEX, ttl: "permanent" })));
+		const results = await Promise.all(Array.from({ length: 4 }, () => status(pages.publish({ files: INDEX, ttl: "permanent" }))));
+		expect(results.filter((result) => result === undefined)).toHaveLength(1);
+		expect(results.filter((result) => result === 409)).toHaveLength(3);
+		expect((await pages.usage()).permanentPages).toBe(LIMITS.permanentPages);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(LIMITS.permanentPages);
+	});
+
+	it("holds when pages race to become permanent", async () => {
+		const { pages } = store();
+		await Promise.all(Array.from({ length: LIMITS.permanentPages - 1 }, () => pages.publish({ files: INDEX, ttl: "permanent" })));
+		const temporary = await Promise.all(Array.from({ length: 3 }, () => pages.publish({ files: INDEX, ttl: HOUR })));
+		const results = await Promise.all(temporary.map((page) => status(pages.extend(page.id, "permanent"))));
+		expect(results.filter((result) => result === undefined)).toHaveLength(1);
+		expect(results.filter((result) => result === 409)).toHaveLength(2);
+		expect((await pages.usage()).permanentPages).toBe(LIMITS.permanentPages);
+	});
+});
+
 describe("storage failures", () => {
 	it("leaves no files behind when a publish fails part way", async () => {
 		const { bucket } = flaky("put", 1);

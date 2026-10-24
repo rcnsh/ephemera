@@ -166,6 +166,24 @@ export class Pages {
 		}
 	}
 
+	/**
+	 * `checkRoom` as a SQL condition, for the statement that takes the room.
+	 * D1 runs one statement at a time, so two requests racing for the last
+	 * slot can't both get it. `except` leaves a page out of the byte count.
+	 */
+	private roomFor(kind: "temporary" | "permanent" | null, extraBytes: number, except = ""): { sql: string; params: unknown[] } {
+		const now = this.now();
+		const params: unknown[] = [];
+		let sql = `(SELECT COALESCE(SUM(size), 0) FROM pages WHERE ${LIVE} AND id != ?) + ? <= ?`;
+		params.push(now, except, extraBytes, LIMITS.totalBytes);
+		if (kind) {
+			const permanent = kind === "permanent" ? "IS NULL" : "IS NOT NULL";
+			sql += ` AND (SELECT COUNT(*) FROM pages WHERE ${LIVE} AND expires_at ${permanent}) < ?`;
+			params.push(now, kind === "permanent" ? LIMITS.permanentPages : LIMITS.temporaryPages);
+		}
+		return { sql, params };
+	}
+
 	/** Waits for every upload to settle, even after one fails, so a cleanup that follows sees them all. */
 	private async writeFiles(id: string, version: number, files: PageFile[]): Promise<void> {
 		const results = await Promise.allSettled(
@@ -207,13 +225,19 @@ export class Pages {
 		};
 		try {
 			await this.writeFiles(row.id, row.version, files);
-			await this.db
+			const room = this.roomFor(input.ttl === "permanent" ? "permanent" : "temporary", size);
+			const result = await this.db
 				.prepare(
 					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, size, file_count)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
 				)
-				.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.size, row.file_count)
+				.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.size, row.file_count, ...room.params)
 				.run();
+			if (result.meta.changes !== 1) {
+				// Another publish took the room while the files were uploading.
+				await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
+				throw new PageError(409, "Out of room; try again");
+			}
 		} catch (error) {
 			await this.deletePrefix(`pages/${row.id}/`);
 			throw error;
@@ -241,9 +265,10 @@ export class Pages {
 			throw error;
 		}
 		const now = this.now();
+		const room = this.roomFor(null, size, id);
 		const result = await this.db
-			.prepare(`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ? WHERE id = ? AND version = ? AND ${LIVE}`)
-			.bind(version, size, files.length, now, id, page.version, now)
+			.prepare(`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ? WHERE id = ? AND version = ? AND ${LIVE} AND ${room.sql}`)
+			.bind(version, size, files.length, now, id, page.version, now, ...room.params)
 			.run();
 		if (result.meta.changes !== 1) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
@@ -262,22 +287,28 @@ export class Pages {
 		const page = await this.get(id);
 		const now = this.now();
 		let expiresAt: number | null;
+		let kind: "temporary" | "permanent" | null = null;
 		if (by === "permanent") {
 			if (page.permanent) return page;
-			await this.checkRoom("permanent", 0);
+			kind = "permanent";
 			expiresAt = null;
 		} else if (page.permanent) {
-			await this.checkRoom("temporary", 0);
+			kind = "temporary";
 			expiresAt = now + by;
 		} else {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
+		if (kind) await this.checkRoom(kind, 0);
+		const room = kind ? this.roomFor(kind, 0) : { sql: "1", params: [] };
 		const result = await this.db
-			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
-			.bind(expiresAt, now, id, now)
+			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE} AND ${room.sql}`)
+			.bind(expiresAt, now, id, now, ...room.params)
 			.run();
-		// It expired or was deleted since the lookup; don't bring it back.
-		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		if (result.meta.changes !== 1) {
+			// Either another request took the last slot, or the page expired or was deleted since the lookup.
+			if (kind) await this.checkRoom(kind, 0);
+			throw new PageError(410, `Page ${id} has expired or been deleted`);
+		}
 		return { ...page, expiresAt, permanent: expiresAt === null, updatedAt: now };
 	}
 
