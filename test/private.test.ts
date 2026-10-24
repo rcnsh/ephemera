@@ -50,7 +50,7 @@ describe("private pages", () => {
 
 		const index = await call(link.url);
 		expect(index.status).toBe(200);
-		expect(index.headers.get("cache-control")).toBe("private, no-cache");
+		expect(index.headers.get("cache-control")).toBe("private, no-cache, no-transform");
 		expect(await index.text()).toContain(`href="/${page.id}/${pass}/app.css"`);
 		expect(await (await call(`${link.url}app.css`)).text()).toBe("body{}");
 

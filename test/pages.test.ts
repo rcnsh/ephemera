@@ -138,7 +138,7 @@ describe("serving", () => {
 		expect(csp).toMatch(/^sandbox allow-scripts allow-forms allow-popups allow-modals/);
 		expect(csp).not.toContain("allow-same-origin");
 		expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow");
-		expect(response.headers.get("cache-control")).toBe("no-cache");
+		expect(response.headers.get("cache-control")).toBe("no-cache, no-transform");
 		expect(response.headers.get("access-control-allow-origin")).toBe("*");
 		expect((await call(`${PAGES}/${page.id}/missing.png`)).headers.get("cache-control")).toBe("no-store");
 
@@ -165,6 +165,21 @@ describe("serving", () => {
 		const changed = await call(`${PAGES}/${page.id}/`, { headers: { "if-none-match": etag } });
 		expect(changed.status).toBe(200);
 		expect(await changed.text()).toContain("v2");
+	});
+
+	it("gzips text files itself and keeps their ETag", async () => {
+		const page = await publish({ files: [{ path: "index.html", content: "<h1>hi</h1>".repeat(100) }, { path: "a.png", content: "iVBORw0KGgo=", encoding: "base64" }] });
+		const zipped = await call(`${PAGES}/${page.id}/`, { headers: { "accept-encoding": "gzip, br" } });
+		expect(zipped.headers.get("content-encoding")).toBe("gzip");
+		expect(zipped.headers.get("vary")).toMatch(/accept-encoding/i);
+		expect(zipped.headers.get("etag")).toBeTruthy();
+		const body = await new Response(zipped.body!.pipeThrough(new DecompressionStream("gzip"))).text();
+		expect(body).toContain("<h1>hi</h1>");
+
+		const plain = await call(`${PAGES}/${page.id}/`);
+		expect(plain.headers.get("content-encoding")).toBeNull();
+		expect(await plain.text()).toContain("<h1>hi</h1>");
+		expect((await call(`${PAGES}/${page.id}/a.png`, { headers: { "accept-encoding": "gzip" } })).headers.get("content-encoding")).toBeNull();
 	});
 
 	it("redirects /<id> and folders without a trailing slash", async () => {

@@ -37,7 +37,9 @@ function withPageHeaders(response: Response): Response {
 	// Page files say how they may be cached; anything else isn't.
 	if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
 	headers.delete("set-cookie");
-	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+	// A body we compressed ourselves must go out as is.
+	const encodeBody = headers.has("content-encoding") ? "manual" : "automatic";
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers, encodeBody });
 }
 
 async function servePage(request: Request, env: Env, pages: Pages, id: string, subpath: string): Promise<Response> {
@@ -82,15 +84,28 @@ async function servePage(request: Request, env: Env, pages: Pages, id: string, s
 
 	// no-cache, not no-store: the browser keeps files but asks each time, so an
 	// update shows on refresh while unchanged files come back as 304s.
+	// no-transform stops Cloudflare editing pages (injected scripts, Rocket
+	// Loader), which would also strip the ETag; so we compress text ourselves.
 	const headers = new Headers({
 		"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
 		etag: object.httpEtag,
-		"cache-control": pass ? "private, no-cache" : "no-cache",
+		"cache-control": pass ? "private, no-cache, no-transform" : "no-cache, no-transform",
 	});
 	if (!("body" in object)) return new Response(null, { status: 304, headers });
 	if (request.method === "HEAD") return new Response(null, { headers });
 	const response = new Response(object.body, { headers });
-	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id, pass) : response;
+	return gzip(request, headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id, pass) : response);
+}
+
+const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|wasm|manifest\+json)|image\/svg\+xml)/;
+
+function gzip(request: Request, response: Response): Response {
+	if (!response.body || !COMPRESSIBLE.test(response.headers.get("content-type") ?? "")) return response;
+	const headers = new Headers(response.headers);
+	headers.append("vary", "accept-encoding");
+	if (!/\bgzip\b/.test(request.headers.get("accept-encoding") ?? "")) return new Response(response.body, { headers });
+	headers.set("content-encoding", "gzip");
+	return new Response(response.body.pipeThrough(new CompressionStream("gzip")), { headers, encodeBody: "manual" });
 }
 
 /** Routes for agents: they need the token (or an upload URL), and get errors back as JSON. */

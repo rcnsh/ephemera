@@ -6,7 +6,7 @@ One Cloudflare Worker serves three things:
 
 | Where | What | Auth |
 | --- | --- | --- |
-| `p.rcn.sh/<id>/` | the pages, sandboxed (`CSP: sandbox` without `allow-same-origin`), `noindex`, `no-cache` with ETags (so unchanged files come back as 304s), `Access-Control-Allow-Origin: *` so they can fetch and import their own files | none |
+| `p.rcn.sh/<id>/` | the pages, sandboxed (`CSP: sandbox` without `allow-same-origin`), `noindex`, `no-cache, no-transform` with ETags (so unchanged files come back as 304s; the Worker gzips text itself, since Cloudflare must not edit pages), `Access-Control-Allow-Origin: *` so they can fetch and import their own files | none |
 | `p.rcn.sh/api`, `p.rcn.sh/mcp` | HTTP API and remote MCP server | `Authorization: Bearer $EPHEMERA_TOKEN` |
 | `ephemera.rcn.sh` | dashboard: a card per page with a thumbnail; search and filter by agent; rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions, delete | Cloudflare Access |
 
