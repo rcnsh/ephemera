@@ -13,9 +13,14 @@ import { ID_PATTERN, Pages } from "./pages.ts";
  * Every response from the pages host goes out with these. Agent-written HTML
  * runs in a sandbox with an opaque origin, so it can't read cookies or storage
  * for rcn.sh, or act as p.rcn.sh. Don't add allow-same-origin.
+ *
+ * That opaque origin is `null`, so a page fetching or importing its own files
+ * makes a cross-origin request; the wildcard lets it read the answer. No
+ * credentials are involved, so it exposes nothing a plain GET doesn't.
  */
 const PAGE_HEADERS: Record<string, string> = {
 	"content-security-policy": "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads",
+	"access-control-allow-origin": "*",
 	"x-robots-tag": "noindex, nofollow",
 	"cache-control": "no-store",
 	"x-content-type-options": "nosniff",

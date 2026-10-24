@@ -139,6 +139,7 @@ describe("serving", () => {
 		expect(csp).not.toContain("allow-same-origin");
 		expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow");
 		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("access-control-allow-origin")).toBe("*");
 
 		expect(await (await call(`${PAGES}/${page.id}/docs/`)).text()).toContain("docs");
 		expect((await call(`${PAGES}/${page.id}/data.json`)).headers.get("content-type")).toMatch(/^application\/json/);
