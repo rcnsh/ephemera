@@ -47,7 +47,33 @@ export function parseTtl(input: string | number | undefined | null): Ttl {
 		ms = Number(match[1]) * UNITS[(match[2] || "s").toLowerCase()]!;
 	}
 	if (!Number.isFinite(ms) || ms < LIMITS.minTtl || ms > LIMITS.maxTtl) {
-		throw new PageError(400, "ttl must be between 5 minutes and 30 days, or \"permanent\"");
+		throw new PageError(400, `ttl must be between ${durationText(LIMITS.minTtl)} and ${durationText(LIMITS.maxTtl)}, or "permanent"`);
 	}
 	return Math.round(ms);
+}
+
+/** The public URL of a page. */
+export function pageUrl(host: string, id: string): string {
+	return `https://${host}/${id}/`;
+}
+
+/** A byte count for people: "512 B", "1.5 KB", "25 MB", "2 GB". */
+export function bytesText(n: number): string {
+	const fixed = (value: number, digits: number) => value.toFixed(digits).replace(/\.0+$/, "");
+	if (n < 1024) return `${n} B`;
+	if (n < 1024 * 1024) return `${fixed(n / 1024, 1)} KB`;
+	if (n < 1024 * 1024 * 1024) return `${fixed(n / 1024 / 1024, 1)} MB`;
+	return `${fixed(n / 1024 / 1024 / 1024, 2)} GB`;
+}
+
+/** A whole number of minutes, hours or days for people: "5 minutes", "30 days". */
+export function durationText(ms: number): string {
+	for (const [unit, size] of [
+		["day", DAY],
+		["hour", HOUR],
+		["minute", MINUTE],
+	] as const) {
+		if (ms >= size && ms % size === 0) return `${ms / size} ${unit}${ms === size ? "" : "s"}`;
+	}
+	return `${Math.round(ms / 1000)} seconds`;
 }

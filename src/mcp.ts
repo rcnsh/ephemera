@@ -1,10 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
-import { listPages, pageView, publishPage, updatePage } from "./api.ts";
+import { bytesText, durationText, LIMITS, PageError } from "./domain.ts";
 import { decodeInlineFiles } from "./files.ts";
-import { PageError, parseTtl } from "./limits.ts";
-import type { Pages } from "./pages.ts";
+import type { Operations } from "./operations.ts";
 
 const files = z
 	.array(
@@ -15,16 +14,16 @@ const files = z
 		}),
 	)
 	.min(1)
-	.describe("The page's files. There must be an index.html at the root. At most 200 files and 25 MB.");
+	.describe(`The page's files. There must be an index.html at the root. At most ${LIMITS.pageFiles} files and ${bytesText(LIMITS.pageBytes)}.`);
 
 const ttl = z
 	.union([z.string(), z.number()])
 	.optional()
-	.describe('How long the page lives: a duration like "30m", "2h", "7d" (5 minutes to 30 days) or a number of seconds. Defaults to "24h". "permanent" keeps it until deleted: only use that when the user asks for it.');
+	.describe(`How long the page lives: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Defaults to ${durationText(LIMITS.defaultTtl)}. "permanent" keeps it until deleted: only use that when the user asks for it.`);
 
 const id = z.string().describe("The page id: the 12 characters in its URL, https://p.rcn.sh/<id>/");
 
-const PUBLISH_GUIDE = `Publish a temporary web page at https://p.rcn.sh/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (24 hours by default).
+const PUBLISH_GUIDE = `Publish a temporary web page at https://p.rcn.sh/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (${durationText(LIMITS.defaultTtl)} by default).
 
 Write links between the page's own files as relative paths ("style.css", "img/a.png", "./data.json"), not root-relative ones ("/style.css"): every page lives under its own /<id>/ folder. Root-relative links in HTML attributes are fixed automatically, but ones inside CSS or JavaScript aren't; the response lists any it found as warnings.
 
@@ -44,7 +43,7 @@ async function run(body: () => Promise<unknown>) {
 	}
 }
 
-function server(pages: Pages, host: string, ctx: ExecutionContext): McpServer {
+function server(ops: Operations): McpServer {
 	const mcp = new McpServer({ name: "ephemera", version: "1.0.0" });
 
 	mcp.registerTool(
@@ -58,7 +57,7 @@ function server(pages: Pages, host: string, ctx: ExecutionContext): McpServer {
 				agent: z.string().optional().describe('Which agent is publishing, e.g. "claude-code" or "codex"'),
 			}),
 		},
-		(input) => run(() => publishPage(pages, host, { ...input, files: decodeInlineFiles(input.files) })),
+		(input) => run(() => ops.publish({ ...input, files: decodeInlineFiles(input.files) })),
 	);
 
 	mcp.registerTool(
@@ -67,17 +66,17 @@ function server(pages: Pages, host: string, ctx: ExecutionContext): McpServer {
 			description: "Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh.",
 			inputSchema: z.object({ id, files }),
 		},
-		(input) => run(() => updatePage(pages, host, input.id, decodeInlineFiles(input.files), ctx)),
+		(input) => run(() => ops.update(input.id, decodeInlineFiles(input.files))),
 	);
 
 	mcp.registerTool(
 		"extend_page",
 		{
 			description:
-				'Give a page more time. A duration adds to its current expiry (at most 30 days from now). "permanent" stops it expiring: only do that when the user asks. A duration on a permanent page makes it temporary again, expiring that long from now.',
+				`Give a page more time. A duration adds to its current expiry (at most ${durationText(LIMITS.maxTtl)} from now). "permanent" stops it expiring: only do that when the user asks. A duration on a permanent page makes it temporary again, expiring that long from now.`,
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).describe('A duration like "2h" or "7d", or "permanent"') }),
 		},
-		(input) => run(async () => pageView(await pages.extend(input.id, parseTtl(input.ttl)), host)),
+		(input) => run(() => ops.extend(input.id, input.ttl)),
 	);
 
 	mcp.registerTool(
@@ -87,11 +86,7 @@ function server(pages: Pages, host: string, ctx: ExecutionContext): McpServer {
 			inputSchema: z.object({ id }),
 			annotations: { destructiveHint: true },
 		},
-		(input) =>
-			run(async () => {
-				await pages.delete(input.id);
-				return { id: input.id, deleted: true };
-			}),
+		(input) => run(() => ops.delete(input.id)),
 	);
 
 	mcp.registerTool(
@@ -101,14 +96,15 @@ function server(pages: Pages, host: string, ctx: ExecutionContext): McpServer {
 			inputSchema: z.object({}),
 			annotations: { readOnlyHint: true },
 		},
-		() => run(() => listPages(pages, host)),
+		() => run(() => ops.list()),
 	);
 
 	return mcp;
 }
 
-export function handleMcp(request: Request, env: Env, ctx: ExecutionContext, pages: Pages): Promise<Response> {
-	const handler = createMcpHandler(() => server(pages, env.PAGES_HOST, ctx), {
+/** The MCP server at /mcp. The caller has already checked the token. */
+export function handleMcp(request: Request, env: Env, ctx: ExecutionContext, ops: Operations): Promise<Response> {
+	const handler = createMcpHandler(() => server(ops), {
 		route: "/mcp",
 		allowedHostnames: [env.PAGES_HOST],
 		corsOptions: false,

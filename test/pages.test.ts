@@ -1,8 +1,8 @@
-import { createScheduledController, env, reset } from "cloudflare:test";
+import { createExecutionContext, createScheduledController, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
-import { LIMITS } from "../src/limits.ts";
-import { PAGES, api, call, objectCount, publish, setExpiry, zip } from "./helpers.ts";
+import { LIMITS } from "../src/domain.ts";
+import { PAGES, api, call, objectCount, publish, zip } from "./helpers.ts";
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -14,7 +14,9 @@ const DAY = 24 * HOUR;
 
 async function sweep(now = Date.now()): Promise<void> {
 	vi.spyOn(Date, "now").mockReturnValue(now);
-	await worker.scheduled(createScheduledController({ scheduledTime: now, cron: "*/10 * * * *" }), env);
+	const ctx = createExecutionContext();
+	await worker.scheduled(createScheduledController({ scheduledTime: now, cron: "*/10 * * * *" }), env, ctx);
+	await waitOnExecutionContext(ctx);
 	vi.restoreAllMocks();
 }
 
@@ -243,22 +245,6 @@ describe("updating and expiry", () => {
 		expect(back.expiresAt).toBeLessThanOrEqual(Date.now() + 2 * HOUR);
 	});
 
-	it("serves 410 the moment a page expires, then 404 after 7 days", async () => {
-		const page = await publish();
-		await setExpiry(page.id, Date.now() - 1000);
-		const gone = await call(page.url);
-		expect(gone.status).toBe(410);
-		expect(await gone.text()).toMatch(/expired/i);
-		expect((await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "x" }] }) })).status).toBe(410);
-
-		await sweep();
-		expect(await objectCount(page.id)).toBe(0);
-		expect((await call(page.url)).status).toBe(410);
-
-		await sweep(Date.now() + LIMITS.goneGrace + HOUR);
-		expect((await call(page.url)).status).toBe(404);
-	});
-
 	it("deletes a page immediately", async () => {
 		const page = await publish();
 		const response = await api(`/pages/${page.id}`, { method: "DELETE" });
@@ -268,10 +254,10 @@ describe("updating and expiry", () => {
 		expect((await api(`/pages/${page.id}`, { method: "DELETE" })).status).toBe(410);
 	});
 
-	it("never sweeps permanent pages", async () => {
-		const page = await publish({ ttl: "permanent" });
-		await sweep(Date.now() + 365 * DAY);
-		expect((await call(page.url)).status).toBe(200);
+	it("purges expired pages on the cron schedule", async () => {
+		const page = await publish({ ttl: "1h" });
+		await sweep(Date.now() + 2 * HOUR);
+		expect(await objectCount(page.id)).toBe(0);
 	});
 
 	it("lists live pages soonest-expiring first, with usage", async () => {

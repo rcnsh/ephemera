@@ -1,7 +1,12 @@
-import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
+const migrations = await readD1Migrations("./migrations");
+
 export default defineConfig({
+	test: {
+		setupFiles: ["./test/setup.ts"],
+	},
 	plugins: [
 		cloudflareTest({
 			main: "./src/index.ts",
@@ -14,6 +19,7 @@ export default defineConfig({
 					PAGES_HOST: "p.rcn.sh",
 					ADMIN_HOST: "ephemera.rcn.sh",
 					ACCESS_AUD: "test-aud",
+					TEST_MIGRATIONS: migrations,
 				},
 			},
 		}),
