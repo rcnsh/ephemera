@@ -1,47 +1,6 @@
-import { hasToken } from "./auth.ts";
-import { decodeInlineFiles, type InlineFile, type PageFile, unzipFiles } from "./files.ts";
-import { PageError, parseTtl } from "./limits.ts";
-import { rootRelativeWarnings } from "./links.ts";
-import type { Page, Pages } from "./pages.ts";
-
-/** What callers see of a page. */
-export function pageView(page: Page, host: string) {
-	return {
-		id: page.id,
-		url: `https://${host}/${page.id}/`,
-		label: page.label,
-		agent: page.agent,
-		createdAt: page.createdAt,
-		updatedAt: page.updatedAt,
-		expiresAt: page.expiresAt,
-		permanent: page.permanent,
-		size: page.size,
-		fileCount: page.fileCount,
-	};
-}
-
-export interface PublishInput {
-	files: PageFile[];
-	ttl?: string | number | null;
-	label?: string | null;
-	agent?: string | null;
-}
-
-export async function publishPage(pages: Pages, host: string, input: PublishInput) {
-	const page = await pages.publish({ files: input.files, ttl: parseTtl(input.ttl), label: input.label, agent: input.agent });
-	return { ...pageView(page, host), warnings: rootRelativeWarnings(input.files) };
-}
-
-export async function updatePage(pages: Pages, host: string, id: string, files: PageFile[], ctx: ExecutionContext) {
-	const { page, cleanup } = await pages.update(id, files);
-	ctx.waitUntil(cleanup);
-	return { ...pageView(page, host), warnings: rootRelativeWarnings(files) };
-}
-
-export async function listPages(pages: Pages, host: string) {
-	const [list, usage] = await Promise.all([pages.list(), pages.usage()]);
-	return { pages: list.map((page) => pageView(page, host)), usage };
-}
+import { PageError } from "./domain.ts";
+import { decodeInlineFiles, type InlineFile, unzipFiles } from "./files.ts";
+import type { Operations, PublishInput, TtlInput } from "./operations.ts";
 
 const MAX_BODY = 40 * 1024 * 1024;
 
@@ -69,7 +28,8 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 }
 
 /**
- * The HTTP API under /api:
+ * The HTTP API under /api. The caller has already checked the token, and
+ * turns thrown `PageError`s into JSON errors.
  *   GET    /api/pages        list live pages and usage
  *   POST   /api/pages        publish (JSON or zip)
  *   GET    /api/pages/:id    one page
@@ -77,37 +37,27 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
  *   PATCH  /api/pages/:id    { ttl }: extend, or "permanent"
  *   DELETE /api/pages/:id    delete now
  */
-export async function handleApi(request: Request, env: Env, ctx: ExecutionContext, pages: Pages): Promise<Response> {
-	if (!(await hasToken(request, env.EPHEMERA_TOKEN))) {
-		return json({ error: "Missing or wrong bearer token" }, 401);
-	}
+export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
-	const host = env.PAGES_HOST;
 	const match = /^\/api\/pages(?:\/([^/]+))?\/?$/.exec(url.pathname);
 	if (!match) return json({ error: "Not found" }, 404);
 	const id = match[1];
-	try {
-		if (!id) {
-			if (request.method === "GET") return json(await listPages(pages, host));
-			if (request.method === "POST") return json(await publishPage(pages, host, await readBundle(request, url)), 201);
-		} else {
-			switch (request.method) {
-				case "GET":
-					return json(pageView(await pages.get(id), host));
-				case "PUT":
-					return json(await updatePage(pages, host, id, (await readBundle(request, url)).files, ctx));
-				case "PATCH": {
-					const body = (await request.json().catch(() => ({}))) as { ttl?: string | number };
-					return json(pageView(await pages.extend(id, parseTtl(body.ttl)), host));
-				}
-				case "DELETE":
-					await pages.delete(id);
-					return json({ id, deleted: true });
+	if (!id) {
+		if (request.method === "GET") return json(await ops.list());
+		if (request.method === "POST") return json(await ops.publish(await readBundle(request, url)), 201);
+	} else {
+		switch (request.method) {
+			case "GET":
+				return json(await ops.get(id));
+			case "PUT":
+				return json(await ops.update(id, (await readBundle(request, url)).files));
+			case "PATCH": {
+				const body = (await request.json().catch(() => ({}))) as { ttl?: TtlInput };
+				return json(await ops.extend(id, body.ttl));
 			}
+			case "DELETE":
+				return json(await ops.delete(id));
 		}
-		return json({ error: "Method not allowed" }, 405);
-	} catch (error) {
-		if (error instanceof PageError) return json({ error: error.message }, error.status);
-		throw error;
 	}
+	return json({ error: "Method not allowed" }, 405);
 }

@@ -1,5 +1,5 @@
 import { contentType, type PageFile, validateBundle } from "./files.ts";
-import { LIMITS, PageError, type Ttl } from "./limits.ts";
+import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
 
 /**
  * The page store. D1 holds one row per page; R2 holds its files under
@@ -7,6 +7,7 @@ import { LIMITS, PageError, type Ttl } from "./limits.ts";
  * `expires_at` passes (NULL means permanent). After that it's "gone": the
  * Worker answers 410 for `LIMITS.goneGrace`, the sweep purges its files, and
  * once the grace period is over the row is dropped and the id answers 404.
+ * The table is created by the migrations in /migrations.
  */
 
 interface Storage {
@@ -49,23 +50,6 @@ export interface Usage {
 
 export type Lookup = { state: "live"; page: Page } | { state: "gone" } | { state: "missing" };
 
-const SCHEMA = [
-	`CREATE TABLE IF NOT EXISTS pages (
-		id TEXT PRIMARY KEY,
-		label TEXT,
-		agent TEXT,
-		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL,
-		expires_at INTEGER,
-		deleted_at INTEGER,
-		purged INTEGER NOT NULL DEFAULT 0,
-		version INTEGER NOT NULL,
-		size INTEGER NOT NULL,
-		file_count INTEGER NOT NULL
-	)`,
-	"CREATE INDEX IF NOT EXISTS pages_expires_at ON pages (expires_at)",
-];
-
 const LIVE = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)";
 const GONE_AT = "COALESCE(deleted_at, expires_at)";
 
@@ -97,27 +81,30 @@ function clean(text: string | undefined | null, max: number): string | null {
 	return value || null;
 }
 
+export interface PagesOptions {
+	/** Keeps background work (deleting replaced files) alive after the response; `ctx.waitUntil` in the Worker. */
+	defer: (work: Promise<unknown>) => void;
+	now?: () => number;
+}
+
 export class Pages {
-	private schemaReady: Promise<unknown> | undefined;
+	private readonly defer: (work: Promise<unknown>) => void;
+	private readonly now: () => number;
 
 	constructor(
 		private readonly storage: Storage,
-		private readonly now: () => number = Date.now,
-	) {}
+		options: PagesOptions,
+	) {
+		this.defer = options.defer;
+		this.now = options.now ?? Date.now;
+	}
 
 	private get db() {
 		return this.storage.DB;
 	}
 
-	/** Creates the table if needed, once per request (the store is built per request). */
-	private async ready(): Promise<void> {
-		this.schemaReady ??= this.db.batch(SCHEMA.map((sql) => this.db.prepare(sql)));
-		await this.schemaReady;
-	}
-
 	async lookup(id: string): Promise<Lookup> {
 		if (!ID_PATTERN.test(id)) return { state: "missing" };
-		await this.ready();
 		const row = await this.db.prepare("SELECT * FROM pages WHERE id = ?").bind(id).first<PageRow>();
 		if (!row) return { state: "missing" };
 		const goneAt = row.deleted_at ?? row.expires_at;
@@ -143,7 +130,6 @@ export class Pages {
 	}
 
 	async usage(): Promise<Usage> {
-		await this.ready();
 		const row = await this.db
 			.prepare(
 				`SELECT
@@ -159,7 +145,6 @@ export class Pages {
 
 	/** Live pages, soonest to expire first, permanent ones last. */
 	async list(): Promise<Page[]> {
-		await this.ready();
 		const { results } = await this.db
 			.prepare(`SELECT * FROM pages WHERE ${LIVE} ORDER BY expires_at IS NULL, expires_at, created_at`)
 			.bind(this.now())
@@ -176,18 +161,21 @@ export class Pages {
 			throw new PageError(409, `There are already ${LIMITS.permanentPages} permanent pages; delete some or make them temporary first`);
 		}
 		if (usage.bytes + extraBytes > LIMITS.totalBytes) {
-			throw new PageError(507, "Publishing this would go over the 2 GB storage limit; delete some pages first");
+			throw new PageError(507, `Publishing this would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
 		}
 	}
 
+	/** Waits for every upload to settle, even after one fails, so a cleanup that follows sees them all. */
 	private async writeFiles(id: string, version: number, files: PageFile[]): Promise<void> {
-		await Promise.all(
+		const results = await Promise.allSettled(
 			files.map((file) =>
 				this.storage.BUCKET.put(`pages/${id}/${version}/${file.path}`, file.body, {
 					httpMetadata: { contentType: contentType(file.path) },
 				}),
 			),
 		);
+		const failed = results.find((result) => result.status === "rejected");
+		if (failed) throw failed.reason;
 	}
 
 	private async deletePrefix(prefix: string): Promise<void> {
@@ -199,9 +187,9 @@ export class Pages {
 		} while (cursor);
 	}
 
+	/** Files go to R2 before the row goes to D1, and are deleted again if either step fails, so nothing is left behind. */
 	async publish(input: { files: PageFile[]; ttl: Ttl; label?: string | null; agent?: string | null }): Promise<Page> {
-		const size = validateBundle(input.files);
-		await this.ready();
+		const { files, size } = validateBundle(input.files);
 		await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
 		const now = this.now();
 		const row: PageRow = {
@@ -214,33 +202,43 @@ export class Pages {
 			deleted_at: null,
 			version: 1,
 			size,
-			file_count: input.files.length,
+			file_count: files.length,
 		};
-		await this.writeFiles(row.id, row.version, input.files);
-		await this.db
-			.prepare(
-				`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, size, file_count)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			)
-			.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.size, row.file_count)
-			.run();
+		try {
+			await this.writeFiles(row.id, row.version, files);
+			await this.db
+				.prepare(
+					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, size, file_count)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.size, row.file_count)
+				.run();
+		} catch (error) {
+			await this.deletePrefix(`pages/${row.id}/`);
+			throw error;
+		}
 		return toPage(row);
 	}
 
 	/**
 	 * Swaps a page's files in one step: the new version is written alongside
-	 * the old, the row is pointed at it, then the old version is deleted.
-	 * The returned promise for that cleanup can be handed to `waitUntil`.
+	 * the old, the row is pointed at it, then the old version is deleted in
+	 * the background.
 	 */
-	async update(id: string, files: PageFile[]): Promise<{ page: Page; cleanup: Promise<void> }> {
-		const size = validateBundle(files);
+	async update(id: string, input: PageFile[]): Promise<Page> {
+		const { files, size } = validateBundle(input);
 		const page = await this.get(id);
 		const usage = await this.usage();
 		if (usage.bytes - page.size + size > LIMITS.totalBytes) {
-			throw new PageError(507, "This update would go over the 2 GB storage limit; delete some pages first");
+			throw new PageError(507, `This update would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
 		}
 		const version = page.version + 1;
-		await this.writeFiles(id, version, files);
+		try {
+			await this.writeFiles(id, version, files);
+		} catch (error) {
+			await this.deletePrefix(`pages/${id}/${version}/`);
+			throw error;
+		}
 		const now = this.now();
 		const result = await this.db
 			.prepare(`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ? WHERE id = ? AND version = ? AND ${LIVE}`)
@@ -250,10 +248,8 @@ export class Pages {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
-		return {
-			page: { ...page, version, size, fileCount: files.length, updatedAt: now },
-			cleanup: this.deletePrefix(`pages/${id}/${page.version}/`),
-		};
+		this.defer(this.deletePrefix(`pages/${id}/${page.version}/`));
+		return { ...page, version, size, fileCount: files.length, updatedAt: now };
 	}
 
 	/**
@@ -275,7 +271,12 @@ export class Pages {
 		} else {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
-		await this.db.prepare("UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ?").bind(expiresAt, now, id).run();
+		const result = await this.db
+			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			.bind(expiresAt, now, id, now)
+			.run();
+		// It expired or was deleted since the lookup; don't bring it back.
+		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return { ...page, expiresAt, permanent: expiresAt === null, updatedAt: now };
 	}
 
@@ -285,25 +286,26 @@ export class Pages {
 		return page.permanent ? this.extend(id, LIMITS.defaultTtl) : page;
 	}
 
+	/** The page is gone as soon as the row says so; if deleting its files fails, the sweep tries again. */
 	async delete(id: string): Promise<void> {
 		await this.get(id);
-		const now = this.now();
-		await this.db.prepare("UPDATE pages SET deleted_at = ?, purged = 1 WHERE id = ?").bind(now, id).run();
+		await this.db.prepare("UPDATE pages SET deleted_at = ? WHERE id = ?").bind(this.now(), id).run();
+		await this.purge(id);
+	}
+
+	private async purge(id: string): Promise<void> {
 		await this.deletePrefix(`pages/${id}/`);
+		await this.db.prepare("UPDATE pages SET purged = 1 WHERE id = ?").bind(id).run();
 	}
 
 	/** Purges the files of pages that have gone, and forgets pages gone longer than the grace period. */
 	async sweep(): Promise<{ purged: number; forgotten: number }> {
-		await this.ready();
 		const now = this.now();
 		const { results } = await this.db
 			.prepare(`SELECT id FROM pages WHERE purged = 0 AND ${GONE_AT} <= ? LIMIT 200`)
 			.bind(now)
 			.all<{ id: string }>();
-		for (const { id } of results) {
-			await this.deletePrefix(`pages/${id}/`);
-			await this.db.prepare("UPDATE pages SET purged = 1 WHERE id = ?").bind(id).run();
-		}
+		for (const { id } of results) await this.purge(id);
 		const forgotten = await this.db
 			.prepare(`DELETE FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?`)
 			.bind(now - LIMITS.goneGrace)

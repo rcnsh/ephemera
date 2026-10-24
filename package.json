@@ -5,7 +5,8 @@
 	"scripts": {
 		"dev": "cf dev",
 		"build": "cf build",
-		"deploy": "cf deploy",
+		"migrate": "cf d1 migrations apply e2647029-d375-4d82-bd9d-859103fcb019",
+		"deploy": "pnpm migrate && cf deploy",
 		"typecheck": "cf workers types && tsc && tsc -p test",
 		"test": "vitest run"
 	},

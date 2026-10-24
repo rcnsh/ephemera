@@ -42,7 +42,10 @@ Pages should link to their own files with relative paths. Root-relative links in
 pnpm install
 pnpm test        # vitest in workerd
 pnpm typecheck
-pnpm deploy      # cf deploy
+pnpm migrate     # apply new files in migrations/ to the production D1 database
+pnpm deploy      # migrate, then cf deploy
 ```
+
+The D1 schema lives in `migrations/`; add a change with `cf d1 migrations create <message>`. Tests apply the migrations to a fresh database before each test.
 
 The token is a Worker secret (`EPHEMERA_TOKEN`). `ACCESS_AUD` in `cloudflare.config.ts` is the audience tag of the Access application that protects `ephemera.rcn.sh`. The dashboard refuses any request that Access didn't authenticate for that application.

@@ -2,10 +2,11 @@ import { handleApi } from "./api.ts";
 import { hasToken } from "./auth.ts";
 import { cat, rootPage } from "./cat.ts";
 import { handleDashboard } from "./dashboard.ts";
+import { PageError } from "./domain.ts";
 import { normalizePath } from "./files.ts";
-import { PageError } from "./limits.ts";
 import { rewriteLinks } from "./links.ts";
 import { handleMcp } from "./mcp.ts";
+import { Operations } from "./operations.ts";
 import { ID_PATTERN, Pages } from "./pages.ts";
 
 /**
@@ -60,13 +61,21 @@ async function servePage(request: Request, pages: Pages, id: string, rest: strin
 	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id) : response;
 }
 
+/** Routes for agents: they need the token, and get errors back as JSON. */
+async function handleAgent(request: Request, env: Env, ctx: ExecutionContext, pages: Pages, pathname: string): Promise<Response> {
+	if (!(await hasToken(request, env.EPHEMERA_TOKEN))) return Response.json({ error: "Missing or wrong bearer token" }, { status: 401 });
+	const ops = new Operations(pages, env.PAGES_HOST);
+	try {
+		return pathname === "/mcp" ? await handleMcp(request, env, ctx, ops) : await handleApi(request, ops);
+	} catch (error) {
+		if (error instanceof PageError) return Response.json({ error: error.message }, { status: error.status });
+		throw error;
+	}
+}
+
 async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext, pages: Pages): Promise<Response> {
 	const { pathname } = new URL(request.url);
-	if (pathname === "/api" || pathname.startsWith("/api/")) return handleApi(request, env, ctx, pages);
-	if (pathname === "/mcp") {
-		if (!(await hasToken(request, env.EPHEMERA_TOKEN))) return Response.json({ error: "Missing or wrong bearer token" }, { status: 401 });
-		return handleMcp(request, env, ctx, pages);
-	}
+	if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/mcp") return handleAgent(request, env, ctx, pages, pathname);
 	if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed\n", 405);
 	if (pathname === "/") return rootPage();
 	if (pathname === "/cat.jpg") return cat();
@@ -77,27 +86,32 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	if (rest === undefined) {
 		return new Response(null, { status: 301, headers: { location: `/${id}/${new URL(request.url).search}` } });
 	}
-	return servePage(request, pages, id, rest.slice(1));
+	try {
+		return await servePage(request, pages, id, rest.slice(1));
+	} catch (error) {
+		if (error instanceof PageError) return text(`${error.message}\n`, error.status);
+		throw error;
+	}
 }
 
 export default {
 	async fetch(request, env, ctx) {
 		const { hostname } = new URL(request.url);
-		const pages = new Pages(env);
+		const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work) });
 		try {
 			if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
 			if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);
 			return text("Not found\n", 404);
 		} catch (error) {
-			if (error instanceof PageError) return withPageHeaders(text(`${error.message}\n`, error.status));
+			// Each host's handler answers PageErrors in its own format; anything left is a bug.
 			console.error(error);
 			const response = text("Something went wrong\n", 500);
 			return hostname === env.PAGES_HOST ? withPageHeaders(response) : response;
 		}
 	},
 
-	async scheduled(_controller, env) {
-		const result = await new Pages(env).sweep();
+	async scheduled(_controller, env, ctx) {
+		const result = await new Pages(env, { defer: (work) => ctx.waitUntil(work) }).sweep();
 		console.log(`sweep: purged ${result.purged} gone page(s), forgot ${result.forgotten}`);
 	},
 } satisfies ExportedHandler<Env>;

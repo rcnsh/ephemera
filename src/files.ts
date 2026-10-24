@@ -1,5 +1,5 @@
 import { unzipSync } from "fflate";
-import { LIMITS, PageError } from "./limits.ts";
+import { bytesText, LIMITS, PageError } from "./domain.ts";
 
 export interface PageFile {
 	path: string;
@@ -63,7 +63,7 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
 				if (file.name.endsWith("/") || JUNK.test(file.name)) return false;
 				declaredBytes += file.originalSize;
 				declaredFiles += 1;
-				if (declaredBytes > LIMITS.pageBytes) throw new PageError(413, "Zip contents exceed the 25 MB page limit");
+				if (declaredBytes > LIMITS.pageBytes) throw new PageError(413, `Zip contents exceed the ${bytesText(LIMITS.pageBytes)} page limit`);
 				if (declaredFiles > LIMITS.pageFiles) throw new PageError(413, `Zip has more than ${LIMITS.pageFiles} files`);
 				return true;
 			},
@@ -83,10 +83,14 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
 	return names.map((name) => ({ path: normalizePath(name), body: entries[name]! }));
 }
 
-/** Checks a bundle against the per-page limits and returns its total size. */
-export function validateBundle(files: PageFile[]): number {
-	if (files.length === 0) throw new PageError(400, "A page needs at least one file");
-	if (files.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
+/**
+ * Checks a bundle against the per-page limits. Returns it with every path in
+ * canonical form (normalizing twice changes nothing), plus its total size.
+ */
+export function validateBundle(input: PageFile[]): { files: PageFile[]; size: number } {
+	if (input.length === 0) throw new PageError(400, "A page needs at least one file");
+	if (input.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
+	const files = input.map((file) => ({ path: normalizePath(file.path), body: file.body }));
 	const seen = new Set<string>();
 	let size = 0;
 	for (const file of files) {
@@ -95,8 +99,8 @@ export function validateBundle(files: PageFile[]): number {
 		size += file.body.byteLength;
 	}
 	if (!seen.has("index.html")) throw new PageError(400, "A page needs an index.html at its root");
-	if (size > LIMITS.pageBytes) throw new PageError(413, "A page can be at most 25 MB");
-	return size;
+	if (size > LIMITS.pageBytes) throw new PageError(413, `A page can be at most ${bytesText(LIMITS.pageBytes)}`);
+	return { files, size };
 }
 
 const TYPES: Record<string, string> = {

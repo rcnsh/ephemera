@@ -1,5 +1,5 @@
 import { checkCsrf, csrfToken } from "./auth.ts";
-import { LIMITS, PageError } from "./limits.ts";
+import { bytesText, LIMITS, PageError, pageUrl } from "./domain.ts";
 import type { Page, Pages, Usage } from "./pages.ts";
 
 const EXTENSIONS: Record<string, number> = { "1h": 3_600_000, "1d": 86_400_000, "7d": 7 * 86_400_000 };
@@ -14,13 +14,6 @@ function duration(ms: number): string {
 	const hours = Math.floor(minutes / 60);
 	if (hours < 48) return `${hours}h ${minutes % 60}m`;
 	return `${Math.floor(hours / 24)}d ${hours % 24}h`;
-}
-
-function bytes(n: number): string {
-	if (n < 1024) return `${n} B`;
-	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-	if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-	return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 const CSS = `
@@ -59,7 +52,7 @@ for (const button of document.querySelectorAll("[data-copy]")) {
 `;
 
 function row(page: Page, host: string, csrf: string, now: number): string {
-	const url = `https://${host}/${page.id}/`;
+	const url = pageUrl(host, page.id);
 	const action = (path: string, label: string, cls = "") =>
 		`<form method="post" action="/pages/${page.id}/${path}"><input type="hidden" name="csrf" value="${csrf}"><button${cls ? ` class="${cls}"` : ""}>${label}</button></form>`;
 	const extend = Object.keys(EXTENSIONS)
@@ -71,7 +64,7 @@ function row(page: Page, host: string, csrf: string, now: number): string {
 <td><a href="${url}" target="_blank" rel="noopener noreferrer">${page.id}</a> <button type="button" data-copy="${url}">copy</button></td>
 <td>${duration(now - page.createdAt)} ago</td>
 <td>${page.permanent ? "permanent" : duration(page.expiresAt! - now)}</td>
-<td>${bytes(page.size)} · ${page.fileCount} file${page.fileCount === 1 ? "" : "s"}</td>
+<td>${bytesText(page.size)} · ${page.fileCount} file${page.fileCount === 1 ? "" : "s"}</td>
 <td class="actions">${page.permanent ? action("temporary", "make temporary") : `${extend} ${action("permanent", "make permanent")}`}
 <details><summary>delete</summary> ${action("delete", "really delete", "danger")}</details></td>
 </tr>`;
@@ -86,7 +79,7 @@ function render(pages: Page[], usage: Usage, host: string, csrf: string, nonce: 
 <title>ephemera</title>
 <style nonce="${nonce}">${CSS}</style>
 <h1>ephemera</h1>
-<p class="usage">${usage.temporaryPages} / ${LIMITS.temporaryPages} temporary · ${usage.permanentPages} / ${LIMITS.permanentPages} permanent · ${bytes(usage.bytes)} / 2 GB</p>
+<p class="usage">${usage.temporaryPages} / ${LIMITS.temporaryPages} temporary · ${usage.permanentPages} / ${LIMITS.permanentPages} permanent · ${bytesText(usage.bytes)} / ${bytesText(LIMITS.totalBytes)}</p>
 ${
 	pages.length
 		? `<table>

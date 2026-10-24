@@ -65,11 +65,6 @@ export function zip(files: Record<string, string>): Uint8Array {
 	return zipSync(Object.fromEntries(Object.entries(files).map(([name, text]) => [name, strToU8(text)])));
 }
 
-/** Moves a page's clock: sets when it expires (or was deleted) directly in D1. */
-export async function setExpiry(id: string, expiresAt: number | null): Promise<void> {
-	await env.DB.prepare("UPDATE pages SET expires_at = ? WHERE id = ?").bind(expiresAt, id).run();
-}
-
 export async function objectCount(id: string): Promise<number> {
 	return (await env.BUCKET.list({ prefix: `pages/${id}/` })).objects.length;
 }
