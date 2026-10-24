@@ -8,7 +8,7 @@ One Cloudflare Worker serves three things:
 | --- | --- | --- |
 | `p.rcn.sh/<id>/` | the pages, sandboxed (`CSP: sandbox` without `allow-same-origin`), `noindex`, `no-cache` with ETags (so unchanged files come back as 304s), `Access-Control-Allow-Origin: *` so they can fetch and import their own files | none |
 | `p.rcn.sh/api`, `p.rcn.sh/mcp` | HTTP API and remote MCP server | `Authorization: Bearer $EPHEMERA_TOKEN` |
-| `ephemera.rcn.sh` | dashboard: list, extend, make permanent or temporary, delete | Cloudflare Access |
+| `ephemera.rcn.sh` | dashboard: a card per page with a thumbnail; search and filter by agent; rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions, delete | Cloudflare Access |
 
 A page can be private. Then `p.rcn.sh/<id>/` shows a gate: a link to sign in through Access (`ephemera.rcn.sh/open/<id>/`), and a password form if the page has a password. Both redirect to `p.rcn.sh/<id>/~<pass>/`, where the pass lasts 12 hours. The pass goes in the path rather than a cookie, because a sandboxed page's own requests don't send cookies. Relative links carry it along, so the page's files, `fetch` and imports all work. `share_link` makes passes for other people (up to 30 days). Setting the visibility again revokes every pass handed out.
 
@@ -37,7 +37,7 @@ curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKE
   -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
 ```
 
-`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage. `GET /api/pages/:id/versions` lists the kept versions and `POST /api/pages/:id/rollback` with `{"version":2}` serves one again. `POST /api/pages/:id/files` with `{"files":[…],"remove":["old.css"]}` changes single files and keeps the rest. `POST /api/pages/:id/visibility` with `{"visibility":"private","password":"…"}` makes a page private, and `POST /api/pages/:id/share` with `{"ttl":"7d"}` makes a share link. Publishing takes `visibility` and `password` too. `POST /api/uploads` (optionally with `{"id":…}`) returns an upload URL: `PUT` a zip to it within an hour, without the token, to replace that page's files.
+`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page (`{"label":"…"}` renames it), `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage. `GET /api/pages/:id/versions` lists the kept versions and `POST /api/pages/:id/rollback` with `{"version":2}` serves one again. `POST /api/pages/:id/files` with `{"files":[…],"remove":["old.css"]}` changes single files and keeps the rest. `POST /api/pages/:id/visibility` with `{"visibility":"private","password":"…"}` makes a page private, and `POST /api/pages/:id/share` with `{"ttl":"7d"}` makes a share link. Publishing takes `visibility` and `password` too. `POST /api/uploads` (optionally with `{"id":…}`) returns an upload URL: `PUT` a zip to it within an hour, without the token, to replace that page's files.
 
 Pages should link to their own files with relative paths. Root-relative links in HTML attributes are rewritten to stay inside the page; ones in CSS or JS can't be, so publishing returns a warning for each one it finds.
 
@@ -52,5 +52,7 @@ pnpm deploy      # migrate, then cf deploy
 ```
 
 The D1 schema lives in `migrations/`; add a change with `cf d1 migrations create <message>`. Tests apply the migrations to a fresh database before each test.
+
+Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. If the browser fails, the dashboard shows a blank tile and tries again on the next load.
 
 The token is a Worker secret (`EPHEMERA_TOKEN`). `ACCESS_AUD` in `cloudflare.config.ts` is the audience tag of the Access application that protects `ephemera.rcn.sh`. The dashboard refuses any request that Access didn't authenticate for that application.

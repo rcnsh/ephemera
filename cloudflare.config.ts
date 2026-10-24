@@ -13,6 +13,8 @@ export default defineConfig({
 		env: {
 			DB: bindings.d1({ name: "ephemera" }),
 			BUCKET: bindings.r2({ name: "ephemera" }),
+			// Browser Rendering, for the dashboard's thumbnails.
+			BROWSER: bindings.browser(),
 			EPHEMERA_TOKEN: bindings.secret(),
 			PAGES_HOST: bindings.text("p.rcn.sh"),
 			ADMIN_HOST: bindings.text("ephemera.rcn.sh"),
