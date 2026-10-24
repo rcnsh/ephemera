@@ -45,7 +45,7 @@ export async function handleUpload(request: Request, ops: Operations, id: string
  *   POST   /api/pages        publish (JSON or zip)
  *   GET    /api/pages/:id    one page
  *   PUT    /api/pages/:id    replace its files (JSON or zip)
- *   PATCH  /api/pages/:id    { ttl }: extend, or "permanent"
+ *   PATCH  /api/pages/:id    { ttl }: extend, or "permanent"; { label }: rename
  *   DELETE /api/pages/:id    delete now
  *   GET    /api/pages/:id/versions   the versions it keeps
  *   POST   /api/pages/:id/rollback   { version }: serve that version again
@@ -89,8 +89,12 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 				return json(await ops.get(id));
 			case "PUT":
 				return json(await ops.update(id, (await readBundle(request, url)).files));
-			case "PATCH":
-				return json(await ops.extend(id, (await readJson<{ ttl: TtlInput }>(request)).ttl));
+			case "PATCH": {
+				const body = await readJson<{ ttl: TtlInput; label: unknown }>(request);
+				if ("label" in body) await ops.setLabel(id, body.label);
+				if ("ttl" in body || !("label" in body)) return json(await ops.extend(id, body.ttl));
+				return json(await ops.get(id));
+			}
 			case "DELETE":
 				return json(await ops.delete(id));
 		}

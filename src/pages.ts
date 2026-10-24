@@ -407,6 +407,25 @@ export class Pages {
 		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
 	}
 
+	/** The versions every live page keeps, newest first, by page id. */
+	async allVersions(): Promise<Map<string, Version[]>> {
+		const now = this.now();
+		const { results } = await this.db
+			.prepare(
+				`SELECT versions.page_id, versions.version, versions.created_at, versions.size, versions.file_count, pages.version AS current
+				FROM versions JOIN pages ON pages.id = versions.page_id WHERE ${LIVE} ORDER BY versions.version DESC`,
+			)
+			.bind(now)
+			.all<VersionRow & { page_id: string; current: number }>();
+		const byPage = new Map<string, Version[]>();
+		for (const row of results) {
+			const list = byPage.get(row.page_id) ?? [];
+			list.push({ version: row.version, createdAt: row.created_at, size: row.size, fileCount: row.file_count, current: row.version === row.current });
+			byPage.set(row.page_id, list);
+		}
+		return byPage;
+	}
+
 	/** The versions a live page keeps, newest first. */
 	async versions(id: string): Promise<Version[]> {
 		const page = await this.get(id);
@@ -515,6 +534,30 @@ export class Pages {
 			.run();
 		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return { ...page, visibility, passwordHash: hash, shareEpoch: page.shareEpoch + 1, updatedAt: now };
+	}
+
+	async setLabel(id: string, label: string | null): Promise<Page> {
+		const page = await this.get(id);
+		const now = this.now();
+		const cleaned = clean(label, 200);
+		const result = await this.db.prepare(`UPDATE pages SET label = ?, updated_at = ? WHERE id = ? AND ${LIVE}`).bind(cleaned, now, id, now).run();
+		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		return { ...page, label: cleaned, updatedAt: now };
+	}
+
+	/** The page's thumbnail, if one was made for the version it's serving. It lives with the files, so it goes when they do. */
+	async thumbnail(page: Page): Promise<R2ObjectBody | null> {
+		const object = await this.storage.BUCKET.get(`pages/${page.id}/thumbnail.png`);
+		if (object && object.customMetadata?.version === String(page.version)) return object;
+		await object?.body.cancel();
+		return null;
+	}
+
+	async saveThumbnail(page: Page, png: Uint8Array): Promise<void> {
+		await this.storage.BUCKET.put(`pages/${page.id}/thumbnail.png`, png, {
+			httpMetadata: { contentType: "image/png" },
+			customMetadata: { version: String(page.version) },
+		});
 	}
 
 	/** Makes a permanent page temporary with a fresh default TTL. */

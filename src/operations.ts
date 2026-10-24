@@ -140,6 +140,11 @@ export class Operations {
 		return { id, url: passUrl(this.host, id, await passFor(this.secret, page, now, ms)), expiresAt: now + ms };
 	}
 
+	async setLabel(id: string, label: unknown) {
+		if (label !== null && typeof label !== "string") throw new PageError(400, "label must be a string, or null to clear it");
+		return pageView(await this.pages.setLabel(id, label), this.host);
+	}
+
 	async extend(id: string, ttl: TtlInput) {
 		return pageView(await this.pages.extend(id, parseTtl(ttl)), this.host);
 	}

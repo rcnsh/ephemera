@@ -1,8 +1,12 @@
 import { reset } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
-import { ADMIN, call, publish } from "./helpers.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { screenshot } from "../src/thumbnails.ts";
+import { ADMIN, api, call, publish } from "./helpers.ts";
 
-afterEach(() => reset());
+afterEach(async () => {
+	vi.mocked(screenshot).mockReset().mockResolvedValue(null);
+	await reset();
+});
 
 const AUD = "test-aud";
 
@@ -16,12 +20,16 @@ async function csrfToken(): Promise<string> {
 	return /name="csrf" value="([^"]+)"/.exec(html)![1]!;
 }
 
-function post(path: string, csrf: string, origin = ADMIN): Promise<Response> {
+function post(path: string, csrf: string, origin = ADMIN, fields: Record<string, string> = {}): Promise<Response> {
 	return admin(path, {
 		method: "POST",
 		headers: { origin, "content-type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams({ csrf }),
+		body: new URLSearchParams({ csrf, ...fields }),
 	});
+}
+
+async function pageInfo(id: string): Promise<Record<string, unknown>> {
+	return (await api(`/pages/${id}`)).json();
 }
 
 describe("dashboard", () => {
@@ -68,5 +76,102 @@ describe("dashboard", () => {
 
 		expect((await post(`/pages/${page.id}/delete`, csrf)).status).toBe(303);
 		expect((await call(page.url)).status).toBe(410);
+	});
+
+	it("shows a card per page with a thumbnail, search and an agent filter", async () => {
+		const page = await publish({ label: "chart", agent: "codex" });
+		await publish({ agent: "claude-code" });
+		const html = await (await admin()).text();
+		expect(html).toContain(`<img src="/thumbnails/${page.id}.png?v=1"`);
+		expect(html).toContain('id="search"');
+		expect(html).toMatch(/<option>claude-code<\/option><option>codex<\/option>/);
+		expect(html).toContain('data-search="chart');
+		expect((await admin()).headers.get("content-security-policy")).toContain("img-src 'self'");
+	});
+
+	it("renames pages", async () => {
+		const page = await publish({ label: "old" });
+		const csrf = await csrfToken();
+		expect((await post(`/pages/${page.id}/label`, csrf, ADMIN, { label: "  new name " })).status).toBe(303);
+		expect((await pageInfo(page.id)).label).toBe("new name");
+		await post(`/pages/${page.id}/label`, csrf, ADMIN, { label: "" });
+		expect((await pageInfo(page.id)).label).toBeNull();
+	});
+
+	it("makes pages private, sets and removes passwords, and makes share links", async () => {
+		const page = await publish();
+		const csrf = await csrfToken();
+		await post(`/pages/${page.id}/private`, csrf);
+		expect(await pageInfo(page.id)).toMatchObject({ visibility: "private", hasPassword: false });
+		expect(await (await admin()).text()).toContain(`href="/open/${page.id}/"`);
+
+		await post(`/pages/${page.id}/password`, csrf, ADMIN, { password: "correct horse" });
+		expect(await pageInfo(page.id)).toMatchObject({ visibility: "private", hasPassword: true });
+		expect((await post(`/pages/${page.id}/password`, csrf, ADMIN, { password: "short" })).status).toBe(400);
+		await post(`/pages/${page.id}/password`, csrf);
+		expect(await pageInfo(page.id)).toMatchObject({ visibility: "private", hasPassword: false });
+
+		const shared = await post(`/pages/${page.id}/share?ttl=7d`, csrf);
+		expect(shared.status).toBe(200);
+		const link = /<input readonly value="([^"]+)"/.exec(await shared.text())![1]!;
+		expect((await call(link)).status).toBe(200);
+		expect((await post(`/pages/${page.id}/share?ttl=1y`, csrf)).status).toBe(400);
+
+		await post(`/pages/${page.id}/public`, csrf);
+		expect((await call(page.url)).status).toBe(200);
+	});
+
+	it("lists versions and rolls back", async () => {
+		const page = await publish({ files: [{ path: "index.html", content: "v1" }] });
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ html: "v2" }) });
+		const csrf = await csrfToken();
+		const html = await (await admin()).text();
+		expect(html).toContain("2 versions");
+		expect(html).toContain(`action="/pages/${page.id}/rollback?version=1"`);
+		expect((await post(`/pages/${page.id}/rollback?version=1`, csrf)).status).toBe(303);
+		expect(await (await call(page.url)).text()).toBe("v1");
+		expect((await post(`/pages/${page.id}/rollback?version=7`, csrf)).status).toBe(404);
+	});
+
+	it("makes a thumbnail once per version, and doesn't cache a failed one", async () => {
+		const png = new Uint8Array([137, 80, 78, 71]);
+		vi.mocked(screenshot).mockResolvedValue(png);
+		const page = await publish();
+
+		const first = await admin(`/thumbnails/${page.id}.png`);
+		expect(first.headers.get("content-type")).toBe("image/png");
+		expect(new Uint8Array(await first.arrayBuffer())).toEqual(png);
+		expect(vi.mocked(screenshot).mock.calls[0]![1]).toBe(page.url);
+		await admin(`/thumbnails/${page.id}.png`);
+		expect(screenshot).toHaveBeenCalledTimes(1);
+
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ html: "v2" }) });
+		vi.mocked(screenshot).mockResolvedValue(null);
+		const failed = await admin(`/thumbnails/${page.id}.png`);
+		expect(failed.headers.get("content-type")).toBe("image/svg+xml");
+		expect(failed.headers.get("cache-control")).toBe("no-store");
+		await admin(`/thumbnails/${page.id}.png`);
+		expect(screenshot).toHaveBeenCalledTimes(3);
+		expect((await admin(`/thumbnails/${page.id}.png`, {}, null)).status).toBe(403);
+	});
+
+	it("shoots private pages through a short-lived pass", async () => {
+		vi.mocked(screenshot).mockResolvedValue(new Uint8Array([1]));
+		const page = await publish({ visibility: "private" });
+		await admin(`/thumbnails/${page.id}.png`);
+		const url = vi.mocked(screenshot).mock.calls[0]![1];
+		expect(url).toMatch(new RegExp(`/${page.id}/~`));
+		expect((await call(url)).status).toBe(200);
+	});
+});
+
+describe("renaming through the API", () => {
+	it("takes a label in PATCH, with or without a ttl", async () => {
+		const page = await publish({ ttl: "1h" });
+		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "x" }) })).json()) as { label: string; expiresAt: number };
+		expect(renamed).toMatchObject({ label: "x", expiresAt: page.expiresAt });
+		const both = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "y", ttl: "1h" }) })).json()) as { label: string; expiresAt: number };
+		expect(both.label).toBe("y");
+		expect(both.expiresAt).toBe(page.expiresAt! + 3_600_000);
 	});
 });
