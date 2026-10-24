@@ -100,14 +100,6 @@ describe("page lifecycle", () => {
 		expect(await status(pages.extend(page.id, DAY))).toBe(410);
 	});
 
-	it("deletes the old version's files in the background after an update", async () => {
-		const { pages, settle } = store();
-		const page = await pages.publish({ files: INDEX, ttl: HOUR });
-		const updated = await pages.update(page.id, [file("index.html", "v2"), file("a.txt")]);
-		expect(updated.version).toBe(2);
-		await settle();
-		expect(await objectCount(page.id)).toBe(2);
-	});
 
 	it("normalizes paths itself, whoever calls it", async () => {
 		const { pages } = store();
@@ -115,6 +107,68 @@ describe("page lifecycle", () => {
 		expect(await pages.hasFile(page, "index.html")).toBe(true);
 		expect(await pages.hasFile(page, "css/a.css")).toBe(true);
 		expect(await status(pages.publish({ files: [file("index.html"), file("../x")], ttl: HOUR }))).toBe(400);
+	});
+});
+
+describe("versions", () => {
+	async function text(pages: Pages, id: string): Promise<string> {
+		const object = (await pages.file(await pages.get(id), "index.html")) as R2ObjectBody;
+		return object.text();
+	}
+
+	it("keeps the newest versions and deletes older ones in the background", async () => {
+		const { pages, settle } = store();
+		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
+		for (let n = 2; n <= LIMITS.keptVersions + 2; n++) await pages.update(page.id, [file("index.html", `v${n}`)]);
+		await settle();
+		const versions = await pages.versions(page.id);
+		expect(versions.map((v) => v.version)).toEqual([7, 6, 5, 4, 3]);
+		expect(versions[0]!.current).toBe(true);
+		expect(await objectCount(page.id)).toBe(LIMITS.keptVersions);
+	});
+
+	it("rolls back, and gives the next update a new number", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
+		await pages.update(page.id, [file("index.html", "v2")]);
+		const rolledBack = await pages.rollback(page.id, 1);
+		expect(rolledBack.version).toBe(1);
+		expect(await text(pages, page.id)).toBe("v1");
+
+		const updated = await pages.update(page.id, [file("index.html", "v3")]);
+		expect(updated.version).toBe(3);
+		expect(await text(pages, page.id)).toBe("v3");
+		expect(await status(pages.rollback(page.id, 9))).toBe(404);
+	});
+
+	it("never prunes the version being served", async () => {
+		const { pages, settle } = store();
+		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
+		await pages.update(page.id, [file("index.html", "v2")]);
+		await pages.rollback(page.id, 1);
+		for (let n = 3; n <= LIMITS.keptVersions + 3; n++) await pages.update(page.id, [file("index.html", `v${n}`)]);
+		await pages.rollback(page.id, LIMITS.keptVersions + 3);
+		await settle();
+		expect(await text(pages, page.id)).toBe(`v${LIMITS.keptVersions + 3}`);
+		expect((await pages.versions(page.id)).length).toBe(LIMITS.keptVersions);
+	});
+
+	it("counts every kept version towards storage", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: [file("index.html", "12345")], ttl: HOUR });
+		await pages.update(page.id, [file("index.html", "123")]);
+		expect((await pages.usage()).bytes).toBe(8);
+		expect((await pages.get(page.id)).size).toBe(3);
+	});
+
+	it("forgets a page's versions with the page", async () => {
+		const { pages, clock } = store();
+		const page = await pages.publish({ files: INDEX, ttl: HOUR });
+		await pages.update(page.id, INDEX);
+		clock.now = START + HOUR + LIMITS.goneGrace;
+		await pages.sweep();
+		const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM versions WHERE page_id = ?").bind(page.id).first<{ n: number }>();
+		expect(left!.n).toBe(0);
 	});
 });
 

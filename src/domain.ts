@@ -12,6 +12,8 @@ export const LIMITS = {
 	minTtl: 5 * MINUTE,
 	maxTtl: 30 * DAY,
 	defaultTtl: DAY,
+	/** Versions kept per page, counting the one being served. Older ones are deleted on update. */
+	keptVersions: 5,
 	/** How long a deleted or expired page answers 410 before it becomes a plain 404. */
 	goneGrace: 7 * DAY,
 } as const;

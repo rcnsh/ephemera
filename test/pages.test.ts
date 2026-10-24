@@ -247,7 +247,26 @@ describe("updating and expiry", () => {
 		expect(updated.expiresAt).toBe(page.expiresAt);
 		expect(updated.fileCount).toBe(2);
 		expect(await (await call(page.url)).text()).toBe("<p>v2</p>");
-		expect(await objectCount(page.id)).toBe(2);
+		// The first version's index.html is kept for rollback.
+		expect(await objectCount(page.id)).toBe(3);
+	});
+
+	it("lists versions and rolls back to one", async () => {
+		const page = await publish({ files: [{ path: "index.html", content: "v1" }] });
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "v2" }] }) });
+		const versions = (await (await api(`/pages/${page.id}/versions`)).json()) as { versions: { version: number; current: boolean }[] };
+		expect(versions.versions.map((v) => [v.version, v.current])).toEqual([
+			[2, true],
+			[1, false],
+		]);
+
+		const rolledBack = await api(`/pages/${page.id}/rollback`, { method: "POST", body: JSON.stringify({ version: 1 }) });
+		expect(rolledBack.status).toBe(200);
+		expect(((await rolledBack.json()) as { version: number }).version).toBe(1);
+		expect(await (await call(page.url)).text()).toBe("v1");
+
+		expect((await api(`/pages/${page.id}/rollback`, { method: "POST", body: JSON.stringify({ version: 9 }) })).status).toBe(404);
+		expect((await api(`/pages/${page.id}/rollback`, { method: "POST", body: JSON.stringify({}) })).status).toBe(400);
 	});
 
 	it("extends from the current expiry, capped at 30 days from now", async () => {

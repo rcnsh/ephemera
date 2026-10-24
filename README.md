@@ -12,13 +12,13 @@ One Cloudflare Worker serves three things:
 
 `p.rcn.sh/` itself shows a random cat from [cataas](https://cataas.com).
 
-Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). Every request checks the expiry, so a page stops working the moment it expires; it then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
+Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). Each update adds a version; a page keeps its last 5, and can be rolled back to any of them. Every request checks the expiry, so a page stops working the moment it expires; it then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
 
-Limits: 25 MB and 200 files per page, 100 temporary pages, 25 permanent pages, 2 GB in total.
+Limits: 25 MB and 200 files per page, 100 temporary pages, 25 permanent pages, 2 GB in total (kept versions included).
 
 ## Publishing
 
-With MCP, the tools are `publish_page`, `update_page`, `extend_page`, `delete_page` and `list_pages`.
+With MCP, the tools are `publish_page`, `update_page`, `extend_page`, `delete_page`, `list_pages`, `list_versions` and `rollback_page`.
 
 With the API:
 
@@ -32,7 +32,7 @@ curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKE
   -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
 ```
 
-`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage.
+`PUT /api/pages/:id` replaces the files (the URL and expiry stay the same), `PATCH /api/pages/:id` with `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends a page, `DELETE /api/pages/:id` deletes it, and `GET /api/pages` lists live pages and usage. `GET /api/pages/:id/versions` lists the kept versions and `POST /api/pages/:id/rollback` with `{"version":2}` serves one again.
 
 Pages should link to their own files with relative paths. Root-relative links in HTML attributes are rewritten to stay inside the page; ones in CSS or JS can't be, so publishing returns a warning for each one it finds.
 
