@@ -1,5 +1,5 @@
 import { handleApi, handleUpload } from "./api.ts";
-import { checkUploadToken, hasToken } from "./auth.ts";
+import { checkUploadToken, checkViewPass, hasToken, PASS_PATTERN } from "./auth.ts";
 import { cat, rootPage } from "./cat.ts";
 import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
@@ -8,6 +8,7 @@ import { rewriteLinks } from "./links.ts";
 import { handleMcp } from "./mcp.ts";
 import { Operations } from "./operations.ts";
 import { ID_PATTERN, Pages } from "./pages.ts";
+import { gate, unlock } from "./privacy.ts";
 
 /**
  * Every response from the pages host goes out with these. Agent-written HTML
@@ -39,12 +40,30 @@ function withPageHeaders(response: Response): Response {
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-async function servePage(request: Request, pages: Pages, id: string, rest: string): Promise<Response> {
+async function servePage(request: Request, env: Env, pages: Pages, id: string, subpath: string): Promise<Response> {
 	const found = await pages.lookup(id);
 	if (found.state === "gone") return text("This page has expired.\n", 410);
 	if (found.state === "missing") return text("Not found\n", 404);
 	const page = found.page;
 	const url = new URL(request.url);
+
+	// A private page needs a pass as its first path segment: /<id>/~<pass>/<rest>.
+	let pass: string | null = null;
+	let rest = subpath;
+	const [first = "", ...after] = subpath.split("/");
+	if (PASS_PATTERN.test(first)) {
+		// A pass on a page that has since been made public: drop it.
+		if (page.visibility === "public") return new Response(null, { status: 301, headers: { location: `/${id}/${after.join("/")}${url.search}` } });
+		if (!(await checkViewPass(env.EPHEMERA_TOKEN, id, page.shareEpoch, first))) {
+			return gate(env, page, after.join("/"), "This link has expired or been revoked.");
+		}
+		if (after.length === 0) return new Response(null, { status: 301, headers: { location: `/${id}/${first}/${url.search}` } });
+		pass = first;
+		rest = after.join("/");
+	} else if (page.visibility === "private") {
+		return gate(env, page, subpath);
+	}
+	const base = pass ? `/${id}/${pass}` : `/${id}`;
 
 	let path: string;
 	try {
@@ -57,7 +76,7 @@ async function servePage(request: Request, pages: Pages, id: string, rest: strin
 	const object = await pages.file(page, path, request.headers);
 	if (!object && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
 		// A folder without its trailing slash: redirect so relative links inside it resolve.
-		return new Response(null, { status: 301, headers: { location: `/${id}/${rest}/${url.search}` } });
+		return new Response(null, { status: 301, headers: { location: `${base}/${rest}/${url.search}` } });
 	}
 	if (!object) return text("Not found\n", 404);
 
@@ -66,12 +85,12 @@ async function servePage(request: Request, pages: Pages, id: string, rest: strin
 	const headers = new Headers({
 		"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
 		etag: object.httpEtag,
-		"cache-control": "no-cache",
+		"cache-control": pass ? "private, no-cache" : "no-cache",
 	});
 	if (!("body" in object)) return new Response(null, { status: 304, headers });
 	if (request.method === "HEAD") return new Response(null, { headers });
 	const response = new Response(object.body, { headers });
-	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id) : response;
+	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id, pass) : response;
 }
 
 /** Routes for agents: they need the token (or an upload URL), and get errors back as JSON. */
@@ -96,6 +115,8 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/mcp" || pathname.startsWith("/upload/")) {
 		return handleAgent(request, env, ctx, pages, pathname);
 	}
+	const unlocking = /^\/([a-z2-7]{12})\/_unlock$/.exec(pathname);
+	if (unlocking && request.method === "POST") return unlock(request, env, pages, unlocking[1]!);
 	if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed\n", 405);
 	if (pathname === "/") return rootPage();
 	if (pathname === "/cat.jpg") return cat();
@@ -107,7 +128,7 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 		return new Response(null, { status: 301, headers: { location: `/${id}/${new URL(request.url).search}` } });
 	}
 	try {
-		return await servePage(request, pages, id, rest.slice(1));
+		return await servePage(request, env, pages, id, rest.slice(1));
 	} catch (error) {
 		if (error instanceof PageError) return text(`${error.message}\n`, error.status);
 		throw error;

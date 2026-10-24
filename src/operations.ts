@@ -1,8 +1,9 @@
-import { uploadToken } from "./auth.ts";
-import { PageError, pageUrl, parseTtl } from "./domain.ts";
+import { hashPassword, uploadToken } from "./auth.ts";
+import { LIMITS, PageError, pageUrl, parseTtl } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
-import type { Page, Pages } from "./pages.ts";
+import type { Page, Pages, Visibility } from "./pages.ts";
+import { passFor, passUrl } from "./privacy.ts";
 
 /** What agents see of a page. */
 export function pageView(page: Page, host: string) {
@@ -18,7 +19,24 @@ export function pageView(page: Page, host: string) {
 		size: page.size,
 		fileCount: page.fileCount,
 		version: page.version,
+		visibility: page.visibility,
+		hasPassword: page.passwordHash !== null,
 	};
+}
+
+/**
+ * Checks a visibility and password as agents give them. A password alone
+ * implies private; a public page can't have one.
+ */
+async function privacy(visibility: unknown, password: unknown): Promise<{ visibility: Visibility; passwordHash: string | null }> {
+	if (password !== undefined && password !== null && typeof password !== "string") throw new PageError(400, "password must be a string");
+	const chosen = visibility ?? (password ? "private" : "public");
+	if (chosen !== "public" && chosen !== "private") throw new PageError(400, 'visibility must be "public" or "private"');
+	if (password) {
+		if (chosen === "public") throw new PageError(400, "Only private pages can have a password");
+		if (password.length < 8 || password.length > 200) throw new PageError(400, "A password must be 8 to 200 characters");
+	}
+	return { visibility: chosen, passwordHash: password ? await hashPassword(password) : null };
 }
 
 /** A TTL as an agent gives it, before `parseTtl`. */
@@ -29,6 +47,9 @@ export interface PublishInput {
 	ttl?: TtlInput;
 	label?: string | null;
 	agent?: string | null;
+	/** Checked by `privacy`. */
+	visibility?: unknown;
+	password?: unknown;
 }
 
 /**
@@ -56,7 +77,13 @@ export class Operations {
 	) {}
 
 	async publish(input: PublishInput) {
-		const page = await this.pages.publish({ files: input.files, ttl: parseTtl(input.ttl), label: input.label, agent: input.agent });
+		const page = await this.pages.publish({
+			files: input.files,
+			ttl: parseTtl(input.ttl),
+			label: input.label,
+			agent: input.agent,
+			...(await privacy(input.visibility, input.password)),
+		});
 		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(input.files) };
 	}
 
@@ -77,7 +104,7 @@ export class Operations {
 	 * hour. Without `id`, publishes a placeholder page first, so the agent
 	 * gets the final URL before uploading.
 	 */
-	async uploadUrl(input: { id?: string | null; ttl?: TtlInput; label?: string | null; agent?: string | null }) {
+	async uploadUrl(input: { id?: string | null; ttl?: TtlInput; label?: string | null; agent?: string | null; visibility?: unknown; password?: unknown }) {
 		const page = input.id
 			? await this.pages.get(input.id)
 			: await this.pages.publish({
@@ -85,6 +112,7 @@ export class Operations {
 					ttl: parseTtl(input.ttl),
 					label: input.label,
 					agent: input.agent,
+					...(await privacy(input.visibility, input.password)),
 				});
 		const expiresAt = this.now() + UPLOAD_WINDOW;
 		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, expiresAt)}`;
@@ -94,6 +122,22 @@ export class Operations {
 			uploadExpiresAt: expiresAt,
 			command: `(cd <folder> && zip -qr - .) | curl -fsS -X PUT -H "content-type: application/zip" --data-binary @- "${uploadUrl}"`,
 		};
+	}
+
+	/** Makes a page public or private (optionally with a password), revoking every link handed out so far. */
+	async setVisibility(id: string, visibility: unknown, password: unknown) {
+		const chosen = await privacy(visibility, password);
+		return pageView(await this.pages.setVisibility(id, chosen.visibility, chosen.passwordHash), this.host);
+	}
+
+	/** A link that opens a private page without signing in, until it expires (a day by default). A public page's link is just its URL. */
+	async shareLink(id: string, ttl: TtlInput) {
+		const page = await this.pages.get(id);
+		if (page.visibility === "public") return { id, url: pageUrl(this.host, id), expiresAt: page.expiresAt };
+		const ms = parseTtl(ttl);
+		if (ms === "permanent") throw new PageError(400, `A share link lasts at most ${LIMITS.maxTtl / 86_400_000} days`);
+		const now = this.now();
+		return { id, url: passUrl(this.host, id, await passFor(this.secret, page, now, ms)), expiresAt: now + ms };
 	}
 
 	async extend(id: string, ttl: TtlInput) {

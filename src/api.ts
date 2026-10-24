@@ -15,15 +15,17 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 	if (/zip|octet-stream/.test(type)) {
 		const files = unzipFiles(new Uint8Array(await request.arrayBuffer()));
 		const ttl = url.searchParams.get("ttl");
-		return { files, ttl: ttl && /^\d+$/.test(ttl) ? Number(ttl) : ttl, label: url.searchParams.get("label"), agent: url.searchParams.get("agent") };
+		// No password here: query strings end up in logs. Set one with /visibility afterwards.
+		const query = (name: string) => url.searchParams.get(name) ?? undefined;
+		return { files, ttl: ttl && /^\d+$/.test(ttl) ? Number(ttl) : ttl, label: query("label"), agent: query("agent"), visibility: query("visibility") };
 	}
-	let body: BundleInput & { ttl?: string | number; label?: string; agent?: string };
+	let body: BundleInput & { ttl?: string | number; label?: string; agent?: string; visibility?: unknown; password?: unknown };
 	try {
 		body = await request.json();
 	} catch {
 		throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent }) or a zip file");
 	}
-	return { files: bundleFrom(body, body.label), ttl: body.ttl, label: body.label, agent: body.agent };
+	return { files: bundleFrom(body, body.label), ttl: body.ttl, label: body.label, agent: body.agent, visibility: body.visibility, password: body.password };
 }
 
 async function readJson<T>(request: Request): Promise<Partial<T>> {
@@ -48,14 +50,16 @@ export async function handleUpload(request: Request, ops: Operations, id: string
  *   GET    /api/pages/:id/versions   the versions it keeps
  *   POST   /api/pages/:id/rollback   { version }: serve that version again
  *   POST   /api/pages/:id/files      { files, remove }: change single files
+ *   POST   /api/pages/:id/visibility { visibility, password }: make it public or private
+ *   POST   /api/pages/:id/share      { ttl }: a link that opens a private page
  *   POST   /api/uploads              { id?, ttl, label, agent }: an upload URL for a zip
  */
 export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname === "/api/uploads" && request.method === "POST") {
-		return json(await ops.uploadUrl(await readJson<{ id: string; ttl: TtlInput; label: string; agent: string }>(request)), 201);
+		return json(await ops.uploadUrl(await readJson<{ id: string; ttl: TtlInput; label: string; agent: string; visibility: unknown; password: unknown }>(request)), 201);
 	}
-	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files))?)?\/?$/.exec(url.pathname);
+	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files|visibility|share))?)?\/?$/.exec(url.pathname);
 	if (!match) return json({ error: "Not found" }, 404);
 	const [, id, sub] = match;
 	if (id && sub) {
@@ -64,6 +68,11 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 			const body = await readJson<{ version: unknown }>(request);
 			return json(await ops.rollback(id, body.version));
 		}
+		if (sub === "visibility" && request.method === "POST") {
+			const body = await readJson<{ visibility: unknown; password: unknown }>(request);
+			return json(await ops.setVisibility(id, body.visibility, body.password));
+		}
+		if (sub === "share" && request.method === "POST") return json(await ops.shareLink(id, (await readJson<{ ttl: TtlInput }>(request)).ttl));
 		if (sub === "files" && request.method === "POST") {
 			const body = await readJson<{ files: InlineFile[]; remove: string[] }>(request);
 			if (body.remove !== undefined && !(Array.isArray(body.remove) && body.remove.every((path) => typeof path === "string"))) {

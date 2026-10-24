@@ -1,6 +1,7 @@
 import { checkCsrf, csrfToken } from "./auth.ts";
 import { bytesText, LIMITS, PageError, pageUrl } from "./domain.ts";
 import type { Page, Pages, Usage } from "./pages.ts";
+import { passFor, passUrl, safeRest } from "./privacy.ts";
 
 const EXTENSIONS: Record<string, number> = { "1h": 3_600_000, "1d": 86_400_000, "7d": 7 * 86_400_000 };
 
@@ -61,7 +62,7 @@ function row(page: Page, host: string, csrf: string, now: number): string {
 	return `<tr>
 <td>${page.label ? escape(page.label) : '<span class="muted">—</span>'}</td>
 <td>${page.agent ? escape(page.agent) : '<span class="muted">—</span>'}</td>
-<td><a href="${url}" target="_blank" rel="noopener noreferrer">${page.id}</a> <button type="button" data-copy="${url}">copy</button></td>
+<td><a href="${page.visibility === "private" ? `/open/${page.id}/` : url}" target="_blank" rel="noopener noreferrer">${page.id}</a> <button type="button" data-copy="${url}">copy</button>${page.visibility === "private" ? ` <span class="muted">private${page.passwordHash ? " · password" : ""}</span>` : ""}</td>
 <td>${duration(now - page.createdAt)} ago</td>
 <td>${page.permanent ? "permanent" : duration(page.expiresAt! - now)}</td>
 <td>${bytesText(page.size)} · ${page.fileCount} file${page.fileCount === 1 ? "" : "s"}</td>
@@ -120,6 +121,18 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		const [list, usage] = await Promise.all([pages.list(), pages.usage()]);
 		const csrf = await csrfToken(env.EPHEMERA_TOKEN, user);
 		return respond(render(list, usage, env.PAGES_HOST, csrf, nonce, Date.now()), 200, nonce);
+	}
+
+	// Signing in to a private page: Access has checked who this is, so hand out a pass.
+	const opening = /^\/open\/([a-z2-7]{12})(?:\/(.*))?$/.exec(url.pathname);
+	if (request.method === "GET" && opening) {
+		const [, id, rest = ""] = opening as unknown as [string, string, string | undefined];
+		const found = await pages.lookup(id);
+		if (found.state !== "live") return respond(found.state === "gone" ? "This page has expired." : "Not found", found.state === "gone" ? 410 : 404);
+		const page = found.page;
+		const location =
+			page.visibility === "private" ? passUrl(env.PAGES_HOST, id, await passFor(env.EPHEMERA_TOKEN, page, Date.now()), rest) : `${pageUrl(env.PAGES_HOST, id)}${safeRest(rest)}`;
+		return new Response(null, { status: 302, headers: { location, "cache-control": "no-store", "referrer-policy": "no-referrer" } });
 	}
 
 	const match = /^\/pages\/([a-z2-7]{12})\/(extend|permanent|temporary|delete)$/.exec(url.pathname);

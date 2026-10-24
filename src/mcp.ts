@@ -32,6 +32,16 @@ const id = z.string().describe("The page id: the 12 characters in its URL, https
 
 const label = z.string().optional().describe("A short human-readable name for the page, shown in the dashboard and list_pages");
 
+const visibility = z
+	.enum(["public", "private"])
+	.optional()
+	.describe('"public" (the default): anyone with the URL can open it. "private": the owner signs in to open it, or uses the password if it has one; share_link makes links for others.');
+
+const password = z
+	.string()
+	.optional()
+	.describe("Lets people open a private page with this password (8+ characters). Implies private. Only set one when the user asks, and tell them what it is.");
+
 const agent = z.string().optional().describe('Which agent is publishing, e.g. "claude-code" or "codex"');
 
 const PUBLISH_GUIDE = `Publish a temporary web page at https://p.rcn.sh/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (${durationText(LIMITS.defaultTtl)} by default).
@@ -63,7 +73,7 @@ function server(ops: Operations): McpServer {
 		"publish_page",
 		{
 			description: PUBLISH_GUIDE,
-			inputSchema: z.object({ ...content, ttl, label, agent }),
+			inputSchema: z.object({ ...content, ttl, label, agent, visibility, password }),
 		},
 		(input) => run(async () => ops.publish({ ...input, files: bundleFrom(input, input.label) })),
 	);
@@ -100,6 +110,8 @@ function server(ops: Operations): McpServer {
 				ttl,
 				label,
 				agent,
+				visibility,
+				password,
 			}),
 		},
 		(input) => run(() => ops.uploadUrl(input)),
@@ -123,6 +135,24 @@ function server(ops: Operations): McpServer {
 			annotations: { destructiveHint: true },
 		},
 		(input) => run(() => ops.delete(input.id)),
+	);
+
+	mcp.registerTool(
+		"set_visibility",
+		{
+			description: "Make a page public or private, and set or clear its password. Either way, every share link handed out so far stops working.",
+			inputSchema: z.object({ id, visibility: z.enum(["public", "private"]), password: password.describe("A password for a private page (8+ characters); omit for none") }),
+		},
+		(input) => run(() => ops.setVisibility(input.id, input.visibility, input.password)),
+	);
+
+	mcp.registerTool(
+		"share_link",
+		{
+			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility revokes these.",
+			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe('How long the link works: "2h", "7d" (up to 30 days); defaults to a day') }),
+		},
+		(input) => run(() => ops.shareLink(input.id, input.ttl)),
 	);
 
 	mcp.registerTool(

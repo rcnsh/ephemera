@@ -14,6 +14,8 @@ export const LIMITS = {
 	defaultTtl: DAY,
 	/** Versions kept per page, counting the one being served. Older ones are deleted on update. */
 	keptVersions: 5,
+	/** How long the pass from signing in to a private page, or from its password, lasts. */
+	passTtl: 12 * HOUR,
 	/** How long a deleted or expired page answers 410 before it becomes a plain 404. */
 	goneGrace: 7 * DAY,
 } as const;
