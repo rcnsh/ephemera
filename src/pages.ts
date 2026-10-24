@@ -1,4 +1,4 @@
-import { contentType, type PageFile, validateBundle } from "./files.ts";
+import { checkBundle, contentType, normalizePath, type PageFile, validateBundle } from "./files.ts";
 import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
 
 /**
@@ -210,17 +210,36 @@ export class Pages {
 		return { sql, params };
 	}
 
-	/** Waits for every upload to settle, even after one fails, so a cleanup that follows sees them all. */
-	private async writeFiles(id: string, version: number, files: PageFile[]): Promise<void> {
-		const results = await Promise.allSettled(
-			files.map((file) =>
-				this.storage.BUCKET.put(`pages/${id}/${version}/${file.path}`, file.body, {
-					httpMetadata: { contentType: contentType(file.path) },
-				}),
-			),
-		);
+	/**
+	 * Writes `files`, and copies the `carried` paths over from the version `from`.
+	 * Waits for every write to settle, even after one fails, so a cleanup that
+	 * follows sees them all.
+	 */
+	private async writeFiles(id: string, version: number, files: PageFile[], carried: string[] = [], from?: Page): Promise<void> {
+		const key = (path: string) => `pages/${id}/${version}/${path}`;
+		const results = await Promise.allSettled([
+			...files.map((file) => this.storage.BUCKET.put(key(file.path), file.body, { httpMetadata: { contentType: contentType(file.path) } })),
+			...carried.map(async (path) => {
+				const object = await this.file(from!, path);
+				if (!object || !("body" in object)) throw new Error(`pages/${id}/${from!.version}/${path} vanished while copying`);
+				await this.storage.BUCKET.put(key(path), object.body, { httpMetadata: object.httpMetadata });
+			}),
+		]);
 		const failed = results.find((result) => result.status === "rejected");
 		if (failed) throw failed.reason;
+	}
+
+	/** The paths and sizes of the files a page is serving. */
+	private async listFiles(page: Page): Promise<Map<string, number>> {
+		const prefix = `pages/${page.id}/${page.version}/`;
+		const files = new Map<string, number>();
+		let cursor: string | undefined;
+		do {
+			const listing = await this.storage.BUCKET.list({ prefix, cursor, limit: 1000 });
+			for (const object of listing.objects) files.set(object.key.slice(prefix.length), object.size);
+			cursor = listing.truncated ? listing.cursor : undefined;
+		} while (cursor);
+		return files;
 	}
 
 	private async deletePrefix(prefix: string): Promise<void> {
@@ -292,13 +311,41 @@ export class Pages {
 	async update(id: string, input: PageFile[]): Promise<Page> {
 		const { files, size } = validateBundle(input);
 		const page = await this.get(id);
+		return this.addVersionOf(page, size, files.length, (version) => this.writeFiles(id, version, files));
+	}
+
+	/**
+	 * Like `update`, but only for the files that change: `files` are added or
+	 * replaced, `remove` deleted, and the rest copied over unchanged.
+	 */
+	async patch(id: string, changes: { files: PageFile[]; remove: string[] }): Promise<Page> {
+		const page = await this.get(id);
+		const put = changes.files.map((file) => ({ path: normalizePath(file.path), body: file.body }));
+		const putPaths = new Set(put.map((file) => file.path));
+		const remove = new Set(changes.remove.map(normalizePath));
+		const existing = await this.listFiles(page);
+		for (const path of remove) {
+			if (!existing.has(path)) throw new PageError(404, `Page ${id} has no file "${path}" to remove`);
+			if (putPaths.has(path)) throw new PageError(400, `"${path}" is both written and removed`);
+		}
+		const carried = [...existing.keys()].filter((path) => !remove.has(path) && !putPaths.has(path));
+		const size = checkBundle(
+			[...carried, ...put.map((file) => file.path)],
+			carried.reduce((total, path) => total + existing.get(path)!, 0) + put.reduce((total, file) => total + file.body.byteLength, 0),
+		);
+		return this.addVersionOf(page, size, carried.length + put.length, (version) => this.writeFiles(id, version, put, carried, page));
+	}
+
+	/** Writes a new version of `page` with `write`, then serves it. */
+	private async addVersionOf(page: Page, size: number, fileCount: number, write: (version: number) => Promise<void>): Promise<Page> {
+		const id = page.id;
 		const usage = await this.usage();
 		if (usage.bytes + size > LIMITS.totalBytes) {
 			throw new PageError(507, `This update would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
 		}
 		const version = page.latestVersion + 1;
 		try {
-			await this.writeFiles(id, version, files);
+			await write(version);
 		} catch (error) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw error;
@@ -311,15 +358,15 @@ export class Pages {
 					`UPDATE pages SET version = ?, latest_version = ?, size = ?, file_count = ?, updated_at = ?
 					WHERE id = ? AND latest_version = ? AND ${LIVE} AND ${room.sql}`,
 				)
-				.bind(version, version, size, files.length, now, id, page.latestVersion, now, ...room.params),
-			this.addVersion(id, version, now, size, files.length),
+				.bind(version, version, size, fileCount, now, id, page.latestVersion, now, ...room.params),
+			this.addVersion(id, version, now, size, fileCount),
 		]);
 		if (result!.meta.changes !== 1) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
 		this.defer(this.prune(id));
-		return { ...page, version, latestVersion: version, size, fileCount: files.length, updatedAt: now };
+		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
 	}
 
 	/** The versions a live page keeps, newest first. */

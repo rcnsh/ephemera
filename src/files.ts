@@ -1,5 +1,6 @@
 import { unzipSync } from "fflate";
 import { bytesText, LIMITS, PageError } from "./domain.ts";
+import { markdownPage } from "./markdown.ts";
 
 export interface PageFile {
 	path: string;
@@ -45,6 +46,23 @@ export function decodeInlineFiles(files: InlineFile[]): PageFile[] {
 	});
 }
 
+/** A page's content as agents can give it: files, or one of the single-page shortcuts. */
+export interface BundleInput {
+	files?: InlineFile[] | null;
+	html?: string | null;
+	markdown?: string | null;
+}
+
+/** Turns exactly one of `files`, `html` or `markdown` into the page's files. `title` names a Markdown page. */
+export function bundleFrom(input: BundleInput, title?: string | null): PageFile[] {
+	const given = [input.files, input.html, input.markdown].filter((value) => value !== undefined && value !== null);
+	if (given.length !== 1) throw new PageError(400, "Give exactly one of files, html or markdown");
+	if (typeof input.html === "string") return decodeInlineFiles([{ path: "index.html", content: input.html }]);
+	if (typeof input.markdown === "string") return decodeInlineFiles([{ path: "index.html", content: markdownPage(input.markdown, title) }]);
+	if (!Array.isArray(input.files)) throw new PageError(400, "files must be an array of { path, content, encoding }");
+	return decodeInlineFiles(input.files);
+}
+
 const JUNK = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/;
 
 /**
@@ -88,19 +106,26 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
  * canonical form (normalizing twice changes nothing), plus its total size.
  */
 export function validateBundle(input: PageFile[]): { files: PageFile[]; size: number } {
-	if (input.length === 0) throw new PageError(400, "A page needs at least one file");
-	if (input.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
 	const files = input.map((file) => ({ path: normalizePath(file.path), body: file.body }));
+	const size = checkBundle(
+		files.map((file) => file.path),
+		files.reduce((total, file) => total + file.body.byteLength, 0),
+	);
+	return { files, size };
+}
+
+/** The per-page limits, for a bundle given as its canonical paths and total size. */
+export function checkBundle(paths: string[], size: number): number {
+	if (paths.length === 0) throw new PageError(400, "A page needs at least one file");
+	if (paths.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
 	const seen = new Set<string>();
-	let size = 0;
-	for (const file of files) {
-		if (seen.has(file.path)) throw new PageError(400, `Duplicate file path "${file.path}"`);
-		seen.add(file.path);
-		size += file.body.byteLength;
+	for (const path of paths) {
+		if (seen.has(path)) throw new PageError(400, `Duplicate file path "${path}"`);
+		seen.add(path);
 	}
 	if (!seen.has("index.html")) throw new PageError(400, "A page needs an index.html at its root");
 	if (size > LIMITS.pageBytes) throw new PageError(413, `A page can be at most ${bytesText(LIMITS.pageBytes)}`);
-	return { files, size };
+	return size;
 }
 
 const TYPES: Record<string, string> = {

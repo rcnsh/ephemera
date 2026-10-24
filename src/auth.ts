@@ -22,6 +22,24 @@ async function hmac(key: string, message: string): Promise<string> {
 	return btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/[+/=]/g, "");
 }
 
+/**
+ * A capability to upload new files for one page until `expiresAt`, so an
+ * agent can hand a zip to curl without the bearer token. Ends in an HMAC of
+ * the rest, keyed by the Worker's token.
+ */
+export async function uploadToken(secret: string, id: string, expiresAt: number): Promise<string> {
+	const exp = expiresAt.toString(36);
+	return `${id}.${exp}.${await hmac(secret, `upload:${id}:${exp}`)}`;
+}
+
+/** The page id an upload token is for, or null if it's forged or expired. */
+export async function checkUploadToken(secret: string, token: string, now = Date.now()): Promise<string | null> {
+	const [id, exp, signature, ...rest] = token.split(".");
+	if (!id || !exp || !signature || rest.length || !secret) return null;
+	if (!(await safeEqual(signature, await hmac(secret, `upload:${id}:${exp}`)))) return null;
+	return parseInt(exp, 36) > now ? id : null;
+}
+
 const CSRF_WINDOW = 12 * 60 * 60 * 1000;
 
 /** A CSRF token for the dashboard, tied to the signed-in user and valid for 12 to 24 hours. */

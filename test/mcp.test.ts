@@ -38,7 +38,7 @@ describe("MCP endpoint", () => {
 	it("lists the tools", async () => {
 		const response = await rpc("tools/list");
 		const text = await response.text();
-		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page"]) {
+		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page", "patch_page", "upload_url"]) {
 			expect(text).toContain(name);
 		}
 	});
@@ -76,9 +76,25 @@ describe("MCP endpoint", () => {
 		expect((await call(published.data.url)).status).toBe(410);
 	});
 
+	it("publishes markdown, patches a file and hands out an upload URL", async () => {
+		const published = await tool("publish_page", { markdown: "# Hello" });
+		expect(await (await call(published.data.url)).text()).toContain("<h1>Hello</h1>");
+
+		const patched = await tool("patch_page", { id: published.data.id, files: [{ path: "extra.txt", content: "more" }] });
+		expect(patched.data.fileCount).toBe(2);
+		expect(await (await call(`${published.data.url}extra.txt`)).text()).toBe("more");
+
+		const upload = await tool("upload_url", { label: "big site" });
+		expect(upload.data.uploadUrl).toContain(`/upload/${upload.data.id}.`);
+		expect(upload.data.label).toBe("big site");
+	});
+
 	it("returns page errors as tool errors", async () => {
 		const result = await tool("publish_page", { files: [{ path: "nope.html", content: "x" }] });
 		expect(result.isError).toBe(true);
 		expect(result.data).toMatch(/index\.html/);
+		const both = await tool("publish_page", { html: "x", markdown: "y" });
+		expect(both.isError).toBe(true);
+		expect(both.data).toMatch(/exactly one/);
 	});
 });
