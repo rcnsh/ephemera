@@ -29,6 +29,9 @@ interface PageRow {
 	latest_version: number;
 	size: number;
 	file_count: number;
+	visibility: Visibility;
+	password_hash: string | null;
+	share_epoch: number;
 }
 
 interface VersionRow {
@@ -47,6 +50,9 @@ export interface Version {
 	current: boolean;
 }
 
+/** Public pages are served to anyone with the URL; private ones need a pass (see `viewPass`). */
+export type Visibility = "public" | "private";
+
 export interface Page {
 	id: string;
 	label: string | null;
@@ -61,6 +67,11 @@ export interface Page {
 	fileCount: number;
 	version: number;
 	latestVersion: number;
+	visibility: Visibility;
+	/** Set on private pages that can be unlocked with a password. */
+	passwordHash: string | null;
+	/** Signs view passes; bumped to revoke them. */
+	shareEpoch: number;
 }
 
 export interface Usage {
@@ -98,6 +109,9 @@ function toPage(row: PageRow): Page {
 		fileCount: row.file_count,
 		version: row.version,
 		latestVersion: row.latest_version,
+		visibility: row.visibility,
+		passwordHash: row.password_hash,
+		shareEpoch: row.share_epoch,
 	};
 }
 
@@ -252,7 +266,14 @@ export class Pages {
 	}
 
 	/** Files go to R2 before the row goes to D1, and are deleted again if either step fails, so nothing is left behind. */
-	async publish(input: { files: PageFile[]; ttl: Ttl; label?: string | null; agent?: string | null }): Promise<Page> {
+	async publish(input: {
+		files: PageFile[];
+		ttl: Ttl;
+		label?: string | null;
+		agent?: string | null;
+		visibility?: Visibility;
+		passwordHash?: string | null;
+	}): Promise<Page> {
 		const { files, size } = validateBundle(input.files);
 		await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
 		const now = this.now();
@@ -268,6 +289,9 @@ export class Pages {
 			latest_version: 1,
 			size,
 			file_count: files.length,
+			visibility: input.visibility ?? "public",
+			password_hash: input.passwordHash ?? null,
+			share_epoch: 0,
 		};
 		try {
 			await this.writeFiles(row.id, row.version, files);
@@ -275,10 +299,24 @@ export class Pages {
 			const [result] = await this.db.batch([
 				this.db
 					.prepare(
-						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count)
-						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
+						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash)
+						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
 					)
-					.bind(row.id, row.label, row.agent, row.created_at, row.updated_at, row.expires_at, row.version, row.latest_version, row.size, row.file_count, ...room.params),
+					.bind(
+						row.id,
+						row.label,
+						row.agent,
+						row.created_at,
+						row.updated_at,
+						row.expires_at,
+						row.version,
+						row.latest_version,
+						row.size,
+						row.file_count,
+						row.visibility,
+						row.password_hash,
+						...room.params,
+					),
 				this.addVersion(row.id, row.version, now, size, files.length),
 			]);
 			if (result!.meta.changes !== 1) {
@@ -460,6 +498,23 @@ export class Pages {
 			throw new PageError(410, `Page ${id} has expired or been deleted`);
 		}
 		return { ...page, expiresAt, permanent: expiresAt === null, updatedAt: now };
+	}
+
+	/**
+	 * Makes a page public or private, and sets or clears its password (only
+	 * private pages have one). Either way, every pass handed out so far stops
+	 * working.
+	 */
+	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null): Promise<Page> {
+		const page = await this.get(id);
+		const hash = visibility === "private" ? passwordHash : null;
+		const now = this.now();
+		const result = await this.db
+			.prepare(`UPDATE pages SET visibility = ?, password_hash = ?, share_epoch = share_epoch + 1, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			.bind(visibility, hash, now, id, now)
+			.run();
+		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		return { ...page, visibility, passwordHash: hash, shareEpoch: page.shareEpoch + 1, updatedAt: now };
 	}
 
 	/** Makes a permanent page temporary with a fresh default TTL. */

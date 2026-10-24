@@ -38,6 +38,8 @@ export interface PublishBody {
 	ttl?: string | number;
 	label?: string;
 	agent?: string;
+	visibility?: "public" | "private";
+	password?: string;
 }
 
 export const HELLO = [{ path: "index.html", content: "<!doctype html><h1>hello</h1>" }];

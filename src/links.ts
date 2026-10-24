@@ -5,8 +5,13 @@ function isRootRelative(url: string): boolean {
 	return url.startsWith("/") && !url.startsWith("//");
 }
 
-function prefix(url: string, base: string): string {
-	if (!isRootRelative(url) || url === base || url.startsWith(`${base}/`)) return url;
+/** Puts a root-relative URL inside the page at `/<id>/`, and behind its `pass` if it has one. */
+function prefix(url: string, id: string, pass: string | null): string {
+	if (!isRootRelative(url)) return url;
+	const page = `/${id}`;
+	const base = pass ? `${page}/${pass}` : page;
+	if (url === base || url.startsWith(`${base}/`)) return url;
+	if (url === page || url.startsWith(`${page}/`) || url.startsWith(`${page}?`) || url.startsWith(`${page}#`)) return base + url.slice(page.length);
 	return base + url;
 }
 
@@ -14,16 +19,16 @@ const URL_ATTRIBUTES = ["href", "src", "action", "poster", "formaction", "data"]
 
 /**
  * Rewrites root-relative URLs in HTML attributes so `/style.css` on page
- * `abc` becomes `/abc/style.css`. Text inside <script> and <style> isn't
- * touched; publishing warns about those instead.
+ * `abc` becomes `/abc/style.css` (or `/abc/~pass/style.css` on a private
+ * page). Text inside <script> and <style> isn't touched; publishing warns
+ * about those instead.
  */
-export function rewriteLinks(response: Response, id: string): Response {
-	const base = `/${id}`;
+export function rewriteLinks(response: Response, id: string, pass: string | null = null): Response {
 	const rewriter = new HTMLRewriter();
 	for (const attribute of URL_ATTRIBUTES) {
 		rewriter.on(`[${attribute}]`, {
 			element(element) {
-				element.setAttribute(attribute, prefix(element.getAttribute(attribute)!, base));
+				element.setAttribute(attribute, prefix(element.getAttribute(attribute)!, id, pass));
 			},
 		});
 	}
@@ -34,7 +39,7 @@ export function rewriteLinks(response: Response, id: string): Response {
 				"srcset",
 				srcset
 					.split(",")
-					.map((candidate) => candidate.replace(/^(\s*)(\S+)/, (_, space: string, url: string) => space + prefix(url, base)))
+					.map((candidate) => candidate.replace(/^(\s*)(\S+)/, (_, space: string, url: string) => space + prefix(url, id, pass)))
 					.join(","),
 			);
 		},

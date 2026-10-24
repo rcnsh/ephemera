@@ -38,7 +38,7 @@ describe("MCP endpoint", () => {
 	it("lists the tools", async () => {
 		const response = await rpc("tools/list");
 		const text = await response.text();
-		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page", "patch_page", "upload_url"]) {
+		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page", "patch_page", "upload_url", "set_visibility", "share_link"]) {
 			expect(text).toContain(name);
 		}
 	});
@@ -87,6 +87,16 @@ describe("MCP endpoint", () => {
 		const upload = await tool("upload_url", { label: "big site" });
 		expect(upload.data.uploadUrl).toContain(`/upload/${upload.data.id}.`);
 		expect(upload.data.label).toBe("big site");
+	});
+
+	it("makes a page private and shares it", async () => {
+		const published = await tool("publish_page", { html: "<p>secret</p>", visibility: "private" });
+		expect((await call(published.data.url)).status).toBe(401);
+		const link = await tool("share_link", { id: published.data.id, ttl: "1h" });
+		expect(await (await call(link.data.url)).text()).toBe("<p>secret</p>");
+		const made = await tool("set_visibility", { id: published.data.id, visibility: "public" });
+		expect(made.data.visibility).toBe("public");
+		expect((await call(published.data.url)).status).toBe(200);
 	});
 
 	it("returns page errors as tool errors", async () => {
