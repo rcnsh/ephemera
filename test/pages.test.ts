@@ -122,7 +122,7 @@ describe("publishing", () => {
 });
 
 describe("serving", () => {
-	it("serves files with the sandbox, noindex and no-store headers", async () => {
+	it("serves files with the sandbox, noindex, CORS and no-cache headers", async () => {
 		const page = await publish({
 			files: [
 				{ path: "index.html", content: "<h1>hi</h1>" },
@@ -138,12 +138,33 @@ describe("serving", () => {
 		expect(csp).toMatch(/^sandbox allow-scripts allow-forms allow-popups allow-modals/);
 		expect(csp).not.toContain("allow-same-origin");
 		expect(response.headers.get("x-robots-tag")).toBe("noindex, nofollow");
-		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("cache-control")).toBe("no-cache");
 		expect(response.headers.get("access-control-allow-origin")).toBe("*");
+		expect((await call(`${PAGES}/${page.id}/missing.png`)).headers.get("cache-control")).toBe("no-store");
 
 		expect(await (await call(`${PAGES}/${page.id}/docs/`)).text()).toContain("docs");
 		expect((await call(`${PAGES}/${page.id}/data.json`)).headers.get("content-type")).toMatch(/^application\/json/);
 		expect((await call(`${PAGES}/${page.id}/missing.png`)).status).toBe(404);
+	});
+
+	it("answers 304 for a file the browser already has, and 200 once it changes", async () => {
+		const page = await publish();
+		const first = await call(`${PAGES}/${page.id}/`);
+		const etag = first.headers.get("etag")!;
+		expect(etag).toBeTruthy();
+		const again = await call(`${PAGES}/${page.id}/`, { headers: { "if-none-match": etag } });
+		expect(again.status).toBe(304);
+		expect(again.headers.get("etag")).toBe(etag);
+		expect(again.headers.get("content-security-policy")).toMatch(/^sandbox/);
+
+		await api(`/pages/${page.id}`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ files: [{ path: "index.html", content: "<h1>v2</h1>" }] }),
+		});
+		const changed = await call(`${PAGES}/${page.id}/`, { headers: { "if-none-match": etag } });
+		expect(changed.status).toBe(200);
+		expect(await changed.text()).toContain("v2");
 	});
 
 	it("redirects /<id> and folders without a trailing slash", async () => {

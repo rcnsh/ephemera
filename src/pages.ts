@@ -121,8 +121,9 @@ export class Pages {
 		throw new PageError(404, `No page with id "${id}"`);
 	}
 
-	async file(page: Page, path: string): Promise<R2ObjectBody | null> {
-		return this.storage.BUCKET.get(`pages/${page.id}/${page.version}/${path}`);
+	/** A file of the page. With `conditional` request headers, a file the caller already has comes back without a body. */
+	async file(page: Page, path: string, conditional?: Headers): Promise<R2ObjectBody | R2Object | null> {
+		return this.storage.BUCKET.get(`pages/${page.id}/${page.version}/${path}`, conditional ? { onlyIf: conditional } : {});
 	}
 
 	async hasFile(page: Page, path: string): Promise<boolean> {

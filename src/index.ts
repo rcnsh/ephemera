@@ -22,7 +22,6 @@ const PAGE_HEADERS: Record<string, string> = {
 	"content-security-policy": "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads",
 	"access-control-allow-origin": "*",
 	"x-robots-tag": "noindex, nofollow",
-	"cache-control": "no-store",
 	"x-content-type-options": "nosniff",
 	"referrer-policy": "no-referrer",
 };
@@ -34,6 +33,8 @@ function text(body: string, status: number, headers: HeadersInit = {}): Response
 function withPageHeaders(response: Response): Response {
 	const headers = new Headers(response.headers);
 	for (const [name, value] of Object.entries(PAGE_HEADERS)) headers.set(name, value);
+	// Page files say how they may be cached; anything else isn't.
+	if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
 	headers.delete("set-cookie");
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
@@ -53,14 +54,21 @@ async function servePage(request: Request, pages: Pages, id: string, rest: strin
 		return text("Not found\n", 404);
 	}
 
-	let object = await pages.file(page, path);
+	const object = await pages.file(page, path, request.headers);
 	if (!object && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
 		// A folder without its trailing slash: redirect so relative links inside it resolve.
 		return new Response(null, { status: 301, headers: { location: `/${id}/${rest}/${url.search}` } });
 	}
 	if (!object) return text("Not found\n", 404);
 
-	const headers = new Headers({ "content-type": object.httpMetadata?.contentType ?? "application/octet-stream", etag: object.httpEtag });
+	// no-cache, not no-store: the browser keeps files but asks each time, so an
+	// update shows on refresh while unchanged files come back as 304s.
+	const headers = new Headers({
+		"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
+		etag: object.httpEtag,
+		"cache-control": "no-cache",
+	});
+	if (!("body" in object)) return new Response(null, { status: 304, headers });
 	if (request.method === "HEAD") return new Response(null, { headers });
 	const response = new Response(object.body, { headers });
 	return headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id) : response;
