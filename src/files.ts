@@ -1,6 +1,7 @@
 import { unzipSync } from "fflate";
 import { bytesText, LIMITS, PageError } from "./domain.ts";
 import { markdownPage } from "./markdown.ts";
+import { mockupOptions } from "./mockups.ts";
 
 export interface PageFile {
 	path: string;
@@ -101,27 +102,39 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
 	return names.map((name) => ({ path: normalizePath(name), body: entries[name]! }));
 }
 
+/** Plain pages, or mockup sets (see mockups.ts). */
+export type PageKind = "page" | "mockup";
+
 /**
  * Checks a bundle against the per-page limits. Returns it with every path in
  * canonical form (normalizing twice changes nothing), plus its total size.
  */
-export function validateBundle(input: PageFile[]): { files: PageFile[]; size: number } {
+export function validateBundle(input: PageFile[], kind: PageKind = "page"): { files: PageFile[]; size: number } {
 	const files = input.map((file) => ({ path: normalizePath(file.path), body: file.body }));
 	const size = checkBundle(
 		files.map((file) => file.path),
 		files.reduce((total, file) => total + file.body.byteLength, 0),
+		kind,
 	);
 	return { files, size };
 }
 
-/** The per-page limits, for a bundle given as its canonical paths and total size. */
-export function checkBundle(paths: string[], size: number): number {
+/**
+ * The per-page limits, for a bundle given as its canonical paths and total
+ * size. A mockup set needs an index.html at its root or in a top-level folder.
+ */
+export function checkBundle(paths: string[], size: number, kind: PageKind = "page"): number {
 	if (paths.length === 0) throw new PageError(400, "A page needs at least one file");
 	if (paths.length > LIMITS.pageFiles) throw new PageError(413, `A page can have at most ${LIMITS.pageFiles} files`);
 	const seen = new Set<string>();
 	for (const path of paths) {
 		if (seen.has(path)) throw new PageError(400, `Duplicate file path "${path}"`);
 		seen.add(path);
+	}
+	if (kind === "mockup") {
+		if (!mockupOptions(paths).length) throw new PageError(400, "A mockup set needs an index.html at its root or in each option's top-level folder (a/index.html, b/index.html, ...)");
+		if (size > LIMITS.mockupBytes) throw new PageError(413, `A mockup set can be at most ${bytesText(LIMITS.mockupBytes)}`);
+		return size;
 	}
 	if (!seen.has("index.html")) throw new PageError(400, "A page needs an index.html at its root");
 	if (size > LIMITS.pageBytes) throw new PageError(413, `A page can be at most ${bytesText(LIMITS.pageBytes)}`);

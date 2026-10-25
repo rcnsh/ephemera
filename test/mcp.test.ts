@@ -38,7 +38,7 @@ describe("MCP endpoint", () => {
 	it("lists the tools", async () => {
 		const response = await rpc("tools/list");
 		const text = await response.text();
-		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page", "patch_page", "upload_url", "set_visibility", "share_link"]) {
+		for (const name of ["publish_page", "update_page", "extend_page", "delete_page", "list_pages", "list_versions", "rollback_page", "patch_page", "upload_url", "set_visibility", "share_link", "publish_mockup", "set_verdict"]) {
 			expect(text).toContain(name);
 		}
 	});
@@ -106,5 +106,42 @@ describe("MCP endpoint", () => {
 		const both = await tool("publish_page", { html: "x", markdown: "y" });
 		expect(both.isError).toBe(true);
 		expect(both.data).toMatch(/exactly one/);
+	});
+});
+
+const TWO_OPTIONS = [
+	{ path: "a/index.html", content: "<p>option a</p>" },
+	{ path: "b/index.html", content: "<p>option b</p>" },
+];
+
+describe("mockup MCP tools", () => {
+	it("publishes a set, records verdicts, and works with the page tools", async () => {
+		const published = await tool("publish_mockup", { project: "cs-skins", name: "Inventory grid", files: TWO_OPTIONS });
+		expect(published.isError).toBeFalsy();
+		const id = published.data.id as string;
+		expect(id).toMatch(/^cs-skins-inventory-grid-[a-z2-7]{6}$/);
+		expect(published.data).toMatchObject({ url: `${PAGES}/${id}/`, kind: "mockup", project: "cs-skins", permanent: true, visibility: "public" });
+
+		const picked = await tool("set_verdict", { id, option: "b", verdict: "picked", note: "cleaner" });
+		expect(picked.data.options.find((o: { name: string }) => o.name === "b")).toMatchObject({ verdict: "picked", note: "cleaner" });
+		expect((await tool("set_verdict", { id, option: "zz", verdict: "picked" })).isError).toBe(true);
+
+		const patched = await tool("patch_page", { id, files: [{ path: "c/index.html", content: "c" }], remove: ["a/"] });
+		expect(patched.data.options.map((o: { name: string }) => o.name)).toEqual(["b", "c"]);
+
+		const listed = await tool("list_pages", {});
+		expect(listed.data.pages.find((p: { id: string }) => p.id === id).options).toHaveLength(2);
+		expect(listed.data.usage.mockups).toBe(1);
+
+		expect((await tool("set_visibility", { id, visibility: "private" })).data.visibility).toBe("private");
+		expect((await tool("list_versions", { id })).data.versions).toHaveLength(2);
+		expect((await tool("delete_page", { id })).isError).toBeFalsy();
+		expect((await call(`${PAGES}/${id}/`)).status).toBe(410);
+	});
+
+	it("returns errors for bad bundles", async () => {
+		const result = await tool("publish_mockup", { project: "p", name: "n", files: [{ path: "deep/er/index.html", content: "x" }] });
+		expect(result.isError).toBe(true);
+		expect(result.data).toMatch(/top-level folder/);
 	});
 });

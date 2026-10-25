@@ -7,8 +7,9 @@ import { normalizePath } from "./files.ts";
 import { rewriteLinks } from "./links.ts";
 import { favicon } from "./logo.ts";
 import { handleMcp } from "./mcp.ts";
+import { mockupIndex } from "./mockups.ts";
 import { Operations } from "./operations.ts";
-import { ID_PATTERN, Pages } from "./pages.ts";
+import { ID_PATTERN, ID_SOURCE, Pages } from "./pages.ts";
 import { gate, unlock } from "./privacy.ts";
 
 /**
@@ -77,6 +78,13 @@ async function servePage(request: Request, env: Env, pages: Pages, id: string, s
 	}
 
 	const object = await pages.file(page, path, request.headers);
+	if (!object && path === "index.html" && page.kind === "mockup") {
+		// A mockup set without its own index shows its options side by side.
+		// Its links are relative, so it isn't rewritten.
+		const html = mockupIndex(page.label ?? page.id, await pages.options(id));
+		const headers = { "content-type": "text/html; charset=utf-8", "cache-control": pass ? "private, no-cache, no-transform" : "no-cache, no-transform" };
+		return gzip(request, new Response(request.method === "HEAD" ? null : html, { headers }));
+	}
 	if (!object && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
 		// A folder without its trailing slash: redirect so relative links inside it resolve.
 		return new Response(null, { status: 301, headers: { location: `${base}/${rest}/${url.search}` } });
@@ -131,7 +139,7 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	if (pathname === "/api" || pathname.startsWith("/api/") || pathname === "/mcp" || pathname.startsWith("/upload/")) {
 		return handleAgent(request, env, ctx, pages, pathname);
 	}
-	const unlocking = /^\/([a-z2-7]{12})\/_unlock$/.exec(pathname);
+	const unlocking = new RegExp(`^/(${ID_SOURCE})/_unlock$`).exec(pathname);
 	if (unlocking && request.method === "POST") return unlock(request, env, pages, unlocking[1]!);
 	if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed\n", 405);
 	if (pathname === "/") return rootPage();
