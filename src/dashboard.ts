@@ -319,7 +319,10 @@ function respond(body: string, status: number, nonce = ""): Response {
 			"content-type": "text/html; charset=utf-8",
 			"cache-control": "no-store",
 			"content-security-policy": `default-src 'none'; img-src 'self'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
-			"referrer-policy": "no-referrer",
+			// Not no-referrer: under that, browsers send `Origin: null` with the
+			// dashboard's own form posts, and the origin check refuses them.
+			// same-origin still sends nothing to pages on PAGES_HOST.
+			"referrer-policy": "same-origin",
 			"x-content-type-options": "nosniff",
 		},
 	});

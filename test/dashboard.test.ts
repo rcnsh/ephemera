@@ -61,6 +61,8 @@ describe("dashboard", () => {
 		expect(response.headers.get("content-security-policy")).not.toMatch(/^sandbox/);
 		expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
 		expect(response.headers.get("cache-control")).toBe("no-store");
+		// no-referrer would make browsers send `Origin: null` with the dashboard's form posts.
+		expect(response.headers.get("referrer-policy")).toBe("same-origin");
 	});
 
 	it("rejects actions without a valid CSRF token or from another origin", async () => {
