@@ -1,5 +1,6 @@
 import { checkPassword, viewPass } from "./auth.ts";
 import { LIMITS } from "./domain.ts";
+import { FAVICON_LINK } from "./logo.ts";
 import type { Page, Pages } from "./pages.ts";
 
 /**
@@ -46,6 +47,7 @@ export function gate(env: Env, page: Page, rest: string, message = "", status = 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Private page</title>
+${FAVICON_LINK}
 <style>
 body { font: 16px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto; padding: 0 1rem; color: #222; }
 h1 { font-size: 1.2rem; }

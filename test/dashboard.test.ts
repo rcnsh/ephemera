@@ -1,7 +1,7 @@
 import { reset } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { screenshot } from "../src/thumbnails.ts";
-import { ADMIN, api, call, publish } from "./helpers.ts";
+import { ADMIN, api, call, PAGES, publish } from "./helpers.ts";
 
 afterEach(async () => {
 	vi.mocked(screenshot).mockReset().mockResolvedValue(null);
@@ -36,6 +36,15 @@ describe("dashboard", () => {
 	it("refuses requests that didn't come through Access, or for another Access app", async () => {
 		expect((await admin("/", {}, null)).status).toBe(403);
 		expect((await admin("/", {}, "other-app")).status).toBe(403);
+	});
+
+	it("serves the favicon on both hosts", async () => {
+		for (const response of [await admin("/favicon.svg"), await call(`${PAGES}/favicon.svg`)]) {
+			expect(response.status).toBe(200);
+			expect(response.headers.get("content-type")).toBe("image/svg+xml");
+			expect(await response.text()).toContain("prefers-color-scheme");
+		}
+		expect(await (await admin()).text()).toContain('href="/favicon.svg"');
 	});
 
 	it("lists live pages with usage, and isn't sandboxed or cached", async () => {

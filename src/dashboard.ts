@@ -1,5 +1,6 @@
 import { checkCsrf, csrfToken } from "./auth.ts";
 import { bytesText, LIMITS, PageError, pageUrl } from "./domain.ts";
+import { FAVICON_LINK, favicon, mark } from "./logo.ts";
 import { Operations } from "./operations.ts";
 import type { Page, Pages, Usage, Version } from "./pages.ts";
 import { passFor, passUrl, safeRest } from "./privacy.ts";
@@ -27,7 +28,8 @@ function duration(ms: number): string {
 
 const CSS = `
 body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem auto; max-width: 80rem; padding: 0 1rem; color: #222; background: #fafafa; }
-h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+h1 { font-size: 1.1rem; margin: 0 0 .25rem; display: flex; align-items: center; gap: .4rem; }
+h1 .logo { width: 1.25em; height: 1.25em; }
 .usage { color: #666; margin: 0 0 1rem; }
 .filters { display: flex; gap: .5rem; margin: 0 0 1rem; }
 .filters input { flex: 1; }
@@ -153,8 +155,9 @@ function render(pages: Page[], versions: Map<string, Version[]>, usage: Usage, h
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ephemera</title>
+${FAVICON_LINK}
 <style nonce="${nonce}">${CSS}</style>
-<h1>ephemera</h1>
+<h1>${mark("logo", 7, 'class="logo"')}ephemera</h1>
 <p class="usage">${usage.temporaryPages} / ${LIMITS.temporaryPages} temporary · ${usage.permanentPages} / ${LIMITS.permanentPages} permanent · ${bytesText(usage.bytes)} / ${bytesText(LIMITS.totalBytes)}</p>
 ${
 	pages.length
@@ -175,6 +178,7 @@ function shareRender(link: { url: string; expiresAt: number | null }, nonce: str
 <html lang="en">
 <meta charset="utf-8">
 <title>Share link</title>
+${FAVICON_LINK}
 <style nonce="${nonce}">${CSS} .share { display: flex; gap: .5rem; } .share input { flex: 1; }</style>
 <h1>Share link</h1>
 <p class="usage">Opens the page without signing in${link.expiresAt ? ` for ${duration(link.expiresAt - now)}` : ""}. Making the page public or private again revokes it.</p>
@@ -226,6 +230,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 	const user = String((identity as { email?: string } | undefined)?.email ?? "owner");
 	const url = new URL(request.url);
 
+	if (request.method === "GET" && url.pathname === "/favicon.svg") return favicon();
 	if (request.method === "GET" && url.pathname === "/") {
 		const nonce = crypto.randomUUID().replaceAll("-", "");
 		const [list, versions, usage] = await Promise.all([pages.list(), pages.allVersions(), pages.usage()]);

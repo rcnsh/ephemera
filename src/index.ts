@@ -5,6 +5,7 @@ import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
 import { normalizePath } from "./files.ts";
 import { rewriteLinks } from "./links.ts";
+import { favicon } from "./logo.ts";
 import { handleMcp } from "./mcp.ts";
 import { Operations } from "./operations.ts";
 import { ID_PATTERN, Pages } from "./pages.ts";
@@ -135,6 +136,7 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	if (request.method !== "GET" && request.method !== "HEAD") return text("Method not allowed\n", 405);
 	if (pathname === "/") return rootPage();
 	if (pathname === "/cat.jpg") return cat();
+	if (pathname === "/favicon.svg") return favicon();
 
 	const match = /^\/([^/]+)(\/.*)?$/.exec(pathname);
 	if (!match || !ID_PATTERN.test(match[1]!)) return text("Not found\n", 404);

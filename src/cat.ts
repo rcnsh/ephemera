@@ -5,6 +5,7 @@ const ROOT_PAGE = (nonce: string) => `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>🐈</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 html, body { margin: 0; height: 100%; background: #111; }
 img { display: block; width: 100%; height: 100%; object-fit: contain; }
