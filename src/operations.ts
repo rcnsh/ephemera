@@ -2,6 +2,7 @@ import { hashPassword, uploadToken } from "./auth.ts";
 import { LIMITS, PageError, pageUrl, parseTtl } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
+import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
 import type { Page, Pages, Visibility } from "./pages.ts";
 import { passFor, passUrl } from "./privacy.ts";
 
@@ -21,7 +22,14 @@ export function pageView(page: Page, host: string) {
 		version: page.version,
 		visibility: page.visibility,
 		hasPassword: page.passwordHash !== null,
+		kind: page.kind,
+		project: page.project,
 	};
+}
+
+/** What agents see of a page, with a mockup set's options and verdicts. */
+function setView(page: Page, host: string, options: MockupOption[] | undefined) {
+	return page.kind === "mockup" ? { ...pageView(page, host), options: options ?? [] } : pageView(page, host);
 }
 
 /**
@@ -76,6 +84,28 @@ export class Operations {
 		private readonly now: () => number = Date.now,
 	) {}
 
+	/** Publishes a permanent mockup set, its id made from `project` and `name`. */
+	async publishMockup(input: { project?: unknown; name?: unknown; files: PageFile[]; visibility?: unknown; password?: unknown }) {
+		if (typeof input.project !== "string" || typeof input.name !== "string") throw new PageError(400, "A mockup set needs a project and a name");
+		const page = await this.pages.publish({
+			files: input.files,
+			ttl: "permanent",
+			label: input.name,
+			mockup: { project: input.project, name: input.name },
+			...(await privacy(input.visibility, input.password)),
+		});
+		return { ...setView(page, this.host, await this.pages.options(page.id)), warnings: rootRelativeWarnings(input.files) };
+	}
+
+	/** Picks, rejects or resets an option of a mockup set. */
+	async setVerdict(id: string, option: unknown, verdict: unknown, note: unknown) {
+		if (typeof option !== "string") throw new PageError(400, "option must be the name of one of the set's top-level folders");
+		if (!VERDICTS.includes(verdict as Verdict)) throw new PageError(400, `verdict must be one of ${VERDICTS.map((v) => `"${v}"`).join(", ")}`);
+		if (note !== undefined && note !== null && typeof note !== "string") throw new PageError(400, "note must be a string, or null to clear it");
+		const options = await this.pages.setVerdict(id, option, verdict as Verdict, note as string | null | undefined);
+		return { id, url: pageUrl(this.host, id), options };
+	}
+
 	async publish(input: PublishInput) {
 		const page = await this.pages.publish({
 			files: input.files,
@@ -90,13 +120,13 @@ export class Operations {
 	/** Replaces a page's files; the URL and expiry stay the same. */
 	async update(id: string, files: PageFile[]) {
 		const page = await this.pages.update(id, files);
-		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
+		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
 
 	/** Adds, replaces and removes single files, keeping the rest. */
 	async patch(id: string, files: PageFile[], remove: string[]) {
 		const page = await this.pages.patch(id, { files, remove });
-		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
+		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
 
 	/**
@@ -160,15 +190,19 @@ export class Operations {
 
 	async rollback(id: string, version: unknown) {
 		if (typeof version !== "number" || !Number.isInteger(version)) throw new PageError(400, "version must be a whole number; list_versions shows the ones a page keeps");
-		return pageView(await this.pages.rollback(id, version), this.host);
+		return this.view(await this.pages.rollback(id, version));
 	}
 
 	async get(id: string) {
-		return pageView(await this.pages.get(id), this.host);
+		return this.view(await this.pages.get(id));
 	}
 
 	async list() {
-		const [list, usage] = await Promise.all([this.pages.list(), this.pages.usage()]);
-		return { pages: list.map((page) => pageView(page, this.host)), usage };
+		const [list, usage, options] = await Promise.all([this.pages.list(), this.pages.usage(), this.pages.allOptions()]);
+		return { pages: list.map((page) => setView(page, this.host, options.get(page.id))), usage };
+	}
+
+	private async view(page: Page) {
+		return setView(page, this.host, page.kind === "mockup" ? await this.pages.options(page.id) : undefined);
 	}
 }

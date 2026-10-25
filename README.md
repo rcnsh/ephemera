@@ -45,13 +45,23 @@ Each update adds a version. A page keeps its last 5 and can be rolled back to an
 
 Every request checks the expiry, so a page stops working the moment it expires. It then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
 
+### Mockup sets
+
+A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `p.rcn.sh/terminus-widget-density-k3x7q2/`.
+
+- **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`.
+- **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
+- **The set's URL shows the options side by side** when it has no root `index.html`, with a badge on picked ones. Rejected ones aren't marked. A root `index.html` replaces this page.
+- Everything else (private sets, versions, rollback, delete) works as for any page.
+
 ### Limits
 
 | | |
 | --- | --- |
 | Per page | 25 MB, 200 files |
+| Per mockup set | 2 MB, 200 files |
 | Temporary pages | 100 |
-| Permanent pages | 25 |
+| Permanent pages | 25; mockup sets don't count |
 | Total storage | 2 GB, kept versions included |
 
 ## Publishing
@@ -68,6 +78,8 @@ Every request checks the expiry, so a page stops working the moment it expires. 
 | `share_link` | a link that opens a private page without signing in |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
 | `extend_page`, `delete_page`, `list_pages` | manage pages |
+| `publish_mockup` | publish a mockup set from `project`, `name` and `files`; takes `visibility`, `password` |
+| `set_verdict` | pick, reject or reset an option of a mockup set, with an optional `note` |
 
 ### HTTP API
 
@@ -91,18 +103,22 @@ curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKE
 | `PUT /api/pages/:id` | replace the files; the URL and expiry stay the same |
 | `PATCH /api/pages/:id` | `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends, `{"label":"…"}` renames |
 | `DELETE /api/pages/:id` | delete |
-| `POST /api/pages/:id/files` | `{"files":[…],"remove":["old.css"]}` changes single files and keeps the rest |
+| `POST /api/pages/:id/files` | `{"files":[…],"remove":["old.css","b/"]}` changes single files (or whole folders) and keeps the rest |
 | `GET /api/pages/:id/versions` | list kept versions |
 | `POST /api/pages/:id/rollback` | `{"version":2}` serves that version again |
 | `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}` |
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
+| `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
+| `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
 | `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token |
 
 ## Dashboard
 
 `ephemera.rcn.sh` shows a card per page with a thumbnail, and lets you search and filter by agent. From there you can rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions and delete.
 
-Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. If the browser fails, the dashboard shows a blank tile and tries again on the next load.
+The Mockups tab shows mockup sets grouped by project, newest first, with a row of option thumbnails per set and buttons to pick or reject each option. It filters by verdict.
+
+Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. If the browser fails, the dashboard shows a blank tile and tries again on the next load. Mockup options get one each, cropped to their content (so a phone-sized mockup isn't lost in a desktop viewport), and all the options of a set are shot in one browser launch.
 
 ## Development
 

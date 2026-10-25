@@ -1,5 +1,6 @@
-import { checkBundle, contentType, normalizePath, type PageFile, validateBundle } from "./files.ts";
+import { checkBundle, contentType, normalizePath, type PageFile, type PageKind, validateBundle } from "./files.ts";
 import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
+import { type MockupOption, mockupOptions, slugify, type Verdict } from "./mockups.ts";
 
 /**
  * The page store. D1 holds one row per page and one per version it keeps;
@@ -9,7 +10,8 @@ import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
  * `expires_at` passes (NULL means permanent). After that it's "gone": the
  * Worker answers 410 for `LIMITS.goneGrace`, the sweep purges its files, and
  * once the grace period is over the row is dropped and the id answers 404.
- * The table is created by the migrations in /migrations.
+ * Mockup sets are pages too (`kind` 'mockup'), with a row per option in
+ * `verdicts`. The table is created by the migrations in /migrations.
  */
 
 interface Storage {
@@ -32,6 +34,20 @@ interface PageRow {
 	visibility: Visibility;
 	password_hash: string | null;
 	share_epoch: number;
+	kind: PageKind;
+	project: string | null;
+}
+
+interface VerdictRow {
+	page_id: string;
+	option: string;
+	verdict: Verdict;
+	note: string | null;
+	updated_at: number;
+}
+
+function toOption(row: VerdictRow): MockupOption {
+	return { name: row.option, verdict: row.verdict, note: row.note, updatedAt: row.updated_at };
 }
 
 interface VersionRow {
@@ -72,11 +88,16 @@ export interface Page {
 	passwordHash: string | null;
 	/** Signs view passes; bumped to revoke them. */
 	shareEpoch: number;
+	kind: PageKind;
+	/** Groups mockup sets; a slug. Null for plain pages. */
+	project: string | null;
 }
 
 export interface Usage {
+	/** Plain pages only: mockup sets don't count towards the page limits. */
 	temporaryPages: number;
 	permanentPages: number;
+	mockups: number;
 	/** Every kept version of every live page. */
 	bytes: number;
 }
@@ -89,11 +110,25 @@ const GONE_AT = "COALESCE(deleted_at, expires_at)";
 const STORED_BYTES = `SELECT COALESCE(SUM(versions.size), 0) FROM versions JOIN pages ON pages.id = versions.page_id WHERE ${LIVE}`;
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
-export const ID_PATTERN = /^[a-z2-7]{12}$/;
+/** A page id, for use inside other patterns: 12 random characters, or a mockup set's `<project>-<name>-<6 random>`. */
+export const ID_SOURCE = "[a-z2-7]{12}|[a-z0-9]+(?:-[a-z0-9]+)*-[a-z2-7]{6}";
+export const ID_PATTERN = new RegExp(`^(?=.{1,47}$)(?:${ID_SOURCE})$`);
 
-function newId(): string {
+function randomChars(length: number): string {
 	// 32 divides 256 evenly, so masking keeps every character equally likely.
-	return Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => ID_ALPHABET[byte & 31]).join("");
+	return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) => ID_ALPHABET[byte & 31]).join("");
+}
+
+/** A mockup set's id: its project and name as one slug, then 6 random characters. */
+function mockupId(project: string, name: string): string {
+	const slug = slugify(`${project}-${name}`);
+	if (!slug) throw new PageError(400, "A mockup set's project and name need some letters or digits");
+	return `${slug}-${randomChars(6)}`;
+}
+
+/** Options as a JSON array, to go through `json_each` in SQL. */
+function optionsJson(paths: string[]): string {
+	return JSON.stringify(mockupOptions(paths));
 }
 
 function toPage(row: PageRow): Page {
@@ -112,6 +147,8 @@ function toPage(row: PageRow): Page {
 		visibility: row.visibility,
 		passwordHash: row.password_hash,
 		shareEpoch: row.share_epoch,
+		kind: row.kind,
+		project: row.project,
 	};
 }
 
@@ -174,14 +211,15 @@ export class Pages {
 		const row = await this.db
 			.prepare(
 				`SELECT
-					COUNT(CASE WHEN expires_at IS NOT NULL THEN 1 END) AS temporary,
-					COUNT(CASE WHEN expires_at IS NULL THEN 1 END) AS permanent,
+					COUNT(CASE WHEN kind = 'page' AND expires_at IS NOT NULL THEN 1 END) AS temporary,
+					COUNT(CASE WHEN kind = 'page' AND expires_at IS NULL THEN 1 END) AS permanent,
+					COUNT(CASE WHEN kind = 'mockup' THEN 1 END) AS mockups,
 					(${STORED_BYTES}) AS bytes
 				FROM pages WHERE ${LIVE}`,
 			)
 			.bind(now, now)
-			.first<{ temporary: number; permanent: number; bytes: number }>();
-		return { temporaryPages: row!.temporary, permanentPages: row!.permanent, bytes: row!.bytes };
+			.first<{ temporary: number; permanent: number; mockups: number; bytes: number }>();
+		return { temporaryPages: row!.temporary, permanentPages: row!.permanent, mockups: row!.mockups, bytes: row!.bytes };
 	}
 
 	/** Live pages, soonest to expire first, permanent ones last. */
@@ -193,7 +231,8 @@ export class Pages {
 		return results.map(toPage);
 	}
 
-	private async checkRoom(kind: "temporary" | "permanent", extraBytes: number): Promise<void> {
+	/** Checks there's room for `extraBytes` more, and for one more page of `kind` (null for one that doesn't count, like a mockup set). */
+	private async checkRoom(kind: "temporary" | "permanent" | null, extraBytes: number): Promise<void> {
 		const usage = await this.usage();
 		if (kind === "temporary" && usage.temporaryPages >= LIMITS.temporaryPages) {
 			throw new PageError(409, `There are already ${LIMITS.temporaryPages} temporary pages; delete some first`);
@@ -218,7 +257,7 @@ export class Pages {
 		params.push(now, extraBytes, LIMITS.totalBytes);
 		if (kind) {
 			const permanent = kind === "permanent" ? "IS NULL" : "IS NOT NULL";
-			sql += ` AND (SELECT COUNT(*) FROM pages WHERE ${LIVE} AND expires_at ${permanent}) < ?`;
+			sql += ` AND (SELECT COUNT(*) FROM pages WHERE ${LIVE} AND kind = 'page' AND expires_at ${permanent}) < ?`;
 			params.push(now, kind === "permanent" ? LIMITS.permanentPages : LIMITS.temporaryPages);
 		}
 		return { sql, params };
@@ -243,9 +282,9 @@ export class Pages {
 		if (failed) throw failed.reason;
 	}
 
-	/** The paths and sizes of the files a page is serving. */
-	private async listFiles(page: Page): Promise<Map<string, number>> {
-		const prefix = `pages/${page.id}/${page.version}/`;
+	/** The paths and sizes of the files of a version of a page. */
+	private async listFiles(id: string, version: number): Promise<Map<string, number>> {
+		const prefix = `pages/${id}/${version}/`;
 		const files = new Map<string, number>();
 		let cursor: string | undefined;
 		do {
@@ -265,7 +304,12 @@ export class Pages {
 		} while (cursor);
 	}
 
-	/** Files go to R2 before the row goes to D1, and are deleted again if either step fails, so nothing is left behind. */
+	/**
+	 * Files go to R2 before the row goes to D1, and are deleted again if either
+	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
+	 * set: its id comes from the project and name, and it doesn't count
+	 * towards the page limits.
+	 */
 	async publish(input: {
 		files: PageFile[];
 		ttl: Ttl;
@@ -273,12 +317,15 @@ export class Pages {
 		agent?: string | null;
 		visibility?: Visibility;
 		passwordHash?: string | null;
+		mockup?: { project: string; name: string };
 	}): Promise<Page> {
-		const { files, size } = validateBundle(input.files);
-		await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
+		const kind: PageKind = input.mockup ? "mockup" : "page";
+		const { files, size } = validateBundle(input.files, kind);
+		const lifetime = kind === "mockup" ? null : input.ttl === "permanent" ? "permanent" : "temporary";
+		await this.checkRoom(lifetime, size);
 		const now = this.now();
 		const row: PageRow = {
-			id: newId(),
+			id: input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12),
 			label: clean(input.label, 200),
 			agent: clean(input.agent, 100),
 			created_at: now,
@@ -292,15 +339,17 @@ export class Pages {
 			visibility: input.visibility ?? "public",
 			password_hash: input.passwordHash ?? null,
 			share_epoch: 0,
+			kind,
+			project: input.mockup ? slugify(input.mockup.project) || null : null,
 		};
 		try {
 			await this.writeFiles(row.id, row.version, files);
-			const room = this.roomFor(input.ttl === "permanent" ? "permanent" : "temporary", size);
+			const room = this.roomFor(lifetime, size);
 			const [result] = await this.db.batch([
 				this.db
 					.prepare(
-						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash)
-						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
+						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project)
+						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
 					)
 					.bind(
 						row.id,
@@ -315,13 +364,16 @@ export class Pages {
 						row.file_count,
 						row.visibility,
 						row.password_hash,
+						row.kind,
+						row.project,
 						...room.params,
 					),
 				this.addVersion(row.id, row.version, now, size, files.length),
+				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
 			]);
 			if (result!.meta.changes !== 1) {
 				// Another publish took the room while the files were uploading.
-				await this.checkRoom(input.ttl === "permanent" ? "permanent" : "temporary", size);
+				await this.checkRoom(lifetime, size);
 				throw new PageError(409, "Out of room; try again");
 			}
 		} catch (error) {
@@ -342,40 +394,74 @@ export class Pages {
 	}
 
 	/**
+	 * Brings a mockup set's verdicts in step with the options of the version
+	 * given by its `paths`: new options start pending, and the verdicts of
+	 * options that went go too. Like `addVersion`, it only applies if the page
+	 * is serving `version` by then.
+	 */
+	private syncOptions(id: string, version: number, now: number, paths: string[]): D1PreparedStatement[] {
+		const options = optionsJson(paths);
+		const serving = "EXISTS (SELECT 1 FROM pages WHERE id = ? AND version = ?)";
+		return [
+			this.db
+				.prepare(`DELETE FROM verdicts WHERE page_id = ? AND option NOT IN (SELECT value FROM json_each(?)) AND ${serving}`)
+				.bind(id, options, id, version),
+			this.db
+				.prepare(`INSERT OR IGNORE INTO verdicts (page_id, option, verdict, updated_at) SELECT ?, value, 'pending', ? FROM json_each(?) WHERE ${serving}`)
+				.bind(id, now, options, id, version),
+		];
+	}
+
+	/**
 	 * Adds a version and serves it, in one step: its files are written
 	 * alongside the old ones, then the row is pointed at it. Versions beyond
 	 * the last `LIMITS.keptVersions` are deleted in the background.
 	 */
 	async update(id: string, input: PageFile[]): Promise<Page> {
-		const { files, size } = validateBundle(input);
 		const page = await this.get(id);
-		return this.addVersionOf(page, size, files.length, (version) => this.writeFiles(id, version, files));
+		const { files, size } = validateBundle(input, page.kind);
+		return this.addVersionOf(page, size, files.map((file) => file.path), (version) => this.writeFiles(id, version, files));
 	}
 
 	/**
 	 * Like `update`, but only for the files that change: `files` are added or
-	 * replaced, `remove` deleted, and the rest copied over unchanged.
+	 * replaced, `remove` deleted, and the rest copied over unchanged. A path in
+	 * `remove` ending in "/" removes that whole folder.
 	 */
 	async patch(id: string, changes: { files: PageFile[]; remove: string[] }): Promise<Page> {
 		const page = await this.get(id);
 		const put = changes.files.map((file) => ({ path: normalizePath(file.path), body: file.body }));
 		const putPaths = new Set(put.map((file) => file.path));
-		const remove = new Set(changes.remove.map(normalizePath));
-		const existing = await this.listFiles(page);
+		const existing = await this.listFiles(id, page.version);
+		const remove = new Set<string>();
+		for (const raw of changes.remove) {
+			if (raw.trim().endsWith("/")) {
+				const folder = normalizePath(raw.trim().replace(/\/+$/, ""));
+				const inside = [...existing.keys()].filter((path) => path.startsWith(`${folder}/`));
+				if (!inside.length) throw new PageError(404, `Page ${id} has no folder "${folder}/" to remove`);
+				for (const path of inside) remove.add(path);
+			} else {
+				const path = normalizePath(raw);
+				if (!existing.has(path)) throw new PageError(404, `Page ${id} has no file "${path}" to remove`);
+				remove.add(path);
+			}
+		}
 		for (const path of remove) {
-			if (!existing.has(path)) throw new PageError(404, `Page ${id} has no file "${path}" to remove`);
 			if (putPaths.has(path)) throw new PageError(400, `"${path}" is both written and removed`);
 		}
 		const carried = [...existing.keys()].filter((path) => !remove.has(path) && !putPaths.has(path));
+		const paths = [...carried, ...putPaths];
 		const size = checkBundle(
-			[...carried, ...put.map((file) => file.path)],
+			paths,
 			carried.reduce((total, path) => total + existing.get(path)!, 0) + put.reduce((total, file) => total + file.body.byteLength, 0),
+			page.kind,
 		);
-		return this.addVersionOf(page, size, carried.length + put.length, (version) => this.writeFiles(id, version, put, carried, page));
+		return this.addVersionOf(page, size, paths, (version) => this.writeFiles(id, version, put, carried, page));
 	}
 
-	/** Writes a new version of `page` with `write`, then serves it. */
-	private async addVersionOf(page: Page, size: number, fileCount: number, write: (version: number) => Promise<void>): Promise<Page> {
+	/** Writes a new version of `page` with `write`, then serves it. `paths` are the files it will have. */
+	private async addVersionOf(page: Page, size: number, paths: string[], write: (version: number) => Promise<void>): Promise<Page> {
+		const fileCount = paths.length;
 		const id = page.id;
 		const usage = await this.usage();
 		if (usage.bytes + size > LIMITS.totalBytes) {
@@ -398,6 +484,7 @@ export class Pages {
 				)
 				.bind(version, version, size, fileCount, now, id, page.latestVersion, now, ...room.params),
 			this.addVersion(id, version, now, size, fileCount),
+			...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
 		]);
 		if (result!.meta.changes !== 1) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
@@ -452,14 +539,17 @@ export class Pages {
 			.first<VersionRow>();
 		if (!target) throw new PageError(404, `Page ${id} has no version ${version}; list_versions shows the ones it keeps`);
 		const now = this.now();
-		const result = await this.db
-			.prepare(
-				`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
-				WHERE id = ? AND version = ? AND ${LIVE} AND EXISTS (SELECT 1 FROM versions WHERE page_id = ? AND version = ?)`,
-			)
-			.bind(version, target.size, target.file_count, now, id, page.version, now, id, version)
-			.run();
-		if (result.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
+		const options = page.kind === "mockup" ? this.syncOptions(id, version, now, [...(await this.listFiles(id, version)).keys()]) : [];
+		const [result] = await this.db.batch([
+			this.db
+				.prepare(
+					`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
+					WHERE id = ? AND version = ? AND ${LIVE} AND EXISTS (SELECT 1 FROM versions WHERE page_id = ? AND version = ?)`,
+				)
+				.bind(version, target.size, target.file_count, now, id, page.version, now, id, version),
+			...options,
+		]);
+		if (result!.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
 		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now };
 	}
 
@@ -505,6 +595,8 @@ export class Pages {
 		} else {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
+		// Mockup sets don't count towards the page limits either way.
+		if (page.kind === "mockup") kind = null;
 		if (kind) await this.checkRoom(kind, 0);
 		const room = kind ? this.roomFor(kind, 0) : { sql: "1", params: [] };
 		const result = await this.db
@@ -560,6 +652,57 @@ export class Pages {
 		});
 	}
 
+	/** The thumbnail of one option of a mockup set, if one was made for the version it's serving. */
+	async optionThumbnail(page: Page, option: string): Promise<R2ObjectBody | null> {
+		const object = await this.storage.BUCKET.get(`pages/${page.id}/thumbnails/${option}.png`);
+		if (object && object.customMetadata?.version === String(page.version)) return object;
+		await object?.body.cancel();
+		return null;
+	}
+
+	async saveOptionThumbnail(page: Page, option: string, png: Uint8Array): Promise<void> {
+		await this.storage.BUCKET.put(`pages/${page.id}/thumbnails/${option}.png`, png, {
+			httpMetadata: { contentType: "image/png" },
+			customMetadata: { version: String(page.version) },
+		});
+	}
+
+	/** The options of a mockup set, by name, with their verdicts. */
+	async options(id: string): Promise<MockupOption[]> {
+		const { results } = await this.db.prepare("SELECT * FROM verdicts WHERE page_id = ? ORDER BY option").bind(id).all<VerdictRow>();
+		return results.map(toOption);
+	}
+
+	/** The options of every live mockup set, by page id. */
+	async allOptions(): Promise<Map<string, MockupOption[]>> {
+		const { results } = await this.db
+			.prepare(`SELECT verdicts.* FROM verdicts JOIN pages ON pages.id = verdicts.page_id WHERE ${LIVE} ORDER BY verdicts.option`)
+			.bind(this.now())
+			.all<VerdictRow>();
+		const byPage = new Map<string, MockupOption[]>();
+		for (const row of results) byPage.set(row.page_id, [...(byPage.get(row.page_id) ?? []), toOption(row)]);
+		return byPage;
+	}
+
+	/**
+	 * Picks, rejects or resets one option of a mockup set. `note` replaces the
+	 * option's note (null or "" clears it); undefined keeps it.
+	 */
+	async setVerdict(id: string, option: string, verdict: Verdict, note?: string | null): Promise<MockupOption[]> {
+		const page = await this.get(id);
+		if (page.kind !== "mockup") throw new PageError(400, `Page ${id} isn't a mockup set; only mockup sets have verdicts`);
+		const now = this.now();
+		const result = await this.db
+			.prepare(`UPDATE verdicts SET verdict = ?, note = CASE WHEN ? THEN ? ELSE note END, updated_at = ? WHERE page_id = ? AND option = ?`)
+			.bind(verdict, note !== undefined ? 1 : 0, clean(note, 200), now, id, option)
+			.run();
+		const options = await this.options(id);
+		if (result.meta.changes !== 1) {
+			throw new PageError(404, `Mockup set ${id} has no option "${option}"; its options are ${options.map((o) => `"${o.name}"`).join(", ")}`);
+		}
+		return options;
+	}
+
 	/** Makes a permanent page temporary with a fresh default TTL. */
 	async makeTemporary(id: string): Promise<Page> {
 		const page = await this.get(id);
@@ -591,6 +734,7 @@ export class Pages {
 				.prepare(`DELETE FROM versions WHERE page_id IN (SELECT id FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?)`)
 				.bind(now - LIMITS.goneGrace),
 			this.db.prepare(`DELETE FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?`).bind(now - LIMITS.goneGrace),
+			this.db.prepare("DELETE FROM verdicts WHERE page_id NOT IN (SELECT id FROM pages)"),
 		]);
 		return { purged: results.length, forgotten: forgotten!.meta.changes };
 	}

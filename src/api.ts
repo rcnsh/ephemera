@@ -28,6 +28,17 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 	return { files: bundleFrom(body, body.label), ttl: body.ttl, label: body.label, agent: body.agent, visibility: body.visibility, password: body.password };
 }
 
+/** Reads a mockup set from a JSON body, or a zip body with `project` and `name` in the query string. */
+async function readMockup(request: Request, url: URL) {
+	if (/zip|octet-stream/.test(request.headers.get("content-type") ?? "")) {
+		const { files, visibility } = await readBundle(request, url);
+		return { files, visibility, project: url.searchParams.get("project"), name: url.searchParams.get("name") };
+	}
+	const body = await readJson<{ project: unknown; name: unknown; files: InlineFile[]; visibility: unknown; password: unknown }>(request);
+	if (!Array.isArray(body.files)) throw new PageError(400, "Body must be JSON ({ project, name, files, visibility }) or a zip file");
+	return { ...body, files: bundleFrom({ files: body.files }) };
+}
+
 async function readJson<T>(request: Request): Promise<Partial<T>> {
 	return (await request.json().catch(() => ({}))) as Partial<T>;
 }
@@ -52,14 +63,17 @@ export async function handleUpload(request: Request, ops: Operations, id: string
  *   POST   /api/pages/:id/files      { files, remove }: change single files
  *   POST   /api/pages/:id/visibility { visibility, password }: make it public or private
  *   POST   /api/pages/:id/share      { ttl }: a link that opens a private page
+ *   POST   /api/pages/:id/verdict    { option, verdict, note }: a verdict on a mockup option
  *   POST   /api/uploads              { id?, ttl, label, agent }: an upload URL for a zip
+ *   POST   /api/mockups              publish a mockup set (JSON, or zip with ?project=&name=)
  */
 export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname === "/api/uploads" && request.method === "POST") {
 		return json(await ops.uploadUrl(await readJson<{ id: string; ttl: TtlInput; label: string; agent: string; visibility: unknown; password: unknown }>(request)), 201);
 	}
-	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files|visibility|share))?)?\/?$/.exec(url.pathname);
+	if (url.pathname === "/api/mockups" && request.method === "POST") return json(await ops.publishMockup(await readMockup(request, url)), 201);
+	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files|visibility|share|verdict))?)?\/?$/.exec(url.pathname);
 	if (!match) return json({ error: "Not found" }, 404);
 	const [, id, sub] = match;
 	if (id && sub) {
@@ -71,6 +85,10 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 		if (sub === "visibility" && request.method === "POST") {
 			const body = await readJson<{ visibility: unknown; password: unknown }>(request);
 			return json(await ops.setVisibility(id, body.visibility, body.password));
+		}
+		if (sub === "verdict" && request.method === "POST") {
+			const body = await readJson<{ option: unknown; verdict: unknown; note: unknown }>(request);
+			return json(await ops.setVerdict(id, body.option, body.verdict, body.note));
 		}
 		if (sub === "share" && request.method === "POST") return json(await ops.shareLink(id, (await readJson<{ ttl: TtlInput }>(request)).ttl));
 		if (sub === "files" && request.method === "POST") {

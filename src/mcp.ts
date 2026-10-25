@@ -28,7 +28,7 @@ const ttl = z
 	.optional()
 	.describe(`How long the page lives: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Defaults to ${durationText(LIMITS.defaultTtl)}. "permanent" keeps it until deleted: only use that when the user asks for it.`);
 
-const id = z.string().describe("The page id: the 12 characters in its URL, https://p.rcn.sh/<id>/");
+const id = z.string().describe("The page id: the part of its URL after the host, https://p.rcn.sh/<id>/");
 
 const label = z.string().optional().describe("A short human-readable name for the page, shown in the dashboard and list_pages");
 
@@ -51,6 +51,12 @@ Write links between the page's own files as relative paths ("style.css", "img/a.
 Give the content as exactly one of: files, html (one HTML document) or markdown (rendered for you). For a folder already on disk, or large or binary files, use upload_url instead: it gives the URL straight away and takes a zip from curl, so the files don't pass through this call.
 
 Pages are sandboxed: scripts, forms, popups, fetch and CDN imports work, but localStorage, sessionStorage, IndexedDB and cookies don't. External resources (CDNs, images, APIs) load normally.`;
+
+const MOCKUP_GUIDE = `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://p.rcn.sh/<project>-<name>-<6 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
+
+Put each option in its own top-level folder with its own index.html: a/index.html, b/index.html, or descriptive names like compact/ and roomy/. The folder name is the option's name. Without a root index.html, the set's URL shows every option side by side; add a root index.html only for a custom comparison page. A single root index.html with no option folders is one option, "main".
+
+Every option starts pending. When the user picks or rejects options, record it with set_verdict. patch_page adds an option when it adds a folder, and removing a folder (remove: ["b/"]) removes that option and its verdict. Links between files should be relative, as for publish_page.`;
 
 function text(value: unknown) {
 	return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
@@ -79,6 +85,37 @@ function server(ops: Operations): McpServer {
 	);
 
 	mcp.registerTool(
+		"publish_mockup",
+		{
+			description: MOCKUP_GUIDE,
+			inputSchema: z.object({
+				project: z.string().describe('The project the mockups are for, e.g. "terminus" or "cs-skins"; sets are grouped by it'),
+				name: z.string().describe('What the mockups are of, e.g. "widget density" or "settings page"'),
+				files: fileList
+					.min(1)
+					.describe(`The set's files: one top-level folder per option, each with its own index.html (a/index.html, compact/index.html, ...). At most ${LIMITS.pageFiles} files and ${bytesText(LIMITS.mockupBytes)}.`),
+				visibility,
+				password,
+			}),
+		},
+		(input) => run(async () => ops.publishMockup({ ...input, files: decodeInlineFiles(input.files) })),
+	);
+
+	mcp.registerTool(
+		"set_verdict",
+		{
+			description: "Record the user's verdict on one option of a mockup set: picked, rejected, or pending again. Only do this for verdicts the user actually gave.",
+			inputSchema: z.object({
+				id,
+				option: z.string().describe("The option's name: its top-level folder, or \"main\" for a set that is a single page"),
+				verdict: z.enum(["pending", "picked", "rejected"]),
+				note: z.string().optional().describe("One line on why, e.g. \"denser but the labels are too small\". Omit to keep the current note; an empty string clears it."),
+			}),
+		},
+		(input) => run(() => ops.setVerdict(input.id, input.option, input.verdict, input.note)),
+	);
+
+	mcp.registerTool(
 		"update_page",
 		{
 			description: `Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh. The previous files are kept as a version (the last ${LIMITS.keptVersions}) that rollback_page can bring back.`,
@@ -95,7 +132,7 @@ function server(ops: Operations): McpServer {
 			inputSchema: z.object({
 				id,
 				files: fileList.optional().describe("Files to add or replace"),
-				remove: z.array(z.string()).optional().describe('Paths to delete, e.g. ["old.css"]'),
+				remove: z.array(z.string()).optional().describe('Paths to delete, e.g. ["old.css"]; a path ending in "/" deletes that folder, e.g. ["b/"]'),
 			}),
 		},
 		(input) => run(async () => ops.patch(input.id, decodeInlineFiles(input.files ?? []), input.remove ?? [])),
