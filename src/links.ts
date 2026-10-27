@@ -76,7 +76,7 @@ export function rootRelativeWarnings(files: PageFile[]): string[] {
 		}
 		for (const url of found) {
 			if (warnings.length === MAX_WARNINGS) return [...warnings, "…and more; use relative paths throughout"];
-			warnings.push(`${file.path}: "${url}" is root-relative and will resolve to p.rcn.sh${url}, outside this page. Use a relative path ("${url.slice(1)}") instead.`);
+			warnings.push(`${file.path}: "${url}" is root-relative and will resolve to ${url} at the root of the pages host, outside this page. Use a relative path ("${url.slice(1)}") instead.`);
 		}
 	}
 	return warnings;

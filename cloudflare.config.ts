@@ -1,5 +1,18 @@
+import { existsSync } from "node:fs";
 import { bindings, defineConfig, triggers } from "cf/config";
 import * as entrypoint from "./src/index.ts" with { type: "cf-worker" };
+
+// Deployment settings live in .env (see .env.example), which cf also reads for credentials.
+if (existsSync(".env")) process.loadEnvFile(".env");
+
+function setting(name: string): string {
+	const value = process.env[name];
+	if (!value) throw new Error(`Set ${name} in .env (see .env.example)`);
+	return value;
+}
+
+const pagesHost = setting("PAGES_HOST");
+const adminHost = setting("ADMIN_HOST");
 
 export default defineConfig({
 	worker: {
@@ -7,7 +20,7 @@ export default defineConfig({
 		compatibilityDate: "2026-10-19",
 		entrypoint,
 		workersDev: false,
-		domains: ["p.rcn.sh", "ephemera.rcn.sh"],
+		domains: [pagesHost, adminHost],
 		triggers: [triggers.scheduled({ schedule: "*/10 * * * *" })],
 		observability: { enabled: true },
 		env: {
@@ -16,10 +29,10 @@ export default defineConfig({
 			// Browser Rendering, for the dashboard's thumbnails.
 			BROWSER: bindings.browser(),
 			EPHEMERA_TOKEN: bindings.secret(),
-			PAGES_HOST: bindings.text("p.rcn.sh"),
-			ADMIN_HOST: bindings.text("ephemera.rcn.sh"),
+			PAGES_HOST: bindings.text(pagesHost),
+			ADMIN_HOST: bindings.text(adminHost),
 			// Audience tag of the Access application guarding ADMIN_HOST.
-			ACCESS_AUD: bindings.text("b7ad86d15465a5788e12e6c7d717aa15512f7536c86f6958ebf48402169adcdd"),
+			ACCESS_AUD: bindings.text(setting("ACCESS_AUD")),
 		},
 	},
 });

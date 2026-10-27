@@ -11,6 +11,8 @@
 
 An agent publishes a bundle of HTML, CSS, JS and images and gets back `https://p.rcn.sh/<id>/`. The page is deleted when its TTL runs out: 24 hours by default, anywhere from 5 minutes to 30 days, or permanent.
 
+This repo runs `p.rcn.sh`, and the hostnames below are that instance's. To run your own, see [Self-hosting](#self-hosting).
+
 One Cloudflare Worker serves three things:
 
 | Where | What | Auth |
@@ -120,18 +122,40 @@ The Mockups tab shows mockup sets grouped by project, newest first, with a row o
 
 Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. If the browser fails, the dashboard shows a blank tile and tries again on the next load. Mockup options get one each, cropped to their content (so a phone-sized mockup isn't lost in a desktop viewport), and all the options of a set are shot in one browser launch.
 
+## Self-hosting
+
+You need a Cloudflare account with a zone for your hostnames, Workers Paid (for Browser Rendering and the cron sweep), and [`cf`](https://developers.cloudflare.com/cf/).
+
+1. `pnpm install`, then `cp .env.example .env`.
+2. Create the database and bucket, and put the database's ID in `.env` as `D1_DATABASE_ID`:
+   ```sh
+   cf d1 create --name ephemera
+   cf r2 buckets create --name ephemera
+   ```
+3. Set `PAGES_HOST` and `ADMIN_HOST` in `.env`. Both must be on a zone in your account; deploying attaches them to the Worker.
+4. In Zero Trust, add a self-hosted Access application for `ADMIN_HOST` and put its audience (AUD) tag in `.env` as `ACCESS_AUD`.
+5. `pnpm deploy`, then set the token agents use:
+   ```sh
+   cf workers secrets update EPHEMERA_TOKEN --worker ephemera --text "$(openssl rand -hex 32)"
+   ```
+6. Optional: add a Configuration Rule for `PAGES_HOST` that turns off Rocket Loader, Email Obfuscation, Automatic HTTPS Rewrites, Server Side Excludes, Fonts and Web Analytics. `no-transform` covers this too; the rule keeps those features off even for a response without it.
+
+To use it from an agent, point an MCP client at `https://<PAGES_HOST>/mcp` with `Authorization: Bearer <EPHEMERA_TOKEN>`.
+
 ## Development
 
 ```sh
 pnpm install
 pnpm test        # vitest in workerd
 pnpm typecheck
-pnpm migrate     # apply new files in migrations/ to the production D1 database
+pnpm migrate     # apply new files in migrations/ to the D1 database in .env
 pnpm deploy      # migrate, then cf deploy
 ```
 
 Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). The D1 schema lives in `migrations/`; add a change with `cf d1 migrations create <message>`. Tests apply the migrations to a fresh database before each test.
 
-The token is a Worker secret (`EPHEMERA_TOKEN`). `ACCESS_AUD` in `cloudflare.config.ts` is the audience tag of the Access application that protects `ephemera.rcn.sh`. The dashboard refuses any request that Access didn't authenticate for that application.
+`cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
 
-`p.rcn.sh` has a Cloudflare Configuration Rule that turns off Rocket Loader, Email Obfuscation, Automatic HTTPS Rewrites, Server Side Excludes, Fonts and Web Analytics. `no-transform` covers this too; the rule keeps those features off even for a response without it.
+## License
+
+[MIT](LICENSE)
