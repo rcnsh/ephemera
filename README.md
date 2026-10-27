@@ -9,23 +9,23 @@
 
 <p align="center">Temporary web pages for agents.</p>
 
-An agent publishes a bundle of HTML, CSS, JS and images and gets back `https://p.rcn.sh/<id>/`. The page is deleted when its TTL runs out: 24 hours by default, anywhere from 5 minutes to 30 days, or permanent.
+An agent publishes a bundle of HTML, CSS, JS and images and gets back `https://PAGES_HOST/<id>/`. The page is deleted when its TTL runs out: 24 hours by default, anywhere from 5 minutes to 30 days, or permanent.
 
-This repo runs `p.rcn.sh`, and the hostnames below are that instance's. To run your own, see [Self-hosting](#self-hosting).
+`PAGES_HOST` and `ADMIN_HOST` below are the two hostnames you choose when you deploy it; see [Self-hosting](#self-hosting).
 
 One Cloudflare Worker serves three things:
 
 | Where | What | Auth |
 | --- | --- | --- |
-| `p.rcn.sh/<id>/` | the pages | none, or a pass for private pages |
-| `p.rcn.sh/api`, `p.rcn.sh/mcp` | HTTP API and remote MCP server | `Authorization: Bearer $EPHEMERA_TOKEN` |
-| `ephemera.rcn.sh` | the dashboard | Cloudflare Access |
+| `PAGES_HOST/<id>/` | the pages | none, or a pass for private pages |
+| `PAGES_HOST/api`, `PAGES_HOST/mcp` | HTTP API and remote MCP server | `Authorization: Bearer $EPHEMERA_TOKEN` |
+| `ADMIN_HOST` | the dashboard | Cloudflare Access |
 
-`p.rcn.sh/` itself shows a random cat from [cataas](https://cataas.com).
+`PAGES_HOST/` itself shows a random cat from [cataas](https://cataas.com).
 
 ## Pages
 
-- **Sandboxed.** Pages are served with `CSP: sandbox` and without `allow-same-origin`, so agent-written code can't read cookies or storage for `rcn.sh`.
+- **Sandboxed.** Pages are served with `CSP: sandbox` and without `allow-same-origin`, so agent-written code can't read cookies or storage for the domain it's served from.
 - **Able to load their own files.** `Access-Control-Allow-Origin: *` lets a page `fetch` and `import` its own files from its opaque origin.
 - **Cheap to refresh.** Files are sent `no-cache` with ETags, so unchanged files come back as 304s.
 - **Served as published.** `no-transform` stops Cloudflare editing pages (injected scripts, Rocket Loader), which would also strip the ETags. The Worker gzips text itself instead.
@@ -35,7 +35,7 @@ Pages should link to their own files with relative paths. Root-relative links in
 
 ### Private pages
 
-A private page shows a gate at `p.rcn.sh/<id>/`. The gate has a link to sign in through Access (`ephemera.rcn.sh/open/<id>/`), and a password form if the page has a password. Both lead to `p.rcn.sh/<id>/~<pass>/`, and that pass lasts 12 hours.
+A private page shows a gate at `PAGES_HOST/<id>/`. The gate has a link to sign in through Access (`ADMIN_HOST/open/<id>/`), and a password form if the page has a password. Both lead to `PAGES_HOST/<id>/~<pass>/`, and that pass lasts 12 hours.
 
 The pass goes in the path rather than a cookie, because a sandboxed page's own requests don't send cookies. Relative links carry the pass along, so the page's files, `fetch` and imports all work.
 
@@ -49,7 +49,7 @@ Every request checks the expiry, so a page stops working the moment it expires. 
 
 ### Mockup sets
 
-A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `p.rcn.sh/terminus-widget-density-k3x7q2/`.
+A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2/`.
 
 - **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`.
 - **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
@@ -87,14 +87,14 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 
 ```sh
 # inline files
-curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" \
+curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" \
   -d '{"files":[{"path":"index.html","content":"<h1>hi</h1>"}],"ttl":"2h","label":"demo"}'
 
 # one Markdown document, rendered
-curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" -d '{"markdown":"# Report","ttl":"1d"}'
+curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_TOKEN" -d '{"markdown":"# Report","ttl":"1d"}'
 
 # a folder, as a zip
-(cd site && zip -qr - .) | curl -X POST "https://p.rcn.sh/api/pages?ttl=7d&label=site" \
+(cd site && zip -qr - .) | curl -X POST "https://$PAGES_HOST/api/pages?ttl=7d&label=site" \
   -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
 ```
 
@@ -116,7 +116,7 @@ curl -X POST https://p.rcn.sh/api/pages -H "Authorization: Bearer $EPHEMERA_TOKE
 
 ## Dashboard
 
-`ephemera.rcn.sh` shows a card per page with a thumbnail, and lets you search and filter by agent. From there you can rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions and delete.
+`ADMIN_HOST` shows a card per page with a thumbnail, and lets you search and filter by agent. From there you can rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions and delete.
 
 The Mockups tab shows mockup sets grouped by project, newest first, with a row of option thumbnails per set and buttons to pick or reject each option. It filters by verdict.
 
@@ -140,7 +140,7 @@ You need a Cloudflare account with a zone for your hostnames, Workers Paid (for 
    ```
 6. Optional: add a Configuration Rule for `PAGES_HOST` that turns off Rocket Loader, Email Obfuscation, Automatic HTTPS Rewrites, Server Side Excludes, Fonts and Web Analytics. `no-transform` covers this too; the rule keeps those features off even for a response without it.
 
-To use it from an agent, point an MCP client at `https://<PAGES_HOST>/mcp` with `Authorization: Bearer <EPHEMERA_TOKEN>`.
+To use it from an agent, point an MCP client at `https://PAGES_HOST/mcp` with `Authorization: Bearer <EPHEMERA_TOKEN>`.
 
 ## Development
 
