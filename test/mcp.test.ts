@@ -116,11 +116,11 @@ const TWO_OPTIONS = [
 
 describe("mockup MCP tools", () => {
 	it("publishes a set, records verdicts, and works with the page tools", async () => {
-		const published = await tool("publish_mockup", { project: "cs-skins", name: "Inventory grid", files: TWO_OPTIONS });
+		const published = await tool("publish_mockup", { project: "app", name: "Inventory grid", files: TWO_OPTIONS });
 		expect(published.isError).toBeFalsy();
 		const id = published.data.id as string;
-		expect(id).toMatch(/^cs-skins-inventory-grid-[a-z2-7]{6}$/);
-		expect(published.data).toMatchObject({ url: `${PAGES}/${id}/`, kind: "mockup", project: "cs-skins", permanent: true, visibility: "public" });
+		expect(id).toMatch(/^app-inventory-grid-[a-z2-7]{6}$/);
+		expect(published.data).toMatchObject({ url: `${PAGES}/${id}/`, kind: "mockup", project: "app", permanent: true, visibility: "public" });
 
 		const picked = await tool("set_verdict", { id, option: "b", verdict: "picked", note: "cleaner" });
 		expect(picked.data.options.find((o: { name: string }) => o.name === "b")).toMatchObject({ verdict: "picked", note: "cleaner" });

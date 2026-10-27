@@ -28,8 +28,6 @@ const ttl = z
 	.optional()
 	.describe(`How long the page lives: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Defaults to ${durationText(LIMITS.defaultTtl)}. "permanent" keeps it until deleted: only use that when the user asks for it.`);
 
-const id = z.string().describe("The page id: the part of its URL after the host, https://p.rcn.sh/<id>/");
-
 const label = z.string().optional().describe("A short human-readable name for the page, shown in the dashboard and list_pages");
 
 const visibility = z
@@ -44,7 +42,7 @@ const password = z
 
 const agent = z.string().optional().describe('Which agent is publishing, e.g. "claude-code" or "codex"');
 
-const PUBLISH_GUIDE = `Publish a temporary web page at https://p.rcn.sh/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (${durationText(LIMITS.defaultTtl)} by default).
+const publishGuide = (host: string) => `Publish a temporary web page at https://${host}/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (${durationText(LIMITS.defaultTtl)} by default).
 
 Write links between the page's own files as relative paths ("style.css", "img/a.png", "./data.json"), not root-relative ones ("/style.css"): every page lives under its own /<id>/ folder. Root-relative links in HTML attributes are fixed automatically, but ones inside CSS or JavaScript aren't; the response lists any it found as warnings.
 
@@ -52,7 +50,7 @@ Give the content as exactly one of: files, html (one HTML document) or markdown 
 
 Pages are sandboxed: scripts, forms, popups, fetch and CDN imports work, but localStorage, sessionStorage, IndexedDB and cookies don't. External resources (CDNs, images, APIs) load normally.`;
 
-const MOCKUP_GUIDE = `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://p.rcn.sh/<project>-<name>-<6 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
+const mockupGuide = (host: string) => `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://${host}/<project>-<name>-<6 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
 
 Put each option in its own top-level folder with its own index.html: a/index.html, b/index.html, or descriptive names like compact/ and roomy/. The folder name is the option's name. Without a root index.html, the set's URL shows every option side by side; add a root index.html only for a custom comparison page. A single root index.html with no option folders is one option, "main".
 
@@ -72,13 +70,15 @@ async function run(body: () => Promise<unknown>) {
 	}
 }
 
-function server(ops: Operations): McpServer {
+/** The tools, with descriptions naming the pages host they publish to. */
+function server(ops: Operations, host: string): McpServer {
 	const mcp = new McpServer({ name: "ephemera", version: "1.0.0" });
+	const id = z.string().describe(`The page id: the part of its URL after the host, https://${host}/<id>/`);
 
 	mcp.registerTool(
 		"publish_page",
 		{
-			description: PUBLISH_GUIDE,
+			description: publishGuide(host),
 			inputSchema: z.object({ ...content, ttl, label, agent, visibility, password }),
 		},
 		(input) => run(async () => ops.publish({ ...input, files: bundleFrom(input, input.label) })),
@@ -87,9 +87,9 @@ function server(ops: Operations): McpServer {
 	mcp.registerTool(
 		"publish_mockup",
 		{
-			description: MOCKUP_GUIDE,
+			description: mockupGuide(host),
 			inputSchema: z.object({
-				project: z.string().describe('The project the mockups are for, e.g. "terminus" or "cs-skins"; sets are grouped by it'),
+				project: z.string().describe('The project the mockups are for, e.g. "my-app" or "website"; sets are grouped by it'),
 				name: z.string().describe('What the mockups are of, e.g. "widget density" or "settings page"'),
 				files: fileList
 					.min(1)
@@ -226,7 +226,7 @@ function server(ops: Operations): McpServer {
 
 /** The MCP server at /mcp. The caller has already checked the token. */
 export function handleMcp(request: Request, env: Env, ctx: ExecutionContext, ops: Operations): Promise<Response> {
-	const handler = createMcpHandler(() => server(ops), {
+	const handler = createMcpHandler(() => server(ops, env.PAGES_HOST), {
 		route: "/mcp",
 		allowedHostnames: [env.PAGES_HOST],
 		corsOptions: false,

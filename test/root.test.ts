@@ -7,7 +7,7 @@ afterEach(async () => {
 	await reset();
 });
 
-describe("the cat at p.rcn.sh/", () => {
+describe("the cat at pages.example.com/", () => {
 	it("serves a page showing /cat.jpg, uncached", async () => {
 		const response = await call(`${PAGES}/`);
 		expect(response.status).toBe(200);

@@ -35,7 +35,7 @@ async function publishMockup(body: Record<string, unknown> = {}): Promise<Mockup
 	const response = await api("/mockups", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ project: "Terminus", name: "Widget density", files: TWO_OPTIONS, ...body }),
+		body: JSON.stringify({ project: "Website", name: "Widget density", files: TWO_OPTIONS, ...body }),
 	});
 	if (response.status !== 201) throw new Error(`publish failed: ${response.status} ${await response.text()}`);
 	return response.json();
@@ -55,10 +55,10 @@ async function options(id: string): Promise<{ name: string; verdict: string; not
 
 describe("mockup ids", () => {
 	it("slugifies the project and name and appends 6 random characters", async () => {
-		const set = await publishMockup({ project: "Terminus", name: "Widget density!" });
-		expect(set.id).toMatch(/^terminus-widget-density-[a-z2-7]{6}$/);
+		const set = await publishMockup({ project: "Website", name: "Widget density!" });
+		expect(set.id).toMatch(/^website-widget-density-[a-z2-7]{6}$/);
 		expect(set.url).toBe(`${PAGES}/${set.id}/`);
-		expect(set.project).toBe("terminus");
+		expect(set.project).toBe("website");
 		expect(set.label).toBe("Widget density!");
 	});
 
@@ -77,8 +77,8 @@ describe("mockup ids", () => {
 
 	it("routes both id shapes, and nothing else", async () => {
 		expect(ID_PATTERN.test("abcdefghijk2")).toBe(true);
-		expect(ID_PATTERN.test("terminus-widget-density-k3x7q2")).toBe(true);
-		for (const id of ["terminus-k3x9q", "-terminus-k3x9q2", "terminus--x-k3x9q2", "Terminus-k3x9q2", "terminus-k3x9q8", `${"a".repeat(41)}-k3x9q2`]) {
+		expect(ID_PATTERN.test("website-widget-density-k3x7q2")).toBe(true);
+		for (const id of ["website-k3x9q", "-website-k3x9q2", "website--x-k3x9q2", "Website-k3x9q2", "website-k3x9q8", `${"a".repeat(41)}-k3x9q2`]) {
 			expect(ID_PATTERN.test(id), id).toBe(false);
 		}
 		const set = await publishMockup();
@@ -266,15 +266,15 @@ describe("the dashboard's Mockups tab", () => {
 	}
 
 	it("groups sets by project, newest first, with a thumbnail and verdict buttons per option", async () => {
-		const older = await publishMockup({ project: "terminus", name: "Older" });
+		const older = await publishMockup({ project: "website", name: "Older" });
 		await new Promise((resolve) => setTimeout(resolve, 5));
-		const newer = await publishMockup({ project: "terminus", name: "Newer" });
-		await publishMockup({ project: "cs-skins", name: "Grid" });
+		const newer = await publishMockup({ project: "website", name: "Newer" });
+		await publishMockup({ project: "app", name: "Grid" });
 		await verdict(newer.id, { option: "a", verdict: "picked" });
 
 		const html = await (await admin("/mockups")).text();
 		expect(html).toContain('aria-current="page">Mockups');
-		expect(html.indexOf("<h2>cs-skins</h2>")).toBeLessThan(html.indexOf("<h2>terminus</h2>"));
+		expect(html.indexOf("<h2>app</h2>")).toBeLessThan(html.indexOf("<h2>website</h2>"));
 		expect(html.indexOf(newer.id)).toBeLessThan(html.indexOf(older.id));
 		expect(html).toContain(`<img src="/thumbnails/${newer.id}/a.png?v=1"`);
 		expect(html).toContain('<figure class="option picked">');

@@ -69,7 +69,7 @@ describe("dashboard", () => {
 		const page = await publish();
 		const csrf = await csrfToken();
 		expect((await post(`/pages/${page.id}/delete`, "forged")).status).toBe(403);
-		expect((await post(`/pages/${page.id}/delete`, csrf, "https://p.rcn.sh")).status).toBe(403);
+		expect((await post(`/pages/${page.id}/delete`, csrf, "https://pages.example.com")).status).toBe(403);
 		expect((await call(page.url)).status).toBe(200);
 	});
 

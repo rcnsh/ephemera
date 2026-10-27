@@ -21,7 +21,7 @@ async function sweep(now = Date.now()): Promise<void> {
 }
 
 describe("publishing", () => {
-	it("returns a random 12-character id on p.rcn.sh with a 24 hour default ttl", async () => {
+	it("returns a random 12-character id on pages.example.com with a 24 hour default ttl", async () => {
 		const before = Date.now();
 		const page = await publish({ label: "report", agent: "claude" });
 		expect(page.id).toMatch(/^[a-z2-7]{12}$/);

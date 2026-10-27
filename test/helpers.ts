@@ -2,8 +2,8 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { zipSync, strToU8 } from "fflate";
 import worker from "../src/index.ts";
 
-export const PAGES = "https://p.rcn.sh";
-export const ADMIN = "https://ephemera.rcn.sh";
+export const PAGES = "https://pages.example.com";
+export const ADMIN = "https://admin.example.com";
 export const TOKEN = "test-token";
 
 interface CallOptions {

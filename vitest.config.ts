@@ -16,8 +16,8 @@ export default defineConfig({
 				r2Buckets: ["BUCKET"],
 				bindings: {
 					EPHEMERA_TOKEN: "test-token",
-					PAGES_HOST: "p.rcn.sh",
-					ADMIN_HOST: "ephemera.rcn.sh",
+					PAGES_HOST: "pages.example.com",
+					ADMIN_HOST: "admin.example.com",
 					ACCESS_AUD: "test-aud",
 					TEST_MIGRATIONS: migrations,
 				},

@@ -15,7 +15,7 @@ import { gate, unlock } from "./privacy.ts";
 /**
  * Every response from the pages host goes out with these. Agent-written HTML
  * runs in a sandbox with an opaque origin, so it can't read cookies or storage
- * for rcn.sh, or act as p.rcn.sh. Don't add allow-same-origin.
+ * for the pages host's domain, or act as the pages host. Don't add allow-same-origin.
  *
  * That opaque origin is `null`, so a page fetching or importing its own files
  * makes a cross-origin request; the wildcard lets it read the answer. No
