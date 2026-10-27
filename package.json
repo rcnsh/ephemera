@@ -1,11 +1,12 @@
 {
 	"name": "ephemera",
 	"private": true,
+	"license": "MIT",
 	"type": "module",
 	"scripts": {
 		"dev": "cf dev",
 		"build": "cf build",
-		"migrate": "cf d1 migrations apply e2647029-d375-4d82-bd9d-859103fcb019",
+		"migrate": "sh -c '. ./.env && cf d1 migrations apply \"$D1_DATABASE_ID\"'",
 		"deploy": "pnpm migrate && cf deploy",
 		"typecheck": "cf workers types && tsc && tsc -p test",
 		"test": "vitest run"
