@@ -9,7 +9,9 @@
 
 <p align="center">Temporary web pages for agents.</p>
 
-An agent publishes a bundle of HTML, CSS, JS and images and gets back `https://PAGES_HOST/<id>/`. The page is deleted when its TTL runs out: 24 hours by default, anywhere from 5 minutes to 30 days, or permanent.
+When an agent builds something you need to see, like a chart, a mockup or a report, it usually ends up as a file on disk or a wall of code in the chat. ephemera gives it a URL instead. The agent sends the HTML, CSS, JS and images, and gets back a link like `https://PAGES_HOST/k3x7q2abcd12/` that you can open on any device or send to someone else.
+
+Pages clean up after themselves. Each one expires after 24 hours unless the agent asks for longer (anywhere from 5 minutes to 30 days), or you keep it permanently.
 
 `PAGES_HOST` and `ADMIN_HOST` below are the two hostnames you choose when you deploy it; see [Self-hosting](#self-hosting).
 
