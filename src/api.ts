@@ -2,7 +2,7 @@ import { PageError } from "./domain.ts";
 import { type BundleInput, bundleFrom, type InlineFile, unzipFiles } from "./files.ts";
 import type { Operations, PublishInput, TtlInput } from "./operations.ts";
 
-const MAX_BODY = 40 * 1024 * 1024;
+const MAX_BODY = 80 * 1024 * 1024;
 
 function json(body: unknown, status = 200): Response {
 	return Response.json(body, { status });

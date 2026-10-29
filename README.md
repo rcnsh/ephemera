@@ -62,7 +62,7 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 
 | | |
 | --- | --- |
-| Per page | 25 MB, 200 files |
+| Per page | 50 MB, 200 files |
 | Per mockup set | 2 MB, 200 files |
 | Temporary pages | 100 |
 | Permanent pages | 25; mockup sets don't count |

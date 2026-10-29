@@ -3,7 +3,7 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
 export const LIMITS = {
-	pageBytes: 25 * 1024 * 1024,
+	pageBytes: 50 * 1024 * 1024,
 	/** Mockup sets get less room per page, and don't count towards the page limits. */
 	mockupBytes: 2 * 1024 * 1024,
 	pageFiles: 200,
