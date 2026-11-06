@@ -21,14 +21,12 @@ async function sweep(now = Date.now()): Promise<void> {
 }
 
 describe("publishing", () => {
-	it("returns a random 12-character id on pages.example.com with a 24 hour default ttl", async () => {
-		const before = Date.now();
+	it("returns a random 12-character id on pages.example.com, kept until deleted when no ttl is given", async () => {
 		const page = await publish({ label: "report", agent: "claude" });
 		expect(page.id).toMatch(/^[a-z2-7]{12}$/);
 		expect(page.url).toBe(`${PAGES}/${page.id}/`);
-		expect(page.permanent).toBe(false);
-		expect(page.expiresAt).toBeGreaterThanOrEqual(before + DAY);
-		expect(page.expiresAt).toBeLessThanOrEqual(Date.now() + DAY);
+		expect(page.permanent).toBe(true);
+		expect(page.expiresAt).toBeNull();
 		expect(page.label).toBe("report");
 		expect(page.agent).toBe("claude");
 	});
@@ -69,22 +67,12 @@ describe("publishing", () => {
 		expect(response.status).toBe(413);
 	});
 
-	it("caps permanent pages at 25", async () => {
-		for (let i = 0; i < LIMITS.permanentPages; i++) await publish({ ttl: "permanent" });
-		const response = await api("/pages", {
-			method: "POST",
-			body: JSON.stringify({ files: [{ path: "index.html", content: "x" }], ttl: "permanent" }),
-		});
-		expect(response.status).toBe(409);
-		expect(await response.text()).toMatch(/25 permanent/);
-		await publish();
-	});
-
-	it("caps temporary pages at 100", async () => {
-		for (let i = 0; i < LIMITS.temporaryPages; i++) await publish();
-		const response = await api("/pages", { method: "POST", body: JSON.stringify({ files: [{ path: "index.html", content: "x" }] }) });
-		expect(response.status).toBe(409);
-		await publish({ ttl: "permanent" });
+	it("doesn't cap how many pages there are", async () => {
+		// Past the old caps of 25 permanent and 100 temporary pages.
+		for (let i = 0; i < 26; i++) await publish({ ttl: "permanent" });
+		for (let i = 0; i < 101; i++) await publish({ ttl: "1h" });
+		const { usage } = (await (await api("/pages")).json()) as { usage: Record<string, number> };
+		expect(usage).toMatchObject({ permanentPages: 26, temporaryPages: 101 });
 	});
 
 	it("needs the bearer token", async () => {
@@ -290,6 +278,13 @@ describe("updating and expiry", () => {
 		expect(extended.expiresAt).toBe(page.expiresAt! + DAY);
 		const capped = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "30d" }) })).json()) as { expiresAt: number };
 		expect(capped.expiresAt).toBeLessThanOrEqual(Date.now() + 30 * DAY);
+	});
+
+	it("needs a ttl to extend, rather than taking the permanent default", async () => {
+		const page = await publish({ ttl: "1h" });
+		const response = await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: null }) });
+		expect(response.status).toBe(400);
+		expect(await response.text()).toMatch(/ttl is required/);
 	});
 
 	it("switches between permanent and temporary", async () => {

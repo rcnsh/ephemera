@@ -1,5 +1,5 @@
 import { checkBundle, contentType, normalizePath, type PageFile, type PageKind, validateBundle } from "./files.ts";
-import { bytesText, LIMITS, PageError, type Ttl } from "./domain.ts";
+import { LIMITS, PageError, type Ttl } from "./domain.ts";
 import { type MockupOption, mockupOptions, slugify, type Verdict } from "./mockups.ts";
 
 /**
@@ -94,7 +94,7 @@ export interface Page {
 }
 
 export interface Usage {
-	/** Plain pages only: mockup sets don't count towards the page limits. */
+	/** Plain pages only: mockup sets are counted separately. */
 	temporaryPages: number;
 	permanentPages: number;
 	mockups: number;
@@ -231,38 +231,6 @@ export class Pages {
 		return results.map(toPage);
 	}
 
-	/** Checks there's room for `extraBytes` more, and for one more page of `kind` (null for one that doesn't count, like a mockup set). */
-	private async checkRoom(kind: "temporary" | "permanent" | null, extraBytes: number): Promise<void> {
-		const usage = await this.usage();
-		if (kind === "temporary" && usage.temporaryPages >= LIMITS.temporaryPages) {
-			throw new PageError(409, `There are already ${LIMITS.temporaryPages} temporary pages; delete some first`);
-		}
-		if (kind === "permanent" && usage.permanentPages >= LIMITS.permanentPages) {
-			throw new PageError(409, `There are already ${LIMITS.permanentPages} permanent pages; delete some or make them temporary first`);
-		}
-		if (usage.bytes + extraBytes > LIMITS.totalBytes) {
-			throw new PageError(507, `Publishing this would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
-		}
-	}
-
-	/**
-	 * `checkRoom` as a SQL condition, for the statement that takes the room.
-	 * D1 runs one statement at a time, so two requests racing for the last
-	 * slot can't both get it.
-	 */
-	private roomFor(kind: "temporary" | "permanent" | null, extraBytes: number): { sql: string; params: unknown[] } {
-		const now = this.now();
-		const params: unknown[] = [];
-		let sql = `(${STORED_BYTES}) + ? <= ?`;
-		params.push(now, extraBytes, LIMITS.totalBytes);
-		if (kind) {
-			const permanent = kind === "permanent" ? "IS NULL" : "IS NOT NULL";
-			sql += ` AND (SELECT COUNT(*) FROM pages WHERE ${LIVE} AND kind = 'page' AND expires_at ${permanent}) < ?`;
-			params.push(now, kind === "permanent" ? LIMITS.permanentPages : LIMITS.temporaryPages);
-		}
-		return { sql, params };
-	}
-
 	/**
 	 * Writes `files`, and copies the `carried` paths over from the version `from`.
 	 * Waits for every write to settle, even after one fails, so a cleanup that
@@ -307,8 +275,7 @@ export class Pages {
 	/**
 	 * Files go to R2 before the row goes to D1, and are deleted again if either
 	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
-	 * set: its id comes from the project and name, and it doesn't count
-	 * towards the page limits.
+	 * set: its id comes from the project and name.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -321,8 +288,6 @@ export class Pages {
 	}): Promise<Page> {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
 		const { files, size } = validateBundle(input.files, kind);
-		const lifetime = kind === "mockup" ? null : input.ttl === "permanent" ? "permanent" : "temporary";
-		await this.checkRoom(lifetime, size);
 		const now = this.now();
 		const row: PageRow = {
 			id: input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12),
@@ -344,12 +309,11 @@ export class Pages {
 		};
 		try {
 			await this.writeFiles(row.id, row.version, files);
-			const room = this.roomFor(lifetime, size);
-			const [result] = await this.db.batch([
+			await this.db.batch([
 				this.db
 					.prepare(
 						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project)
-						SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${room.sql}`,
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					)
 					.bind(
 						row.id,
@@ -366,16 +330,10 @@ export class Pages {
 						row.password_hash,
 						row.kind,
 						row.project,
-						...room.params,
 					),
 				this.addVersion(row.id, row.version, now, size, files.length),
 				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
 			]);
-			if (result!.meta.changes !== 1) {
-				// Another publish took the room while the files were uploading.
-				await this.checkRoom(lifetime, size);
-				throw new PageError(409, "Out of room; try again");
-			}
 		} catch (error) {
 			await this.deletePrefix(`pages/${row.id}/`);
 			throw error;
@@ -463,10 +421,6 @@ export class Pages {
 	private async addVersionOf(page: Page, size: number, paths: string[], write: (version: number) => Promise<void>): Promise<Page> {
 		const fileCount = paths.length;
 		const id = page.id;
-		const usage = await this.usage();
-		if (usage.bytes + size > LIMITS.totalBytes) {
-			throw new PageError(507, `This update would go over the ${bytesText(LIMITS.totalBytes)} storage limit; delete some pages first`);
-		}
 		const version = page.latestVersion + 1;
 		try {
 			await write(version);
@@ -475,14 +429,13 @@ export class Pages {
 			throw error;
 		}
 		const now = this.now();
-		const room = this.roomFor(null, size);
 		const [result] = await this.db.batch([
 			this.db
 				.prepare(
 					`UPDATE pages SET version = ?, latest_version = ?, size = ?, file_count = ?, updated_at = ?
-					WHERE id = ? AND latest_version = ? AND ${LIVE} AND ${room.sql}`,
+					WHERE id = ? AND latest_version = ? AND ${LIVE}`,
 				)
-				.bind(version, version, size, fileCount, now, id, page.latestVersion, now, ...room.params),
+				.bind(version, version, size, fileCount, now, id, page.latestVersion, now),
 			this.addVersion(id, version, now, size, fileCount),
 			...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
 		]);
@@ -584,28 +537,20 @@ export class Pages {
 		const page = await this.get(id);
 		const now = this.now();
 		let expiresAt: number | null;
-		let kind: "temporary" | "permanent" | null = null;
 		if (by === "permanent") {
 			if (page.permanent) return page;
-			kind = "permanent";
 			expiresAt = null;
 		} else if (page.permanent) {
-			kind = "temporary";
 			expiresAt = now + by;
 		} else {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
-		// Mockup sets don't count towards the page limits either way.
-		if (page.kind === "mockup") kind = null;
-		if (kind) await this.checkRoom(kind, 0);
-		const room = kind ? this.roomFor(kind, 0) : { sql: "1", params: [] };
 		const result = await this.db
-			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE} AND ${room.sql}`)
-			.bind(expiresAt, now, id, now, ...room.params)
+			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			.bind(expiresAt, now, id, now)
 			.run();
 		if (result.meta.changes !== 1) {
-			// Either another request took the last slot, or the page expired or was deleted since the lookup.
-			if (kind) await this.checkRoom(kind, 0);
+			// The page expired or was deleted since the lookup.
 			throw new PageError(410, `Page ${id} has expired or been deleted`);
 		}
 		return { ...page, expiresAt, permanent: expiresAt === null, updatedAt: now };
@@ -703,10 +648,10 @@ export class Pages {
 		return options;
 	}
 
-	/** Makes a permanent page temporary with a fresh default TTL. */
+	/** Makes a permanent page temporary, expiring `LIMITS.temporaryTtl` from now. */
 	async makeTemporary(id: string): Promise<Page> {
 		const page = await this.get(id);
-		return page.permanent ? this.extend(id, LIMITS.defaultTtl) : page;
+		return page.permanent ? this.extend(id, LIMITS.temporaryTtl) : page;
 	}
 
 	/** The page is gone as soon as the row says so; if deleting its files fails, the sweep tries again. */

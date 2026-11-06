@@ -7,11 +7,11 @@
 
 <h1 align="center">ephemera</h1>
 
-<p align="center">Temporary web pages for agents.</p>
+<p align="center">Throwaway web pages for agents, kept until you throw them away.</p>
 
 When an agent builds something you need to see, like a chart, a mockup or a report, it usually ends up as a file on disk or a wall of code in the chat. ephemera gives it a URL instead. The agent sends the HTML, CSS, JS and images, and gets back a link like `https://PAGES_HOST/k3x7q2abcd12/` that you can open on any device or send to someone else.
 
-Pages clean up after themselves. Each one expires after 24 hours unless the agent asks for longer (anywhere from 5 minutes to 30 days), or you keep it permanently.
+Pages are kept until you delete them. An agent can give a page a ttl (anywhere from 5 minutes to 30 days) when you ask for it to expire or when it's obviously scratch work, and it's deleted when that runs out. You can make a page expire, or stop it expiring, at any time.
 
 `PAGES_HOST` and `ADMIN_HOST` below are the two hostnames you choose when you deploy it; see [Self-hosting](#self-hosting).
 
@@ -47,7 +47,7 @@ The pass goes in the path rather than a cookie, because a sandboxed page's own r
 
 Each update adds a version. A page keeps its last 5 and can be rolled back to any of them.
 
-Every request checks the expiry, so a page stops working the moment it expires. It then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
+Pages given a ttl expire. Every request checks the expiry, so a page stops working the moment it expires. It then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
 
 ### Mockup sets
 
@@ -64,9 +64,8 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | --- | --- |
 | Per page | 50 MB, 200 files |
 | Per mockup set | 2 MB, 200 files |
-| Temporary pages | 100 |
-| Permanent pages | 25; mockup sets don't count |
-| Total storage | 2 GB, kept versions included |
+| Pages | no limit |
+| Total storage | no limit; the dashboard shows what's stored, kept versions included |
 
 ## Publishing
 
@@ -105,7 +104,7 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 | `POST /api/pages` | publish; also takes `visibility` and `password` |
 | `GET /api/pages` | list live pages and usage |
 | `PUT /api/pages/:id` | replace the files; the URL and expiry stay the same |
-| `PATCH /api/pages/:id` | `{"ttl":"1d"}` or `{"ttl":"permanent"}` extends, `{"label":"…"}` renames |
+| `PATCH /api/pages/:id` | `{"ttl":"1d"}` sets or extends the expiry, `{"ttl":"permanent"}` stops it, `{"label":"…"}` renames |
 | `DELETE /api/pages/:id` | delete |
 | `POST /api/pages/:id/files` | `{"files":[…],"remove":["old.css","b/"]}` changes single files (or whole folders) and keeps the rest |
 | `GET /api/pages/:id/versions` | list kept versions |

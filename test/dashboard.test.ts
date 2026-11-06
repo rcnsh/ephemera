@@ -48,16 +48,15 @@ describe("dashboard", () => {
 	});
 
 	it("lists live pages with usage, and isn't sandboxed or cached", async () => {
-		await publish({ label: "quarterly report", agent: "codex" });
-		await publish({ ttl: "permanent", label: "keeper" });
+		await publish({ ttl: "1h", label: "quarterly report", agent: "codex" });
+		await publish({ label: "keeper" });
 		const response = await admin();
 		expect(response.status).toBe(200);
 		const html = await response.text();
 		expect(html).toContain("quarterly report");
 		expect(html).toContain("codex");
 		expect(html).toContain("permanent");
-		expect(html).toMatch(/1\s*\/\s*100 temporary/);
-		expect(html).toMatch(/1\s*\/\s*25 permanent/);
+		expect(html).toContain("1 kept · 1 expiring");
 		expect(response.headers.get("content-security-policy")).not.toMatch(/^sandbox/);
 		expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
 		expect(response.headers.get("cache-control")).toBe("no-store");

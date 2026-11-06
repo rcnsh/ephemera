@@ -8,12 +8,11 @@ export const LIMITS = {
 	mockupBytes: 2 * 1024 * 1024,
 	pageFiles: 200,
 	pathLength: 256,
-	temporaryPages: 100,
-	permanentPages: 25,
-	totalBytes: 2 * 1024 * 1024 * 1024,
+	/** Pages are permanent unless given a ttl, which must fall between these. There's no cap on how many pages there are or how much they store. */
 	minTtl: 5 * MINUTE,
 	maxTtl: 30 * DAY,
-	defaultTtl: DAY,
+	/** How long a page lasts when the dashboard makes it temporary, and a share link given no ttl. */
+	temporaryTtl: DAY,
 	/** Versions kept per page, counting the one being served. Older ones are deleted on update. */
 	keptVersions: 5,
 	/** How long the pass from signing in to a private page, or from its password, lasts. */
@@ -39,11 +38,10 @@ const UNITS: Record<string, number> = { s: 1000, m: MINUTE, h: HOUR, d: DAY };
 
 /**
  * Parses a TTL as given by an agent: "permanent", a duration like "30m", "2h"
- * or "7d", or a bare number of seconds. Omitted means the 24-hour default.
+ * or "7d", or a bare number of seconds. Omitted means permanent.
  */
 export function parseTtl(input: string | number | undefined | null): Ttl {
-	if (input === undefined || input === null || input === "") return LIMITS.defaultTtl;
-	if (input === "permanent") return "permanent";
+	if (input === undefined || input === null || input === "" || input === "permanent") return "permanent";
 	let ms: number;
 	if (typeof input === "number") {
 		ms = input * 1000;

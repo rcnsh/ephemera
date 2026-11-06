@@ -160,11 +160,11 @@ export class Operations {
 		return pageView(await this.pages.setVisibility(id, chosen.visibility, chosen.passwordHash), this.host);
 	}
 
-	/** A link that opens a private page without signing in, until it expires (a day by default). A public page's link is just its URL. */
+	/** A link that opens a private page without signing in, until it expires (`LIMITS.temporaryTtl` by default). A public page's link is just its URL. */
 	async shareLink(id: string, ttl: TtlInput) {
 		const page = await this.pages.get(id);
 		if (page.visibility === "public") return { id, url: pageUrl(this.host, id), expiresAt: page.expiresAt };
-		const ms = parseTtl(ttl);
+		const ms = ttl === undefined || ttl === null || ttl === "" ? LIMITS.temporaryTtl : parseTtl(ttl);
 		if (ms === "permanent") throw new PageError(400, `A share link lasts at most ${LIMITS.maxTtl / 86_400_000} days`);
 		const now = this.now();
 		return { id, url: passUrl(this.host, id, await passFor(this.secret, page, now, ms)), expiresAt: now + ms };
@@ -176,6 +176,7 @@ export class Operations {
 	}
 
 	async extend(id: string, ttl: TtlInput) {
+		if (ttl === undefined || ttl === null || ttl === "") throw new PageError(400, 'ttl is required: a duration like "2h" or "7d", or "permanent"');
 		return pageView(await this.pages.extend(id, parseTtl(ttl)), this.host);
 	}
 
