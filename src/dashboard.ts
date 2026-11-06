@@ -1,5 +1,5 @@
 import { checkCsrf, csrfToken } from "./auth.ts";
-import { bytesText, LIMITS, PageError, pageUrl } from "./domain.ts";
+import { bytesText, PageError, pageUrl } from "./domain.ts";
 import { FAVICON_LINK, favicon, mark } from "./logo.ts";
 import { MAIN_OPTION, type MockupOption, optionPath, VERDICTS } from "./mockups.ts";
 import { Operations } from "./operations.ts";
@@ -288,7 +288,7 @@ ${mockupSets(sets, options, versions, host, csrf, now)}`
 ${FAVICON_LINK}
 <style nonce="${nonce}">${CSS}</style>
 <h1>${mark("logo", 7, 'class="logo"')}ephemera</h1>
-<p class="usage">${usage.temporaryPages} / ${LIMITS.temporaryPages} temporary · ${usage.permanentPages} / ${LIMITS.permanentPages} permanent · ${usage.mockups} mockup set${usage.mockups === 1 ? "" : "s"} · ${bytesText(usage.bytes)} / ${bytesText(LIMITS.totalBytes)}</p>
+<p class="usage">${usage.permanentPages} kept · ${usage.temporaryPages} expiring · ${usage.mockups} mockup set${usage.mockups === 1 ? "" : "s"} · ${bytesText(usage.bytes)}</p>
 <nav class="tabs">${tabLink("pages", "/", "Pages")}${tabLink("mockups", "/mockups", "Mockups")}</nav>
 ${body}
 <script nonce="${nonce}">${SCRIPT}</script>

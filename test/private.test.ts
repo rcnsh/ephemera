@@ -115,6 +115,14 @@ describe("private pages", () => {
 		}
 	});
 
+	it("give share links a day when no ttl is given, though pages are kept by default", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		const before = Date.now();
+		const link = await shareLink(page.id);
+		expect(link.expiresAt).toBeGreaterThanOrEqual(before + 86_400_000);
+		expect(link.expiresAt).toBeLessThanOrEqual(Date.now() + 86_400_000);
+	});
+
 	it("revoke share links when the visibility is set again, and drop passes once public", async () => {
 		const page = await publish({ files: FILES, visibility: "private" });
 		const link = await shareLink(page.id);

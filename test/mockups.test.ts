@@ -89,18 +89,17 @@ describe("mockup ids", () => {
 });
 
 describe("mockup limits", () => {
-	it("doesn't count mockup sets towards the permanent page limit", async () => {
-		for (let i = 0; i < LIMITS.permanentPages; i++) await publish({ ttl: "permanent" });
+	it("counts mockup sets apart from pages", async () => {
+		await publish({ ttl: "permanent" });
 		const set = await publishMockup();
 		expect(set.permanent).toBe(true);
 		const { usage } = (await (await api("/pages")).json()) as { usage: Record<string, number> };
-		expect(usage).toMatchObject({ permanentPages: LIMITS.permanentPages, mockups: 1 });
-		// Nor when it's made temporary and permanent again.
+		expect(usage).toMatchObject({ permanentPages: 1, mockups: 1 });
 		expect((await api(`/pages/${set.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "1d" }) })).status).toBe(200);
 		expect((await api(`/pages/${set.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "permanent" }) })).status).toBe(200);
 	});
 
-	it("caps a mockup set at 2 MB, and counts it towards total storage", async () => {
+	it("caps a mockup set at 2 MB, and counts it in the storage total", async () => {
 		const big = "x".repeat(LIMITS.mockupBytes + 1);
 		const response = await api("/mockups", {
 			method: "POST",

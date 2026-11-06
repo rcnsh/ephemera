@@ -26,7 +26,7 @@ const content = {
 const ttl = z
 	.union([z.string(), z.number()])
 	.optional()
-	.describe(`How long the page lives: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Defaults to ${durationText(LIMITS.defaultTtl)}. "permanent" keeps it until deleted: only use that when the user asks for it.`);
+	.describe(`When the page expires: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Omit it, or give "permanent", to keep the page until it's deleted. Give one when the user asks for the page to expire, or when it's obviously scratch work nobody will come back to.`);
 
 const label = z.string().optional().describe("A short human-readable name for the page, shown in the dashboard and list_pages");
 
@@ -42,7 +42,7 @@ const password = z
 
 const agent = z.string().optional().describe('Which agent is publishing, e.g. "claude-code" or "codex"');
 
-const publishGuide = (host: string) => `Publish a temporary web page at https://${host}/<id>/ and get its URL back. It's deleted automatically when its ttl runs out (${durationText(LIMITS.defaultTtl)} by default).
+const publishGuide = (host: string) => `Publish a web page at https://${host}/<id>/ and get its URL back. It's kept until it's deleted, unless you give it a ttl, in which case it's deleted automatically when that runs out.
 
 Write links between the page's own files as relative paths ("style.css", "img/a.png", "./data.json"), not root-relative ones ("/style.css"): every page lives under its own /<id>/ folder. Root-relative links in HTML attributes are fixed automatically, but ones inside CSS or JavaScript aren't; the response lists any it found as warnings.
 
@@ -158,7 +158,7 @@ function server(ops: Operations, host: string): McpServer {
 		"extend_page",
 		{
 			description:
-				`Give a page more time. A duration adds to its current expiry (at most ${durationText(LIMITS.maxTtl)} from now). "permanent" stops it expiring: only do that when the user asks. A duration on a permanent page makes it temporary again, expiring that long from now.`,
+				`Change when a page expires. On a page with a ttl, a duration adds to its current expiry (at most ${durationText(LIMITS.maxTtl)} from now) and "permanent" stops it expiring. On a permanent page (the default), a duration makes it expire that long from now.`,
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).describe('A duration like "2h" or "7d", or "permanent"') }),
 		},
 		(input) => run(() => ops.extend(input.id, input.ttl)),
@@ -187,7 +187,7 @@ function server(ops: Operations, host: string): McpServer {
 		"share_link",
 		{
 			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility revokes these.",
-			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe('How long the link works: "2h", "7d" (up to 30 days); defaults to a day') }),
+			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe(`How long the link works: "2h", "7d" (up to ${durationText(LIMITS.maxTtl)}); defaults to ${durationText(LIMITS.temporaryTtl)}`) }),
 		},
 		(input) => run(() => ops.shareLink(input.id, input.ttl)),
 	);
