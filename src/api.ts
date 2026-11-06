@@ -109,8 +109,11 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 				return json(await ops.update(id, (await readBundle(request, url)).files));
 			case "PATCH": {
 				const body = await readJson<{ ttl: TtlInput; label: unknown }>(request);
+				// A null or empty ttl next to a label means "just rename"; on its own it's an error from extend.
+				const ttlGiven = body.ttl !== undefined && body.ttl !== null && body.ttl !== "";
+				if (!ttlGiven && !("label" in body)) return json(await ops.extend(id, body.ttl));
 				if ("label" in body) await ops.setLabel(id, body.label);
-				if ("ttl" in body || !("label" in body)) return json(await ops.extend(id, body.ttl));
+				if (ttlGiven) return json(await ops.extend(id, body.ttl));
 				return json(await ops.get(id));
 			}
 			case "DELETE":
