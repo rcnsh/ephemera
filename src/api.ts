@@ -1,4 +1,4 @@
-import { PageError } from "./domain.ts";
+import { PageError, parseTtl, ttlOmitted } from "./domain.ts";
 import { type BundleInput, bundleFrom, type InlineFile, unzipFiles } from "./files.ts";
 import type { Operations, PublishInput, TtlInput } from "./operations.ts";
 
@@ -110,8 +110,10 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 			case "PATCH": {
 				const body = await readJson<{ ttl: TtlInput; label: unknown }>(request);
 				// A null or empty ttl next to a label means "just rename"; on its own it's an error from extend.
-				const ttlGiven = body.ttl !== undefined && body.ttl !== null && body.ttl !== "";
+				const ttlGiven = !ttlOmitted(body.ttl);
 				if (!ttlGiven && !("label" in body)) return json(await ops.extend(id, body.ttl));
+				// Check the ttl before renaming, so a bad one changes nothing.
+				if (ttlGiven) parseTtl(body.ttl);
 				if ("label" in body) await ops.setLabel(id, body.label);
 				if (ttlGiven) return json(await ops.extend(id, body.ttl));
 				return json(await ops.get(id));

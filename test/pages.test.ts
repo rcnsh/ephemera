@@ -287,6 +287,8 @@ describe("updating and expiry", () => {
 		expect(await response.text()).toMatch(/ttl is required/);
 		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "new", ttl: null }) })).json()) as { label: string; expiresAt: number };
 		expect(renamed).toMatchObject({ label: "new", expiresAt: page.expiresAt });
+		expect((await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "newer", ttl: "0" }) })).status).toBe(400);
+		expect(((await (await api(`/pages/${page.id}`)).json()) as { label: string }).label).toBe("new");
 	});
 
 	it("switches between permanent and temporary", async () => {

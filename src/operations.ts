@@ -1,5 +1,5 @@
 import { hashPassword, uploadToken } from "./auth.ts";
-import { LIMITS, PageError, pageUrl, parseTtl } from "./domain.ts";
+import { LIMITS, PageError, pageUrl, parseTtl, ttlOmitted } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
@@ -164,7 +164,7 @@ export class Operations {
 	async shareLink(id: string, ttl: TtlInput) {
 		const page = await this.pages.get(id);
 		if (page.visibility === "public") return { id, url: pageUrl(this.host, id), expiresAt: page.expiresAt };
-		const ms = ttl === undefined || ttl === null || ttl === "" ? LIMITS.temporaryTtl : parseTtl(ttl);
+		const ms = ttlOmitted(ttl) ? LIMITS.temporaryTtl : parseTtl(ttl);
 		if (ms === "permanent") throw new PageError(400, `A share link lasts at most ${LIMITS.maxTtl / 86_400_000} days`);
 		const now = this.now();
 		return { id, url: passUrl(this.host, id, await passFor(this.secret, page, now, ms)), expiresAt: now + ms };
@@ -176,7 +176,7 @@ export class Operations {
 	}
 
 	async extend(id: string, ttl: TtlInput) {
-		if (ttl === undefined || ttl === null || ttl === "") throw new PageError(400, 'ttl is required: a duration like "2h" or "7d", or "permanent"');
+		if (ttlOmitted(ttl)) throw new PageError(400, 'ttl is required: a duration like "2h" or "7d", or "permanent"');
 		return pageView(await this.pages.extend(id, parseTtl(ttl)), this.host);
 	}
 

@@ -26,7 +26,7 @@ const content = {
 const ttl = z
 	.union([z.string(), z.number()])
 	.optional()
-	.describe(`When the page expires: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Omit it to keep the page until it's deleted. Give one when the user asks for the page to expire, or when it's obviously scratch work nobody will come back to.`);
+	.describe(`When the page expires: a duration like "30m", "2h", "7d" (${durationText(LIMITS.minTtl)} to ${durationText(LIMITS.maxTtl)}) or a number of seconds. Omit it, or give "permanent", to keep the page until it's deleted. Give one when the user asks for the page to expire, or when it's obviously scratch work nobody will come back to.`);
 
 const label = z.string().optional().describe("A short human-readable name for the page, shown in the dashboard and list_pages");
 
