@@ -7,7 +7,7 @@
 
 <h1 align="center">ephemera</h1>
 
-<p align="center">Throwaway web pages for agents, kept until you throw them away.</p>
+<p align="center">Instant web pages for agents.</p>
 
 When an agent builds something you need to see, like a chart, a mockup or a report, it usually ends up as a file on disk or a wall of code in the chat. ephemera gives it a URL instead. The agent sends the HTML, CSS, JS and images, and gets back a link like `https://PAGES_HOST/k3x7q2abcd12/` that you can open on any device or send to someone else.
 
