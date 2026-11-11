@@ -254,6 +254,15 @@ describe("the set page", () => {
 		expect(html).toContain('src="a%22%3C/"');
 	});
 
+	it("keeps showing current verdicts when the set's missing index is cached, and its own index once one is added", async () => {
+		const set = await publishMockup();
+		expect(await (await call(set.url)).text()).not.toContain("picked</span>");
+		await verdict(set.id, { option: "a", verdict: "picked" });
+		expect(await (await call(set.url)).text()).toContain("picked</span>");
+		await patch(set.id, { files: [{ path: "index.html", content: "<p>custom</p>" }] });
+		expect(await (await call(set.url)).text()).toBe("<p>custom</p>");
+	});
+
 	it("serves the set's own root index.html instead, if it has one", async () => {
 		const set = await publishMockup({ files: [...TWO_OPTIONS, { path: "index.html", content: "<p>custom</p>" }] });
 		expect(await (await call(set.url)).text()).toBe("<p>custom</p>");

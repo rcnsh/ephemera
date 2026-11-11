@@ -44,8 +44,36 @@ function withPageHeaders(response: Response): Response {
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers, encodeBody });
 }
 
+/** Times steps of a request, for its Server-Timing header. */
+class Timings {
+	private readonly entries: string[] = [];
+	/** `describe` gives the entry a description from the result, such as a cache hit or miss. */
+	async time<T>(name: string, work: Promise<T>, describe?: (result: T) => string | null): Promise<T> {
+		const start = performance.now();
+		let description: string | null = null;
+		try {
+			const result = await work;
+			description = describe?.(result) ?? null;
+			return result;
+		} finally {
+			this.entries.push(`${name};${description ? `desc=${description};` : ""}dur=${Math.round(performance.now() - start)}`);
+		}
+	}
+	header(): string {
+		return this.entries.join(", ");
+	}
+}
+
 async function servePage(request: Request, env: Env, pages: Pages, id: string, subpath: string): Promise<Response> {
-	const found = await pages.lookup(id);
+	const timings = new Timings();
+	const response = await servePageTimed(request, env, pages, id, subpath, timings);
+	// Every response here is built in this file, so its headers can be changed.
+	response.headers.set("server-timing", timings.header());
+	return response;
+}
+
+async function servePageTimed(request: Request, env: Env, pages: Pages, id: string, subpath: string, timings: Timings): Promise<Response> {
+	const found = await timings.time("db", pages.lookup(id));
 	if (found.state === "gone") return text("This page has expired.\n", 410);
 	if (found.state === "missing") return text("Not found\n", 404);
 	const page = found.page;
@@ -77,33 +105,33 @@ async function servePage(request: Request, env: Env, pages: Pages, id: string, s
 		return text("Not found\n", 404);
 	}
 
-	const object = await pages.file(page, path, request.headers);
-	if (!object && path === "index.html" && page.kind === "mockup") {
+	const file = await timings.time("file", pages.serveFile(page, path, request.headers.get("if-none-match")), (served) => (served ? (served.cached ? "hit" : "miss") : null));
+	const cacheControl = pass ? "private, no-cache, no-transform" : "no-cache, no-transform";
+	if (!file && path === "index.html" && page.kind === "mockup") {
 		// A mockup set without its own index shows its options side by side.
 		// Its links are relative, so it isn't rewritten.
-		const html = mockupIndex(page.label ?? page.id, await pages.options(id));
-		const headers = { "content-type": "text/html; charset=utf-8", "cache-control": pass ? "private, no-cache, no-transform" : "no-cache, no-transform" };
+		const html = mockupIndex(page.label ?? page.id, await timings.time("options", pages.options(id)));
+		const headers = { "content-type": "text/html; charset=utf-8", "cache-control": cacheControl };
 		return gzip(request, new Response(request.method === "HEAD" ? null : html, { headers }));
 	}
-	if (!object && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
+	if (!file && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
 		// A folder without its trailing slash: redirect so relative links inside it resolve.
 		return new Response(null, { status: 301, headers: { location: `${base}/${rest}/${url.search}` } });
 	}
-	if (!object) return text("Not found\n", 404);
+	if (!file) return text("Not found\n", 404);
 
 	// no-cache, not no-store: the browser keeps files but asks each time, so an
 	// update shows on refresh while unchanged files come back as 304s.
 	// no-transform stops Cloudflare editing pages (injected scripts, Rocket
 	// Loader), which would also strip the ETag; so we compress text ourselves.
-	const headers = new Headers({
-		"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
-		etag: object.httpEtag,
-		"cache-control": pass ? "private, no-cache, no-transform" : "no-cache, no-transform",
-	});
-	if (!("body" in object)) return new Response(null, { status: 304, headers });
-	if (request.method === "HEAD") return new Response(null, { headers });
-	const response = new Response(object.body, { headers });
-	return gzip(request, headers.get("content-type")!.startsWith("text/html") ? rewriteLinks(response, id, pass) : response);
+	const headers = new Headers({ "content-type": file.contentType, etag: file.etag, "cache-control": cacheControl });
+	if (!file.body) return new Response(null, { status: 304, headers });
+	if (request.method === "HEAD") {
+		await file.body.cancel();
+		return new Response(null, { headers });
+	}
+	const response = new Response(file.body, { headers });
+	return gzip(request, file.contentType.startsWith("text/html") ? rewriteLinks(response, id, pass) : response);
 }
 
 const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|wasm|manifest\+json)|image\/svg\+xml)/;
@@ -163,7 +191,7 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 export default {
 	async fetch(request, env, ctx) {
 		const { hostname } = new URL(request.url);
-		const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work) });
+		const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work), cacheOrigin: `https://${env.PAGES_HOST}` });
 		try {
 			if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
 			if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);

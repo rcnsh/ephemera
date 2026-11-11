@@ -12,6 +12,12 @@ import { type MockupOption, mockupOptions, slugify, type Verdict } from "./mocku
  * once the grace period is over the row is dropped and the id answers 404.
  * Mockup sets are pages too (`kind` 'mockup'), with a row per option in
  * `verdicts`. The table is created by the migrations in /migrations.
+ *
+ * A version's files never change, so `serveFile` keeps them in the edge cache
+ * under their version (see `PagesOptions.cacheOrigin`): R2 is read once per
+ * file per data centre rather than on every view. Each frame of a mockup set
+ * is a sandboxed opaque origin with a cache partition of its own, so browsers
+ * can't share files between frames and every frame asks the Worker again.
  */
 
 interface Storage {
@@ -161,11 +167,43 @@ export interface PagesOptions {
 	/** Keeps background work (deleting replaced files) alive after the response; `ctx.waitUntil` in the Worker. */
 	defer: (work: Promise<unknown>) => void;
 	now?: () => number;
+	/**
+	 * An origin of this Worker's zone (`https://PAGES_HOST`) to key cached files
+	 * under, at paths no request reaches. Without it nothing is cached.
+	 */
+	cacheOrigin?: string;
+}
+
+/** A file as served: `body` is null when the caller's ETag already matches. */
+export interface ServedFile {
+	etag: string;
+	contentType: string;
+	body: ReadableStream | null;
+	/** Whether it came from the edge cache rather than R2. */
+	cached: boolean;
+}
+
+/**
+ * How long a data centre keeps a cached file. Views of a page cluster soon
+ * after it's published; a short life means a deleted page's copies (which no
+ * request can reach) don't linger.
+ */
+const CACHE_SECONDS = 24 * 60 * 60;
+
+/** Marks a cached answer that a version has no file at a path. */
+const MISSING = "x-ephemera-missing";
+
+/** Whether an If-None-Match header names `etag` (weakly, as browsers compare). */
+function matches(ifNoneMatch: string | null, etag: string): boolean {
+	if (!ifNoneMatch) return false;
+	const bare = (tag: string) => tag.trim().replace(/^W\//, "");
+	return ifNoneMatch.split(",").some((tag) => tag.trim() === "*" || bare(tag) === bare(etag));
 }
 
 export class Pages {
 	private readonly defer: (work: Promise<unknown>) => void;
 	private readonly now: () => number;
+	private readonly cacheOrigin: string | undefined;
 
 	constructor(
 		private readonly storage: Storage,
@@ -173,6 +211,7 @@ export class Pages {
 	) {
 		this.defer = options.defer;
 		this.now = options.now ?? Date.now;
+		this.cacheOrigin = options.cacheOrigin;
 	}
 
 	private get db() {
@@ -197,9 +236,63 @@ export class Pages {
 		throw new PageError(404, `No page with id "${id}"`);
 	}
 
-	/** A file of the page. With `conditional` request headers, a file the caller already has comes back without a body. */
-	async file(page: Page, path: string, conditional?: Headers): Promise<R2ObjectBody | R2Object | null> {
-		return this.storage.BUCKET.get(`pages/${page.id}/${page.version}/${path}`, conditional ? { onlyIf: conditional } : {});
+	/** A file of the page, straight from R2. */
+	async file(page: Page, path: string): Promise<R2ObjectBody | null> {
+		return this.storage.BUCKET.get(`pages/${page.id}/${page.version}/${path}`);
+	}
+
+	/** Where the edge cache keeps a version's file. `_files` can't be a page id, so no request maps here. */
+	private cacheKey(id: string, version: number, path: string): string | null {
+		if (!this.cacheOrigin) return null;
+		return `${this.cacheOrigin}/_files/${id}/${version}/${path.split("/").map(encodeURIComponent).join("/")}`;
+	}
+
+	private cacheFile(id: string, version: number, path: string, file: { etag: string; contentType: string; body: BodyInit } | null): Promise<void> {
+		const key = this.cacheKey(id, version, path);
+		if (!key) return Promise.resolve();
+		const headers = new Headers({ "cache-control": `public, max-age=${CACHE_SECONDS}` });
+		if (file) {
+			headers.set("etag", file.etag);
+			headers.set("content-type", file.contentType);
+		} else headers.set(MISSING, "1");
+		return caches.default.put(key, new Response(file?.body ?? null, { headers })).catch((error) => console.warn(`caching ${key} failed: ${error}`));
+	}
+
+	/**
+	 * A file of the page to send, or null if it has none at `path`. Answers
+	 * from the edge cache when it can, and fills it from R2 when it can't.
+	 * With an `ifNoneMatch` naming the file's ETag, the body is null.
+	 */
+	async serveFile(page: Page, path: string, ifNoneMatch: string | null = null): Promise<ServedFile | null> {
+		const key = this.cacheKey(page.id, page.version, path);
+		const cached = key ? await caches.default.match(key) : undefined;
+		if (cached) {
+			if (cached.headers.has(MISSING)) return null;
+			const etag = cached.headers.get("etag")!;
+			const fresh = matches(ifNoneMatch, etag);
+			if (fresh) await cached.body?.cancel();
+			return { etag, contentType: cached.headers.get("content-type")!, body: fresh ? null : cached.body, cached: true };
+		}
+		const object = await this.file(page, path);
+		if (!object) {
+			// Only a missing index is worth remembering: it's how a mockup set
+			// without one of its own is shown, on every view.
+			if (path === "index.html") this.defer(this.cacheFile(page.id, page.version, path, null));
+			return null;
+		}
+		const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
+		if (matches(ifNoneMatch, file.etag)) {
+			if (!key) {
+				await object.body.cancel();
+				return { ...file, body: null };
+			}
+			this.defer(this.cacheFile(page.id, page.version, path, { ...file, body: object.body }));
+			return { ...file, body: null };
+		}
+		// The cache gets its own read rather than a tee: a tee would hold
+		// whatever a slow client hasn't taken yet in memory, up to a whole page.
+		if (key) this.defer(this.file(page, path).then((copy) => (copy ? this.cacheFile(page.id, page.version, path, { ...file, body: copy.body }) : undefined)));
+		return { ...file, body: object.body };
 	}
 
 	async hasFile(page: Page, path: string): Promise<boolean> {
@@ -235,19 +328,32 @@ export class Pages {
 	 * Writes `files`, and copies the `carried` paths over from the version `from`.
 	 * Waits for every write to settle, even after one fails, so a cleanup that
 	 * follows sees them all.
+	 *
+	 * Returns `warm`, which puts the new files in the edge cache: whoever
+	 * published is usually the first to look, from the same data centre. Call
+	 * it only once the version is committed, since a version number that
+	 * failed to commit is used again.
 	 */
-	private async writeFiles(id: string, version: number, files: PageFile[], carried: string[] = [], from?: Page): Promise<void> {
+	private async writeFiles(id: string, version: number, files: PageFile[], carried: string[] = [], from?: Page): Promise<() => void> {
 		const key = (path: string) => `pages/${id}/${version}/${path}`;
+		const written: { path: string; etag: string; contentType: string; body: Uint8Array }[] = [];
 		const results = await Promise.allSettled([
-			...files.map((file) => this.storage.BUCKET.put(key(file.path), file.body, { httpMetadata: { contentType: contentType(file.path) } })),
+			...files.map(async (file) => {
+				const type = contentType(file.path);
+				const object = await this.storage.BUCKET.put(key(file.path), file.body, { httpMetadata: { contentType: type } });
+				written.push({ path: file.path, etag: object.httpEtag, contentType: type, body: file.body });
+			}),
 			...carried.map(async (path) => {
 				const object = await this.file(from!, path);
-				if (!object || !("body" in object)) throw new Error(`pages/${id}/${from!.version}/${path} vanished while copying`);
+				if (!object) throw new Error(`pages/${id}/${from!.version}/${path} vanished while copying`);
 				await this.storage.BUCKET.put(key(path), object.body, { httpMetadata: object.httpMetadata });
 			}),
 		]);
 		const failed = results.find((result) => result.status === "rejected");
 		if (failed) throw failed.reason;
+		return () => {
+			for (const { path, ...file } of written) this.defer(this.cacheFile(id, version, path, file));
+		};
 	}
 
 	/** The paths and sizes of the files of a version of a page. */
@@ -307,8 +413,9 @@ export class Pages {
 			kind,
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
 		};
+		let warm: () => void;
 		try {
-			await this.writeFiles(row.id, row.version, files);
+			warm = await this.writeFiles(row.id, row.version, files);
 			await this.db.batch([
 				this.db
 					.prepare(
@@ -338,6 +445,7 @@ export class Pages {
 			await this.deletePrefix(`pages/${row.id}/`);
 			throw error;
 		}
+		warm();
 		return toPage(row);
 	}
 
@@ -418,31 +526,51 @@ export class Pages {
 	}
 
 	/** Writes a new version of `page` with `write`, then serves it. `paths` are the files it will have. */
-	private async addVersionOf(page: Page, size: number, paths: string[], write: (version: number) => Promise<void>): Promise<Page> {
+	private async addVersionOf(page: Page, size: number, paths: string[], write: (version: number) => Promise<() => void>): Promise<Page> {
 		const fileCount = paths.length;
 		const id = page.id;
 		const version = page.latestVersion + 1;
+		// Reserve the version number before writing, so two updates at once
+		// can't write over each other's files. A number that fails is skipped.
+		const reserved = await this.db
+			.prepare(`UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND ${LIVE}`)
+			.bind(version, id, page.latestVersion, this.now())
+			.run();
+		if (reserved.meta.changes !== 1) {
+			await this.get(id); // 410 if it has gone since
+			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
+		}
+		let warm: () => void;
 		try {
-			await write(version);
+			warm = await write(version);
 		} catch (error) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw error;
 		}
 		const now = this.now();
-		const [result] = await this.db.batch([
-			this.db
-				.prepare(
-					`UPDATE pages SET version = ?, latest_version = ?, size = ?, file_count = ?, updated_at = ?
-					WHERE id = ? AND latest_version = ? AND ${LIVE}`,
-				)
-				.bind(version, version, size, fileCount, now, id, page.latestVersion, now),
-			this.addVersion(id, version, now, size, fileCount),
-			...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
-		]);
-		if (result!.meta.changes !== 1) {
+		let committed: boolean;
+		try {
+			const [result] = await this.db.batch([
+				this.db
+					.prepare(
+						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
+						WHERE id = ? AND latest_version = ? AND ${LIVE}`,
+					)
+					.bind(version, size, fileCount, now, id, version, now),
+				this.addVersion(id, version, now, size, fileCount),
+				...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
+			]);
+			committed = result!.meta.changes === 1;
+		} catch (error) {
+			// The number is never used again, so nothing else would clear its files.
+			await this.deletePrefix(`pages/${id}/${version}/`);
+			throw error;
+		}
+		if (!committed) {
 			await this.deletePrefix(`pages/${id}/${version}/`);
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
+		warm();
 		this.defer(this.prune(id));
 		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
 	}
