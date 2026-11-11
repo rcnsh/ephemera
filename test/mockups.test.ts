@@ -233,9 +233,19 @@ describe("the set page", () => {
 		await verdict(set.id, { option: "a", verdict: "picked" });
 		await verdict(set.id, { option: "b", verdict: "rejected" });
 		const html = await (await call(set.url)).text();
-		expect(html).toMatch(/<figure class="picked">\s*<figcaption><a href="a\/"[^>]*>a<\/a> <span class="badge">picked<\/span>/);
-		expect(html).toMatch(/<figure>\s*<figcaption><a href="b\/"[^>]*>b<\/a><\/figcaption>/);
+		expect(html).toMatch(/<figure class="option picked" data-option="a"[^>]*>\s*<figcaption><a class="name" href="#option=a">a<\/a> <span class="badge">picked<\/span>/);
+		expect(html).toMatch(/<figure class="option" data-option="b"[^>]*>\s*<figcaption><a class="name" href="#option=b">b<\/a><a class="open"/);
 		expect(html).not.toContain("rejected");
+	});
+
+	it("shows a picked option's note, and keeps the label out of reach of the script", () => {
+		const html = mockupIndex("</script><b>", [
+			{ name: "a", verdict: "picked", note: "denser <but> fine", updatedAt: 0 },
+			{ name: "b", verdict: "rejected", note: "too busy", updatedAt: 0 },
+		]);
+		expect(html).toContain('<p class="note">denser &#60;but&#62; fine</p>');
+		expect(html).not.toContain("too busy");
+		expect(html.match(/<\/script>/g)).toHaveLength(2);
 	});
 
 	it("escapes option names and the label", () => {
