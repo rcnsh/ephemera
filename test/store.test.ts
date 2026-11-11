@@ -116,6 +116,19 @@ describe("versions", () => {
 		return object.text();
 	}
 
+	it("lets one of two updates at once win, without the other touching its files", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
+		const results = await Promise.allSettled([pages.update(page.id, [file("index.html", "a")]), pages.update(page.id, [file("index.html", "b")])]);
+		const won = results.filter((result) => result.status === "fulfilled");
+		expect(won).toHaveLength(1);
+		expect(results.find((result) => result.status === "rejected")?.reason).toMatchObject({ status: 409 });
+		const served = await text(pages, page.id);
+		expect(["a", "b"]).toContain(served);
+		expect(await pages.update(page.id, [file("index.html", "c")])).toMatchObject({ version: 3 });
+		expect(await text(pages, page.id)).toBe("c");
+	});
+
 	it("keeps the newest versions and deletes older ones in the background", async () => {
 		const { pages, settle } = store();
 		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });

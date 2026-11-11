@@ -30,6 +30,7 @@ One Cloudflare Worker serves three things:
 - **Sandboxed.** Pages are served with `CSP: sandbox` and without `allow-same-origin`, so agent-written code can't read cookies or storage for the domain it's served from.
 - **Able to load their own files.** `Access-Control-Allow-Origin: *` lets a page `fetch` and `import` its own files from its opaque origin.
 - **Cheap to refresh.** Files are sent `no-cache` with ETags, so unchanged files come back as 304s.
+- **Fast to load.** A version's files never change, so the Worker keeps them in Cloudflare's edge cache and reads R2 for a file once per data centre. Publishing fills the cache with the files it sends, in the data centre it came through; cached copies last a day. Each response carries a `Server-Timing` header (`db`, `file` with a cache hit or miss, `options`).
 - **Served as published.** `no-transform` stops Cloudflare editing pages (injected scripts, Rocket Loader), which would also strip the ETags. The Worker gzips text itself instead.
 - **Out of search engines:** `noindex`.
 

@@ -155,6 +155,40 @@ describe("serving", () => {
 		expect(await changed.text()).toContain("v2");
 	});
 
+	it("serves a version's files from the edge cache, without R2, until the page changes or goes", async () => {
+		const page = await publish({ files: [{ path: "index.html", content: "<h1>v1</h1>" }, { path: "a b/c.css", content: "p{}" }] });
+		// Publishing warms the cache, so the files survive losing their R2 copies.
+		await env.BUCKET.delete([`pages/${page.id}/1/index.html`, `pages/${page.id}/1/a b/c.css`]);
+		const cached = await call(`${PAGES}/${page.id}/`);
+		expect(cached.status).toBe(200);
+		expect(await cached.text()).toContain("v1");
+		expect(cached.headers.get("server-timing")).toMatch(/\bfile;desc=hit;dur=\d+/);
+		expect(await (await call(`${PAGES}/${page.id}/a%20b/c.css`)).text()).toBe("p{}");
+		const etag = cached.headers.get("etag")!;
+		expect((await call(`${PAGES}/${page.id}/`, { headers: { "if-none-match": `W/${etag}` } })).status).toBe(304);
+		expect((await call(`${PAGES}/${page.id}/nope.css`)).status).toBe(404);
+		expect((await call(`${PAGES}/${page.id}/nope.css`)).status).toBe(404);
+
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "<h1>v2</h1>" }, { path: "nope.css", content: "q{}" }] }) });
+		expect(await (await call(`${PAGES}/${page.id}/`)).text()).toContain("v2");
+		expect(await (await call(`${PAGES}/${page.id}/nope.css`)).text()).toBe("q{}");
+
+		await api(`/pages/${page.id}`, { method: "DELETE" });
+		expect((await call(`${PAGES}/${page.id}/`)).status).toBe(410);
+	});
+
+	it("fills the edge cache from R2 for files it doesn't have", async () => {
+		const page = await publish();
+		const key = `https://pages.example.com/_files/${page.id}/1/index.html`;
+		await caches.default.delete(key);
+		const missed = await call(`${PAGES}/${page.id}/`);
+		expect(missed.headers.get("server-timing")).toMatch(/\bfile;desc=miss;dur=\d+/);
+		expect(await missed.text()).toContain("hello");
+		expect(await caches.default.match(key)).toBeTruthy();
+		await env.BUCKET.delete(`pages/${page.id}/1/index.html`);
+		expect(await (await call(`${PAGES}/${page.id}/`)).text()).toContain("hello");
+	});
+
 	it("gzips text files itself and keeps their ETag", async () => {
 		const page = await publish({ files: [{ path: "index.html", content: "<h1>hi</h1>".repeat(100) }, { path: "a.png", content: "iVBORw0KGgo=", encoding: "base64" }] });
 		const zipped = await call(`${PAGES}/${page.id}/`, { headers: { "accept-encoding": "gzip, br" } });
