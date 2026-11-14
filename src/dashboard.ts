@@ -4,7 +4,7 @@ import { FAVICON_LINK, favicon, mark } from "./logo.ts";
 import { type MockupOption, VERDICTS } from "./mockups.ts";
 import { Operations, type Overview } from "./operations.ts";
 import { ID_SOURCE, type Page, type Pages, type Version } from "./pages.ts";
-import { passFor, passUrl, safeRest } from "./privacy.ts";
+import { viewerUrl } from "./privacy.ts";
 import { screenshot, screenshotOptions } from "./thumbnails.ts";
 
 /** What the dashboard's extend buttons add, as ttls. */
@@ -323,7 +323,7 @@ async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: stri
 	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
 	if (cached) return new Response(cached.body, { headers });
 
-	const url = page.visibility === "private" ? passUrl(env.PAGES_HOST, id, await passFor(env.EPHEMERA_TOKEN, page, Date.now(), THUMBNAIL_PASS)) : pageUrl(env.PAGES_HOST, id);
+	const url = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { ttl: THUMBNAIL_PASS });
 	const png = await screenshot(env.BROWSER, url);
 	// Not cached, so the next dashboard load tries again.
 	if (!png) return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": "no-store" } });
@@ -337,8 +337,9 @@ const shooting = new Map<string, Promise<Map<string, Uint8Array | null>>>();
 /** Shoots every option of a mockup set in one browser launch, and keeps the ones that worked. */
 async function shootOptions(env: Env, ctx: ExecutionContext, pages: Pages, page: Page): Promise<Map<string, Uint8Array | null>> {
 	const options = await pages.options(page.id);
-	const pass = page.visibility === "private" ? await passFor(env.EPHEMERA_TOKEN, page, Date.now(), THUMBNAIL_PASS) : null;
-	const urls = options.map((option) => (pass ? passUrl(env.PAGES_HOST, page.id, pass, option.path) : `${pageUrl(env.PAGES_HOST, page.id)}${option.path}`));
+	// One URL (and pass) for the set; option paths are relative to it.
+	const set = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { ttl: THUMBNAIL_PASS });
+	const urls = options.map((option) => `${set}${option.path}`);
 	const pngs = await screenshotOptions(env.BROWSER, urls);
 	const shots = new Map(options.map((option, i) => [option.name, pngs[i] ?? null]));
 	for (const [option, png] of shots) if (png) ctx.waitUntil(pages.files.saveThumbnail(page, png, option));
@@ -404,8 +405,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		const found = await pages.lookup(id);
 		if (found.state !== "live") return respond(found.state === "gone" ? "This page has expired." : "Not found", found.state === "gone" ? 410 : 404);
 		const page = found.page;
-		const location =
-			page.visibility === "private" ? passUrl(env.PAGES_HOST, id, await passFor(env.EPHEMERA_TOKEN, page, Date.now()), rest) : `${pageUrl(env.PAGES_HOST, id)}${safeRest(rest)}`;
+		const location = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { rest });
 		return new Response(null, { status: 302, headers: { location, "cache-control": "no-store", "referrer-policy": "no-referrer" } });
 	}
 

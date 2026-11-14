@@ -4,7 +4,7 @@ import { type Content, decodeContent, decodeFiles, hasFiles } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
 import type { Page, Pages, Usage, Version, Visibility } from "./pages.ts";
-import { passFor, passUrl } from "./privacy.ts";
+import { viewerUrl } from "./privacy.ts";
 
 /** What agents see of a page. */
 export function pageView(page: Page, host: string) {
@@ -186,7 +186,7 @@ export class Operations {
 		const ms = ttlOmitted(ttl) ? LIMITS.temporaryTtl : parseTtl(ttl);
 		if (ms === "permanent") throw new PageError(400, `A share link lasts at most ${LIMITS.maxTtl / 86_400_000} days`);
 		const now = this.now();
-		return { id, url: passUrl(this.host, id, await passFor(this.secret, page, now, ms)), expiresAt: now + ms };
+		return { id, url: await viewerUrl(this.secret, this.host, page, now, { ttl: ms }), expiresAt: now + ms };
 	}
 
 	async setLabel(id: string, label: unknown) {
