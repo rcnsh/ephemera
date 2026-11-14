@@ -6,6 +6,12 @@ afterEach(() => reset());
 
 const PASSWORD = "correct horse";
 
+/** Each guess comes from its own address, so a long list of them stays under the per-address guess limit. */
+let address = 0;
+function fromNewAddress(): Record<string, string> {
+	return { "cf-connecting-ip": `203.0.113.${++address % 250}` };
+}
+
 describe("unlocking a private page", () => {
 	it("never redirects outside the page, however the next path is encoded", async () => {
 		const page = await publish({ visibility: "private", password: PASSWORD });
@@ -23,7 +29,7 @@ describe("unlocking a private page", () => {
 			`a/%2e%2e/%2e%2e/${other.id}/`,
 		];
 		for (const next of sneaky) {
-			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", body: new URLSearchParams({ password: PASSWORD, next }) });
+			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", headers: fromNewAddress(), body: new URLSearchParams({ password: PASSWORD, next }) });
 			expect(response.status, next).toBe(303);
 			const location = new URL(response.headers.get("location")!);
 			expect(location.pathname, next).toMatch(new RegExp(`^/${page.id}/~[^/]+/$`));
@@ -54,7 +60,7 @@ describe("unlocking a private page", () => {
 	it("keeps inputs that were already safe inside the page", async () => {
 		const page = await publish({ visibility: "private", password: PASSWORD });
 		for (const next of ["%252e%252e/%252e%252e/zzz/", "..\\zzz", "%5c..%5czzz", "%2E", "https://evil.example/", "//evil.example/", "?x=1", "#top", "..;/zzz/", "%2e/x", "%2e%2e%2fzzz/", "%zz/"]) {
-			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", body: new URLSearchParams({ password: PASSWORD, next }) });
+			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", headers: fromNewAddress(), body: new URLSearchParams({ password: PASSWORD, next }) });
 			expect(response.status, next).toBe(303);
 			const location = new URL(response.headers.get("location")!);
 			expect(location.origin, next).toBe(PAGES);
