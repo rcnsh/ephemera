@@ -1,7 +1,7 @@
 import { reset } from "cloudflare:test";
 import { unzipSync, strFromU8 } from "fflate";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PAGES, api, call, mcp, mcpTool, publish, zip } from "./helpers.ts";
+import { HELLO, PAGES, api, call, mcp, mcpTool, publish, zip } from "./helpers.ts";
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -70,6 +70,15 @@ describe("get_page", () => {
 });
 
 describe("read_file", () => {
+	it("keeps a byte order mark, so a file read and patched back is unchanged", async () => {
+		const withBom = btoa(String.fromCharCode(0xef, 0xbb, 0xbf, 0x68, 0x69));
+		const page = await publish({ files: [...HELLO, { path: "bom.txt", content: withBom, encoding: "base64" }] });
+		const read = await mcpTool("read_file", { id: page.id, path: "bom.txt" });
+		expect(read.data).toMatchObject({ encoding: "utf8", content: "\uFEFFhi", size: 5 });
+		await send(`/pages/${page.id}/files`, { files: [{ path: "bom.txt", content: read.data.content }] });
+		expect((await mcpTool("diff_versions", { id: page.id })).data).toMatchObject({ changed: [], unchanged: 2 });
+	});
+
 	it("reads text as text and binary as base64, from any kept version", async () => {
 		const page = await publish({
 			files: [
@@ -177,9 +186,23 @@ describe("list_pages", () => {
 		expect(http.body.pages.map((p: { id: string }) => p.id)).toEqual([ids["Q3 report"]]);
 	});
 
+	it("pages through pages that share an updated time, each exactly once", async () => {
+		tick();
+		const ids: string[] = [];
+		for (let i = 0; i < 5; i++) ids.push((await publish()).id);
+		const seen: string[] = [];
+		let cursor: string | undefined;
+		do {
+			const listed = await mcpTool("list_pages", { limit: 2, ...(cursor ? { cursor } : {}) });
+			seen.push(...listed.data.pages.map((p: { id: string }) => p.id));
+			cursor = listed.data.nextCursor ?? undefined;
+		} while (cursor);
+		expect(seen.toSorted()).toEqual(ids.toSorted());
+	});
+
 	it("explains bad parameters", async () => {
 		expect((await mcpTool("list_pages", { cursor: "nonsense" })).data).toMatch(/nextCursor/);
-		for (const query of ["cursor=nonsense", "limit=0", "limit=101", "limit=two", "kind=site"]) {
+		for (const query of ["cursor=nonsense", "limit=0", "limit=101", "limit=two", "kind=site", "project=!!!", `query=${"a".repeat(201)}`]) {
 			expect((await api(`/pages?${query}`)).status, query).toBe(400);
 		}
 	});

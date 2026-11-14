@@ -360,7 +360,7 @@ export class Operations {
 		let text: string | null = null;
 		if (TEXTUAL.test(type)) {
 			try {
-				text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+				text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 			} catch {
 				text = null;
 			}
@@ -465,10 +465,13 @@ export class Operations {
 	 */
 	async list(input: ListInput = {}) {
 		const text = optionalString(input.query, "query");
+		if (text !== undefined && text.length > 200) throw new PageError(400, "query must be 200 characters or fewer");
 		const agent = optionalString(input.agent, "agent");
 		const kind = optionalString(input.kind, "kind");
 		if (kind !== undefined && kind !== "page" && kind !== "mockup") throw new PageError(400, 'kind must be "page" or "mockup"');
 		const project = optionalString(input.project, "project");
+		// Projects are stored as slugs. One that slugifies to nothing would otherwise drop the filter and match every page.
+		if (project !== undefined && project !== "" && !slugify(project)) throw new PageError(400, "project needs at least one letter or digit");
 		const cursor = optionalString(input.cursor, "cursor");
 		const limitInput = typeof input.limit === "string" && input.limit !== "" ? Number(input.limit) : (input.limit ?? undefined);
 		if (limitInput !== undefined && (typeof limitInput !== "number" || !Number.isInteger(limitInput) || limitInput < 1 || limitInput > LIST_LIMITS.max)) {

@@ -272,7 +272,7 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: `Find live pages, newest-updated first. Each row has the id, url, label, kind, updatedAt and expiresAt (null: permanent), and for a mockup set how many options are pending, picked and rejected; get_page has the rest. Returns ${LIST_LIMITS.default} rows unless given a limit; when nextCursor isn't null, pass it as cursor for the next ones. Also returns storage usage.`,
 			inputSchema: z.object({
-				query: z.string().optional().describe('Part of a label or id, e.g. "report"; case-insensitive'),
+				query: z.string().optional().describe('Part of a label or id, e.g. "report"; ASCII letters match in either case'),
 				agent: z.string().optional().describe('Only pages published by this agent, e.g. "claude-code"'),
 				kind: z.enum(["page", "mockup"]).optional().describe('"mockup" for mockup sets only, "page" for everything else'),
 				project: z.string().optional().describe("Only mockup sets of this project"),
