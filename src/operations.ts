@@ -1,6 +1,6 @@
 import { hashPassword, uploadToken } from "./auth.ts";
 import { LIMITS, PageError, pageUrl, parseTtl, ttlOmitted } from "./domain.ts";
-import type { PageFile } from "./files.ts";
+import { type Content, decodeContent, decodeFiles, hasFiles } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
 import type { Page, Pages, Usage, Version, Visibility } from "./pages.ts";
@@ -51,7 +51,7 @@ async function privacy(visibility: unknown, password: unknown): Promise<{ visibi
 export type TtlInput = string | number | null | undefined;
 
 export interface PublishInput {
-	files: PageFile[];
+	content: Content;
 	ttl?: TtlInput;
 	label?: string | null;
 	agent?: string | null;
@@ -95,17 +95,19 @@ export class Operations {
 		private readonly now: () => number = Date.now,
 	) {}
 
-	/** Publishes a permanent mockup set, its id made from `project` and `name`. */
-	async publishMockup(input: { project?: unknown; name?: unknown; files: PageFile[]; visibility?: unknown; password?: unknown }) {
+	/** Publishes a permanent mockup set, its id made from `project` and `name`. Its content is inline files or a zip. */
+	async publishMockup(input: { project?: unknown; name?: unknown; content: Content; visibility?: unknown; password?: unknown }) {
 		if (typeof input.project !== "string" || typeof input.name !== "string") throw new PageError(400, "A mockup set needs a project and a name");
+		if (!hasFiles(input.content)) throw new PageError(400, "A mockup set needs files: one top-level folder per option (a/index.html, b/index.html, ...), or a zip of them");
+		const files = decodeContent(input.content);
 		const page = await this.pages.publish({
-			files: input.files,
+			files,
 			ttl: "permanent",
 			label: input.name,
 			mockup: { project: input.project, name: input.name },
 			...(await privacy(input.visibility, input.password)),
 		});
-		return { ...setView(page, this.host, await this.pages.options(page.id)), warnings: rootRelativeWarnings(input.files) };
+		return { ...setView(page, this.host, await this.pages.options(page.id)), warnings: rootRelativeWarnings(files) };
 	}
 
 	/** Picks, rejects or resets an option of a mockup set. */
@@ -117,25 +119,31 @@ export class Operations {
 		return { id, url: pageUrl(this.host, id), options };
 	}
 
+	/** Publishes a page. A `label` titles a Markdown page. */
 	async publish(input: PublishInput) {
+		const files = decodeContent(input.content, typeof input.label === "string" ? input.label : null);
 		const page = await this.pages.publish({
-			files: input.files,
+			files,
 			ttl: parseTtl(input.ttl),
 			label: input.label,
 			agent: input.agent,
 			...(await privacy(input.visibility, input.password)),
 		});
-		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(input.files) };
+		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
 	}
 
-	/** Replaces a page's files; the URL and expiry stay the same. */
-	async update(id: string, files: PageFile[]) {
+	/** Replaces a page's files; the URL and expiry stay the same. Markdown is titled by its first heading. */
+	async update(id: string, content: Content) {
+		const files = decodeContent(content);
 		const page = await this.pages.update(id, files);
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
 
-	/** Adds, replaces and removes single files, keeping the rest. */
-	async patch(id: string, files: PageFile[], remove: string[]) {
+	/** Adds or replaces inline `files` and deletes the paths in `remove`, keeping the rest. */
+	async patch(id: string, input: { files?: unknown; remove?: unknown }) {
+		const remove = input.remove ?? [];
+		if (!(Array.isArray(remove) && remove.every((path) => typeof path === "string"))) throw new PageError(400, "remove must be an array of paths");
+		const files = input.files === undefined || input.files === null ? [] : decodeFiles(input.files);
 		const page = await this.pages.patch(id, { files, remove });
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}

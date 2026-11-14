@@ -35,6 +35,8 @@ describe("single-page shortcuts", () => {
 	it("wants exactly one kind of content", async () => {
 		expect((await post("/pages", { html: "x", markdown: "y" })).status).toBe(400);
 		expect((await post("/pages", {})).status).toBe(400);
+		expect((await post("/pages", null)).status).toBe(400);
+		expect((await post("/pages", { files: [{ path: "index.html" }] })).status).toBe(400);
 	});
 
 	it("updates with a shortcut too", async () => {

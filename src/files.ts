@@ -32,9 +32,12 @@ export function normalizePath(raw: string): string {
 	return path;
 }
 
-export function decodeInlineFiles(files: InlineFile[]): PageFile[] {
+/** Decodes inline files as callers send them, checking their shape: an array of `{ path, content, encoding }`. */
+export function decodeFiles(files: unknown): PageFile[] {
+	if (!Array.isArray(files)) throw new PageError(400, "files must be an array of { path, content, encoding }");
 	const encoder = new TextEncoder();
-	return files.map((file) => {
+	return files.map((file: Partial<InlineFile> | null) => {
+		if (typeof file?.path !== "string" || typeof file.content !== "string") throw new PageError(400, "Every file needs a path and a content, both strings");
 		const path = normalizePath(file.path);
 		if (file.encoding === "base64") {
 			try {
@@ -47,22 +50,41 @@ export function decodeInlineFiles(files: InlineFile[]): PageFile[] {
 	});
 }
 
-/** A page's content as agents can give it: files, or one of the single-page shortcuts. */
-export interface BundleInput {
-	files?: InlineFile[] | null;
-	html?: string | null;
-	markdown?: string | null;
+/**
+ * A page's content as callers send it, unchecked: exactly one of inline
+ * `files`, a single `html` document, a `markdown` document, or a `zip`.
+ */
+export interface Content {
+	files?: unknown;
+	html?: unknown;
+	markdown?: unknown;
+	zip?: Uint8Array;
 }
 
-/** Turns exactly one of `files`, `html` or `markdown` into the page's files. `title` names a Markdown page. */
-export function bundleFrom(input: BundleInput, title?: string | null): PageFile[] {
-	const given = [input.files, input.html, input.markdown].filter((value) => value !== undefined && value !== null);
-	if (given.length !== 1) throw new PageError(400, "Give exactly one of files, html or markdown");
-	if (typeof input.html === "string") return decodeInlineFiles([{ path: "index.html", content: input.html }]);
-	if (typeof input.markdown === "string") return decodeInlineFiles([{ path: "index.html", content: markdownPage(input.markdown, title) }]);
-	if (!Array.isArray(input.files)) throw new PageError(400, "files must be an array of { path, content, encoding }");
-	return decodeInlineFiles(input.files);
+function given(value: unknown): boolean {
+	return value !== undefined && value !== null;
 }
+
+/** Whether content was given as inline files or a zip, the only ways a mockup set's options can come. */
+export function hasFiles(content: Content): boolean {
+	return given(content.files) || given(content.zip);
+}
+
+/** Turns content into the page's files, or throws. `title` names a Markdown page. */
+export function decodeContent(content: Content, title?: string | null): PageFile[] {
+	if ([content.files, content.html, content.markdown, content.zip].filter(given).length !== 1) throw new PageError(400, "Give exactly one of files, html or markdown (or a zip)");
+	if (content.zip) return unzipFiles(content.zip);
+	if (given(content.html)) {
+		if (typeof content.html !== "string") throw new PageError(400, "html must be a string");
+		return [{ path: "index.html", body: new TextEncoder().encode(content.html) }];
+	}
+	if (given(content.markdown)) {
+		if (typeof content.markdown !== "string") throw new PageError(400, "markdown must be a string");
+		return [{ path: "index.html", body: new TextEncoder().encode(markdownPage(content.markdown, title)) }];
+	}
+	return decodeFiles(content.files);
+}
+
 
 const JUNK = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/;
 
