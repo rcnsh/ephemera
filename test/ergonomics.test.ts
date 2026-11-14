@@ -24,7 +24,10 @@ describe("single-page shortcuts", () => {
 		const html = await (await call(page.url)).text();
 		expect(html).toContain("<title>Report</title>");
 		expect(html).toContain("<h1>Report</h1>");
-		expect(html).toContain("<table>");
+		expect(html).toContain('<div class="table"><table>');
+		expect(html).toContain("</table></div>");
+		// Root-relative links get rewritten into the page, so the favicon is inline.
+		expect(html).toContain('<link rel="icon" href="data:image/svg+xml,');
 	});
 
 	it("titles a markdown page by its label when there is one", async () => {
