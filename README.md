@@ -30,7 +30,7 @@ One Cloudflare Worker serves three things:
 - **Sandboxed.** Pages are served with `CSP: sandbox` and without `allow-same-origin`, so agent-written code can't read cookies or storage for the domain it's served from.
 - **Able to load their own files.** `Access-Control-Allow-Origin: *` lets a page `fetch` and `import` its own files from its opaque origin.
 - **Cheap to refresh.** Files are sent `no-cache` with ETags, so unchanged files come back as 304s.
-- **Fast to load.** A version's files never change, so the Worker keeps them in Cloudflare's edge cache and reads R2 for a file once per data centre. Publishing fills the cache with the files it sends, in the data centre it came through; cached copies last a day. Each response carries a `Server-Timing` header (`db`, `file` with a cache hit or miss, `options`).
+- **Fast to load.** A version's files never change, so the Worker keeps them in Cloudflare's edge cache and reads R2 for a file once per data centre. It remembers a path a version has no file at the same way, so a missing file costs R2 once too. Publishing fills the cache with the files it sends, in the data centre it came through; cached copies last a day. Each Worker instance also keeps a page's database row for 2 seconds, so a page's HTML and the files it loads share one database query. Each response carries a `Server-Timing` header (`db`, `file` with a cache hit or miss, `options`).
 - **Served as published.** `no-transform` stops Cloudflare editing pages (injected scripts, Rocket Loader), which would also strip the ETags. The Worker gzips text itself instead.
 - **Out of search engines:** `noindex`.
 
@@ -48,7 +48,9 @@ The pass goes in the path rather than a cookie, because a sandboxed page's own r
 
 Each update adds a version. A page keeps its last 5 and can be rolled back to any of them.
 
-Pages given a ttl expire. Every request checks the expiry, so a page stops working the moment it expires. It then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages.
+Pages given a ttl expire. Every request checks the expiry, so a page stops working the moment it expires. It then answers 410 for 7 days and 404 after that. A cron sweep every 10 minutes deletes the files of expired pages. It also checks 10 random live pages for files of versions the database no longer knows (left by an update that died part way, or a failed cleanup) and deletes them once they're an hour old.
+
+Other changes (deleting a page, making it private, changing its password, updating it) apply at once in the Worker instance that made them. Other instances can serve the old state for up to 2 seconds, since each keeps a page's row that long. That delay is the cost of not querying the database on every request.
 
 ### Mockup sets
 
@@ -122,7 +124,7 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 
 The Mockups tab shows mockup sets grouped by project, newest first, with a row of option thumbnails per set and buttons to pick or reject each option. It filters by verdict.
 
-Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. If the browser fails, the dashboard shows a blank tile and tries again on the next load. Mockup options get one each, cropped to their content (so a phone-sized mockup isn't lost in a desktop viewport), and all the options of a set are shot in one browser launch.
+Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. Thumbnails asked for together (a dashboard load's worth, up to 10) are shot in one browser launch, since Browser Rendering allows only a few launches a second. A page that never stops loading is shot after 10 seconds as it is. If a page can't be shot, the dashboard shows a blank tile and tries again after 10 minutes. If no browser could be had, it tries again on the next load. Mockup options get one each, cropped to their content (so a phone-sized mockup isn't lost in a desktop viewport). Only options without a thumbnail of the current version are shot, and an option's thumbnail goes when the option does.
 
 ## Self-hosting
 

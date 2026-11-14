@@ -193,6 +193,6 @@ export default {
 
 	async scheduled(_controller, env, ctx) {
 		const result = await new Pages(env, { defer: (work) => ctx.waitUntil(work) }).sweep();
-		console.log(`sweep: purged ${result.purged} gone page(s), forgot ${result.forgotten}`);
+		console.log(`sweep: purged ${result.purged} gone page(s), forgot ${result.forgotten}, deleted ${result.orphans} orphaned version(s)`);
 	},
 } satisfies ExportedHandler<Env>;

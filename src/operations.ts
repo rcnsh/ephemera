@@ -224,7 +224,8 @@ export class Operations {
 	}
 
 	async list() {
-		const { pages, usage, options } = await this.overview();
+		// Not `overview`: agents don't see versions, and reading every page's is a join over them all.
+		const [pages, usage, options] = await Promise.all([this.pages.list(), this.pages.usage(), this.pages.allOptions()]);
 		return { pages: pages.map((page) => setView(page, this.host, options.get(page.id))), usage };
 	}
 

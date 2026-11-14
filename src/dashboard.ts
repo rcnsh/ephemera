@@ -5,7 +5,7 @@ import { type MockupOption, VERDICTS } from "./mockups.ts";
 import { Operations, type Overview } from "./operations.ts";
 import { ID_SOURCE, type Page, type Pages, type Version } from "./pages.ts";
 import { viewerUrl } from "./privacy.ts";
-import { screenshot, screenshotOptions } from "./thumbnails.ts";
+import { type Shot, type ShotResult, screenshots } from "./thumbnails.ts";
 
 /** What the dashboard's extend buttons add, as ttls. */
 const EXTENSIONS = ["1h", "1d", "7d"];
@@ -314,57 +314,129 @@ function respond(body: string, status: number, nonce = ""): Response {
 
 const PLACEHOLDER = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 200"><rect width="320" height="200" fill="#888" fill-opacity=".15"/></svg>`;
 
-/** GET /thumbnails/<id>.png: the cached screenshot for the version being served, made on first request. */
-async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: string): Promise<Response> {
-	const found = await pages.lookup(id);
-	if (found.state !== "live") return new Response("Not found", { status: 404 });
-	const page = found.page;
-	const cached = await pages.files.thumbnail(page);
-	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
-	if (cached) return new Response(cached.body, { headers });
+/** How long a failed thumbnail is remembered, so dashboard loads in between show a blank tile without starting a browser. */
+const FAILURE_MEMORY = 10 * 60_000;
 
-	const url = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { ttl: THUMBNAIL_PASS });
-	const png = await screenshot(env.BROWSER, url);
-	// Not cached, so the next dashboard load tries again.
-	if (!png) return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": "no-store" } });
-	ctx.waitUntil(pages.files.saveThumbnail(page, png));
-	return new Response(png, { headers });
+function placeholder(maxAge: number): Response {
+	const cacheControl = maxAge > 0 ? `private, max-age=${Math.ceil(maxAge / 1000)}` : "no-store";
+	return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": cacheControl } });
 }
 
-/** Option thumbnails being made, by set and version, so the dashboard's requests for one set's options share a browser. */
-const shooting = new Map<string, Promise<Map<string, Uint8Array | null>>>();
+/**
+ * Thumbnails asked for within `BATCH_WINDOW` of each other (a dashboard
+ * load's worth) are shot in one browser, up to `BATCH_SIZE` at a time, and
+ * this isolate starts a browser at most once per `LAUNCH_GAP`: Browser Run
+ * allows 3 launches a second per account, and a launch per thumbnail would
+ * fail most of them.
+ */
+const BATCH_WINDOW = 100;
+const BATCH_SIZE = 10;
+const LAUNCH_GAP = 400;
 
-/** Shoots every option of a mockup set in one browser launch, and keeps the ones that worked. */
-async function shootOptions(env: Env, ctx: ExecutionContext, pages: Pages, page: Page): Promise<Map<string, Uint8Array | null>> {
-	const options = await pages.options(page.id);
-	// One URL (and pass) for the set; option paths are relative to it.
-	const set = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { ttl: THUMBNAIL_PASS });
-	const urls = options.map((option) => `${set}${option.path}`);
-	const pngs = await screenshotOptions(env.BROWSER, urls);
-	const shots = new Map(options.map((option, i) => [option.name, pngs[i] ?? null]));
-	for (const [option, png] of shots) if (png) ctx.waitUntil(pages.files.saveThumbnail(page, png, option));
-	return shots;
+interface Job {
+	page: Page;
+	option: string | undefined;
+	/** Undefined when the set has no such option. */
+	resolve: (result: ShotResult | undefined) => void;
 }
 
-/** GET /thumbnails/<id>/<option>.png: like `thumbnail`, for one option of a mockup set. */
-async function optionThumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: string, option: string): Promise<Response> {
-	const found = await pages.lookup(id);
-	if (found.state !== "live" || found.page.kind !== "mockup") return new Response("Not found", { status: 404 });
-	const page = found.page;
-	const cached = await pages.files.thumbnail(page, option);
-	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
-	if (cached) return new Response(cached.body, { headers });
+/** The batch still taking jobs, if any. */
+let gathering: Job[] | null = null;
+let nextLaunch = 0;
+/** Thumbnails being made, by page, version and option, so asking twice shares one shot. */
+const making = new Map<string, Promise<ShotResult | undefined>>();
 
-	const key = `${id}/${page.version}`;
-	let shots = shooting.get(key);
-	if (!shots) {
-		shots = shootOptions(env, ctx, pages, page).finally(() => shooting.delete(key));
-		shooting.set(key, shots);
+/**
+ * Makes a thumbnail of `page` (or of one of its options), in the batch
+ * that's gathering or a new one. When this call starts the batch, `batch`
+ * is its whole run: the browser's work belongs to this request, so the
+ * caller must wait for all of it before answering, and it's kept alive past
+ * a client that goes away, since other requests are waiting on it.
+ */
+function make(env: Env, ctx: ExecutionContext, pages: Pages, page: Page, option: string | undefined): { result: Promise<ShotResult | undefined>; batch?: Promise<void> } {
+	const key = JSON.stringify([page.id, page.version, option ?? null]);
+	const shared = making.get(key);
+	if (shared) return { result: shared };
+	let batch: Promise<void> | undefined;
+	const result = new Promise<ShotResult | undefined>((resolve) => {
+		if (!gathering || gathering.length >= BATCH_SIZE) {
+			const jobs: Job[] = [];
+			gathering = jobs;
+			batch = shoot(env, pages, jobs);
+			ctx.waitUntil(batch);
+		}
+		gathering.push({ page, option, resolve });
+	}).finally(() => making.delete(key));
+	making.set(key, result);
+	return { result, batch };
+}
+
+/** Waits for the batch to gather, then shoots it in one browser, keeping each thumbnail (or its failure) as it comes. */
+async function shoot(env: Env, pages: Pages, jobs: Job[]): Promise<void> {
+	const wait = Math.max(BATCH_WINDOW, nextLaunch - Date.now());
+	nextLaunch = Date.now() + wait + LAUNCH_GAP;
+	await new Promise((resolve) => setTimeout(resolve, wait));
+	if (gathering === jobs) gathering = null;
+	try {
+		// An option's URL needs its path, read once per set.
+		const sets = new Map<string, Promise<MockupOption[]>>();
+		const planned = await Promise.all(
+			jobs.map(async (job): Promise<Shot | undefined> => {
+				const url = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, job.page, Date.now(), { ttl: THUMBNAIL_PASS });
+				if (job.option === undefined) return { url, kind: "page" };
+				let options = sets.get(job.page.id);
+				if (!options) sets.set(job.page.id, (options = pages.options(job.page.id)));
+				const found = (await options).find((option) => option.name === job.option);
+				return found && { url: `${url}${found.path}`, kind: "option" };
+			}),
+		);
+		const wanted = jobs.flatMap((job, i) => (planned[i] ? [{ job, shot: planned[i] }] : []));
+		for (const [i, job] of jobs.entries()) if (!planned[i]) job.resolve(undefined);
+		if (!wanted.length) return;
+		const results = await screenshots(
+			env.BROWSER,
+			wanted.map(({ shot }) => shot),
+		);
+		await Promise.all(
+			wanted.map(async ({ job }, i) => {
+				const result = results[i] ?? null;
+				try {
+					if (result instanceof Uint8Array) await pages.files.saveThumbnail(job.page, result, job.option);
+					else if (result === "failed") await pages.files.saveThumbnailFailure(job.page, Date.now(), job.option);
+				} catch (error) {
+					console.warn(`keeping the thumbnail of ${job.page.id} failed: ${error}`);
+				}
+				job.resolve(result);
+			}),
+		);
+	} finally {
+		// Whatever went wrong, nobody waits forever; resolving twice changes nothing.
+		for (const job of jobs) job.resolve(null);
 	}
-	const png = (await shots).get(option);
-	if (png === undefined) return new Response("Not found", { status: 404 });
-	if (!png) return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": "no-store" } });
-	return new Response(png, { headers });
+}
+
+/**
+ * GET /thumbnails/<id>.png, and /thumbnails/<id>/<option>.png for an option
+ * of a mockup set: the screenshot kept for the version being served, made on
+ * first request. A failure is remembered for `FAILURE_MEMORY`; when no
+ * browser could be had, the next load tries again.
+ */
+async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: string, option?: string): Promise<Response> {
+	const found = await pages.lookup(id);
+	if (found.state !== "live" || (option !== undefined && found.page.kind !== "mockup")) return new Response("Not found", { status: 404 });
+	const page = found.page;
+	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
+	const kept = await pages.files.thumbnail(page, option);
+	if (kept && "png" in kept) return new Response(kept.png.body, { headers });
+	const remembered = kept ? kept.failedAt + FAILURE_MEMORY - Date.now() : 0;
+	if (remembered > 0) return placeholder(remembered);
+
+	const { result, batch } = make(env, ctx, pages, page, option);
+	const made = await result;
+	await batch;
+	if (made === undefined) return new Response("Not found", { status: 404 });
+	if (made instanceof Uint8Array) return new Response(made, { headers });
+	return placeholder(made === "failed" ? FAILURE_MEMORY : 0);
 }
 
 const ACTIONS = new RegExp(`^/pages/(${ID_SOURCE})/(extend|permanent|temporary|delete|label|private|public|password|share|rollback|verdict)$`);
@@ -395,7 +467,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		} catch {
 			return new Response("Not found", { status: 404 });
 		}
-		return optionThumbnail(env, ctx, pages, optionThumb[1]!, option);
+		return thumbnail(env, ctx, pages, optionThumb[1]!, option);
 	}
 
 	// Signing in to a private page: Access has checked who this is, so hand out a pass.
