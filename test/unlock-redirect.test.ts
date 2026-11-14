@@ -33,7 +33,7 @@ describe("unlocking a private page", () => {
 	it("redirects inside the page on a public page too, without a password", async () => {
 		const page = await publish();
 		const other = await publish();
-		for (const next of [`.\t./.\t./${other.id}/`, `.\n./.\n./${other.id}/`, `.\r./.\r./${other.id}/`]) {
+		for (const next of [`.\t./.\t./${other.id}/`, `.\n./.\n./${other.id}/`, `.\r./.\r./${other.id}/`, "%2e%2e/_/x", ".%2E/_/"]) {
 			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", body: new URLSearchParams({ next }) });
 			expect(response.status, JSON.stringify(next)).toBe(303);
 			expect(new URL(response.headers.get("location")!).pathname, JSON.stringify(next)).toBe(`/${page.id}/`);
@@ -42,7 +42,7 @@ describe("unlocking a private page", () => {
 
 	it("keeps the gate's links inside the page after a wrong password", async () => {
 		const page = await publish({ visibility: "private", password: PASSWORD });
-		for (const next of [`.\t./.\t./zzz/`, `.\n./zzz/`, `%2e%2e/zzz/`]) {
+		for (const next of [`.\t./.\t./zzz/`, `.\n./zzz/`, `%2e%2e/zzz/`, "%2e%2e/_/x", `%2e%2e/%2e%2e/${page.id}/_/x`]) {
 			const response = await call(`${PAGES}/${page.id}/_unlock`, { method: "POST", body: new URLSearchParams({ password: "wrong password", next }) });
 			expect(response.status).toBe(401);
 			const html = await response.text();

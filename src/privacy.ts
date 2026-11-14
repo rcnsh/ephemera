@@ -62,12 +62,14 @@ function escape(text: string): string {
  * leave. Rather than look for bad strings, it resolves the path the way a URL
  * parser will (which reads "%2e%2e" as ".." and drops tabs and newlines) under
  * a folder of the page, and keeps it only if it stays in that folder.
- * Whitespace, control characters, backslashes and plain "." or ".." segments
- * are refused outright.
+ * Whitespace, control characters, backslashes and "." or ".." segments, plain
+ * or percent-encoded, are refused outright: callers append the path under
+ * different folders (`/<id>/`, `/<id>/~pass/`, `/open/<id>/`), so one that
+ * climbs out and back in ("%2e%2e/_/x") must not pass.
  */
 function safeRest(id: string, rest: string): string {
 	const clean = rest.replace(/^\/+/, "");
-	if (/[\s\u0000-\u001f\u007f\\]/.test(clean) || clean.split("/").some((segment) => segment === "." || segment === "..")) return "";
+	if (/[\s\u0000-\u001f\u007f\\]/.test(clean) || clean.split(/[/?#]/).some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment))) return "";
 	const folder = `/${id}/_/`;
 	const resolved = new URL(`https://page.invalid${folder}${clean}`);
 	return resolved.origin === "https://page.invalid" && resolved.pathname.startsWith(folder) ? clean : "";
