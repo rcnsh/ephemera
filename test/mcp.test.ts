@@ -125,6 +125,15 @@ describe("MCP endpoint", () => {
 		expect(response.status).toBe(400);
 		expect((await response.json<any>()).error.code).toBe(-32700);
 	});
+
+	it("answers malformed JSON of any size with a parse error, and refuses a body past the API's cap", async () => {
+		const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" };
+		const long = await call(`${PAGES}/mcp`, { method: "POST", headers, body: `{"not json": ${"x".repeat(5 * 1024 * 1024)}` });
+		expect(long.status).toBe(400);
+		expect((await long.json<any>()).error.code).toBe(-32700);
+		const huge = await call(`${PAGES}/mcp`, { method: "POST", headers: { ...headers, "content-length": String(81 * 1024 * 1024) }, body: "{}" });
+		expect(huge.status).toBe(413);
+	});
 });
 
 const TWO_OPTIONS = [

@@ -15,7 +15,7 @@ function tooLarge(): PageError {
  * The request body, cut off with a 413 once more than `MAX_BODY` bytes have
  * arrived: a chunked body has no content-length to check up front.
  */
-function limitedBody(request: Request): ReadableStream<Uint8Array> {
+export function limitedBody(request: Request): ReadableStream<Uint8Array> {
 	if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) throw tooLarge();
 	let received = 0;
 	return (request.body ?? new Response("").body!).pipeThrough(

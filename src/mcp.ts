@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
+import { limitedBody } from "./api.ts";
 import { bytesText, durationText, LIMITS, PageError } from "./domain.ts";
 import { LIST_LIMITS, type Operations, READ_LIMIT } from "./operations.ts";
 
@@ -337,14 +338,15 @@ export async function handleMcp(request: Request, env: Env, ctx: ExecutionContex
 	if (request.method !== "POST") return handler(request, env, ctx);
 	// The MCP SDK stops reading a body at 4 MiB, and agents doesn't pass a larger
 	// maxRequestBodySize on to the lane that serves 2025-era clients. A page can
-	// be 50 MB, so parse the body here: the SDK doesn't limit a parsedBody. Workers
-	// caps the request size itself. Malformed JSON goes to the SDK to answer.
-	const body = await request.text();
+	// be 50 MB, so parse the body here, under the API's own size cap: the SDK
+	// doesn't limit a parsedBody. Malformed JSON gets the SDK's parse error; it's
+	// sent an empty body for that, since a long one would get its 4 MiB refusal.
+	const body = await new Response(limitedBody(request)).text();
 	let parsedBody: unknown;
 	try {
 		parsedBody = JSON.parse(body);
 	} catch {
-		return handler(new Request(request, { body }), env, ctx);
+		return handler(new Request(request, { body: "" }), env, ctx);
 	}
 	return handler.fetch(request, { parsedBody });
 }
