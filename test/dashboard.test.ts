@@ -79,6 +79,7 @@ describe("dashboard", () => {
 		const extended = await post(`/pages/${page.id}/extend?by=1d`, csrf);
 		expect(extended.status).toBe(303);
 		expect(extended.headers.get("location")).toBe("/");
+		expect((await post(`/pages/${page.id}/extend?by=60d`, csrf)).status).toBe(400);
 
 		expect((await post(`/pages/${page.id}/permanent`, csrf)).status).toBe(303);
 		expect(await (await admin()).text()).toMatch(/permanent/);

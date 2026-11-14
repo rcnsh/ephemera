@@ -603,12 +603,6 @@ export class Pages {
 		return options;
 	}
 
-	/** Makes a permanent page temporary, expiring `LIMITS.temporaryTtl` from now. */
-	async makeTemporary(id: string): Promise<Page> {
-		const page = await this.get(id);
-		return page.permanent ? this.extend(id, LIMITS.temporaryTtl) : page;
-	}
-
 	/** The page is gone as soon as the row says so; if deleting its files fails, the sweep tries again. */
 	async delete(id: string): Promise<void> {
 		await this.get(id);
