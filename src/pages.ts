@@ -106,6 +106,21 @@ export interface Usage {
 	bytes: number;
 }
 
+/** What `search` looks for; every field narrows it. */
+export interface PageSearch {
+	/** A substring of the label or id. */
+	text?: string;
+	agent?: string;
+	kind?: PageKind;
+	/** A project slug. */
+	project?: string;
+	limit: number;
+	/** Where the previous page of results ended. */
+	after?: { updatedAt: number; id: string };
+}
+
+export type VerdictCounts = Record<Verdict, number>;
+
 export type Lookup = { state: "live"; page: Page } | { state: "gone" } | { state: "missing" };
 
 const LIVE = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)";
@@ -134,11 +149,16 @@ function randomChars(length: number): string {
 	return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) => ID_ALPHABET[byte & 31]).join("");
 }
 
-/** A mockup set's id: its project and name as one slug, then 10 random characters. */
+/** An id that says what it is: a slug, then 10 random characters. Mockup sets and pages published with a slug both get one. */
+function slugId(slug: string): string {
+	return `${slug}-${randomChars(10)}`;
+}
+
+/** A mockup set's id: its project and name as one slug, then the random suffix. */
 function mockupId(project: string, name: string): string {
 	const slug = slugify(`${project}-${name}`);
 	if (!slug) throw new PageError(400, "A mockup set's project and name need some letters or digits");
-	return `${slug}-${randomChars(10)}`;
+	return slugId(slug);
 }
 
 /** Options as a JSON array of `{ name, folder }`, to go through `json_each` in SQL. */
@@ -216,7 +236,7 @@ export class Pages {
 		const found = await this.lookup(id);
 		if (found.state === "live") return found.page;
 		if (found.state === "gone") throw new PageError(410, `Page ${id} has expired or been deleted`);
-		throw new PageError(404, `No page with id "${id}"`);
+		throw new PageError(404, `No page with id "${id}"; list_pages finds pages by label or id`);
 	}
 
 	async usage(): Promise<Usage> {
@@ -245,6 +265,47 @@ export class Pages {
 	}
 
 	/**
+	 * Live pages matching `query`, newest-updated first, a page of `limit` at a
+	 * time: `after` continues from the last page of the previous call. Mockup
+	 * sets come with how many options have each verdict.
+	 */
+	async search(query: PageSearch): Promise<{ pages: (Page & { verdicts: VerdictCounts | null })[]; more: boolean }> {
+		const where = [LIVE];
+		const binds: unknown[] = [this.now()];
+		if (query.text) {
+			const like = `%${query.text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+			where.push("(label LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')");
+			binds.push(like, like);
+		}
+		if (query.agent) {
+			where.push("agent = ? COLLATE NOCASE");
+			binds.push(query.agent);
+		}
+		if (query.kind) {
+			where.push("kind = ?");
+			binds.push(query.kind);
+		}
+		if (query.project) {
+			where.push("project = ?");
+			binds.push(query.project);
+		}
+		if (query.after) {
+			where.push("(updated_at < ? OR (updated_at = ? AND id < ?))");
+			binds.push(query.after.updatedAt, query.after.updatedAt, query.after.id);
+		}
+		const count = (verdict: Verdict) => `(SELECT COUNT(*) FROM verdicts WHERE page_id = pages.id AND verdict = '${verdict}') AS ${verdict}`;
+		const { results } = await this.db
+			.prepare(`SELECT *, ${count("pending")}, ${count("picked")}, ${count("rejected")} FROM pages WHERE ${where.join(" AND ")} ORDER BY updated_at DESC, id DESC LIMIT ?`)
+			.bind(...binds, query.limit + 1)
+			.all<PageRow & VerdictCounts>();
+		const pages = results.slice(0, query.limit).map((row) => ({
+			...toPage(row),
+			verdicts: row.kind === "mockup" ? { pending: row.pending, picked: row.picked, rejected: row.rejected } : null,
+		}));
+		return { pages, more: results.length > query.limit };
+	}
+
+	/**
 	 * Reserves an id first, so a publish only ever writes files under an id
 	 * it owns: the row goes into D1 already deleted and purged, so it's out of
 	 * every listing and out of the sweep's way, while the files are written.
@@ -265,6 +326,8 @@ export class Pages {
 		visibility?: Visibility;
 		passwordHash?: string | null;
 		mockup?: { project: string; name: string };
+		/** Gives a plain page the id `<slug>-<random>`; already slugified (see `slugify`). */
+		slug?: string;
 		pendingTtl?: Ttl;
 	}): Promise<Page> {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
@@ -288,7 +351,7 @@ export class Pages {
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
 			pending_ttl: input.pendingTtl === undefined ? null : input.pendingTtl === "permanent" ? 0 : input.pendingTtl,
 		};
-		const row = await this.reserve(fields, () => (input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12)));
+		const row = await this.reserve(fields, () => (input.mockup ? mockupId(input.mockup.project, input.mockup.name) : input.slug ? slugId(input.slug) : randomChars(12)));
 		let warm: () => void;
 		try {
 			warm = await this.store.write(row, files);
@@ -427,7 +490,10 @@ export class Pages {
 				for (const path of inside) remove.add(path);
 			} else {
 				const path = normalizePath(raw);
-				if (!existing.has(path)) throw new PageError(404, `Page ${id} has no file "${path}" to remove`);
+				if (!existing.has(path)) {
+					const folder = [...existing.keys()].some((file) => file.startsWith(`${path}/`));
+					throw new PageError(404, folder ? `"${path}" is a folder of page ${id}; give "${path}/" to remove it and everything in it` : `Page ${id} has no file "${path}" to remove`);
+				}
 				remove.add(path);
 			}
 		}

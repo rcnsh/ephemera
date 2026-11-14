@@ -237,8 +237,8 @@ describe("mockup options", () => {
 	it("start pending when a set is published", async () => {
 		const set = await publishMockup();
 		expect(set.options).toEqual([
-			{ name: "a", path: "a/", verdict: "pending", note: null, updatedAt: expect.any(Number) },
-			{ name: "b", path: "b/", verdict: "pending", note: null, updatedAt: expect.any(Number) },
+			{ name: "a", path: "a/", verdict: "pending", note: null, updatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) },
+			{ name: "b", path: "b/", verdict: "pending", note: null, updatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) },
 		]);
 		const single = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
 		expect(single.options.map((o) => o.name)).toEqual(["main"]);

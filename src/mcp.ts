@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { bytesText, durationText, LIMITS, PageError } from "./domain.ts";
-import type { Operations } from "./operations.ts";
+import { LIST_LIMITS, type Operations, READ_LIMIT } from "./operations.ts";
 
 const fileList = z.array(
 	z.object({
@@ -55,9 +55,26 @@ Put each option in its own top-level folder with its own index.html: a/index.htm
 
 Every option starts pending. When the user picks or rejects options, record it with set_verdict. patch_page adds an option when it adds a folder, and removing a folder (remove: ["b/"]) removes that option and its verdict. Links between files should be relative, as for publish_page.`;
 
+/** Compact JSON: indentation costs agents tokens and tells them nothing. */
 function text(value: unknown) {
-	return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+	return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
+
+/**
+ * Tool hints, stated in full: a tool without them counts as destructive and
+ * not idempotent, so cautious clients would ask before every call. Every tool
+ * here acts on this server's own pages, never the open world.
+ */
+const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+function writes(hints: { destructive: boolean; idempotent: boolean }) {
+	return { readOnlyHint: false, destructiveHint: hints.destructive, idempotentHint: hints.idempotent, openWorldHint: false };
+}
+
+const instructions = `ephemera hosts web pages for agents. publish_page (or upload_url for a folder on disk) returns a URL to give the user; publish_mockup is for design options, with set_verdict to record which the user picks.
+
+To change a page later, even one another session made: list_pages finds it by label or id, get_page shows its files, read_file reads one, then patch_page changes a few files or update_page replaces them all. Every change keeps the old files as a version: list_versions and diff_versions show what changed, rollback_page undoes it.
+
+Times are ISO 8601 in UTC. A null expiresAt means the page is permanent.`;
 
 /** Runs a tool body, turning page errors into tool errors the agent can read. */
 async function run(body: () => Promise<unknown>) {
@@ -71,14 +88,26 @@ async function run(body: () => Promise<unknown>) {
 
 /** The tools, with descriptions naming the pages host they publish to. */
 function server(ops: Operations, host: string): McpServer {
-	const mcp = new McpServer({ name: "ephemera", version: "1.0.0" });
+	const mcp = new McpServer({ name: "ephemera", version: "1.0.0" }, { instructions });
 	const id = z.string().describe(`The page id: the part of its URL after the host, https://${host}/<id>/`);
 
 	mcp.registerTool(
 		"publish_page",
 		{
 			description: publishGuide(host),
-			inputSchema: z.object({ ...content, ttl, label, agent, visibility, password }),
+			inputSchema: z.object({
+				...content,
+				ttl,
+				label,
+				agent,
+				slug: z
+					.string()
+					.optional()
+					.describe(`A few words for the URL, e.g. "q3 report" gives https://${host}/q3-report-k3x7q2/. Lowercased and hyphenated for you; a random suffix is always added. Omit for a random id.`),
+				visibility,
+				password,
+			}),
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		({ files, html, markdown, ...rest }) => run(() => ops.publish({ ...rest, content: { files, html, markdown } })),
 	);
@@ -93,9 +122,11 @@ function server(ops: Operations, host: string): McpServer {
 				files: fileList
 					.min(1)
 					.describe(`The set's files: one top-level folder per option, each with its own index.html (a/index.html, compact/index.html, ...). At most ${LIMITS.pageFiles} files and ${bytesText(LIMITS.mockupBytes)}.`),
+				agent,
 				visibility,
 				password,
 			}),
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		({ files, ...rest }) => run(() => ops.publishMockup({ ...rest, content: { files } })),
 	);
@@ -110,6 +141,7 @@ function server(ops: Operations, host: string): McpServer {
 				verdict: z.enum(["pending", "picked", "rejected"]),
 				note: z.string().optional().describe("One line on why, e.g. \"denser but the labels are too small\". Omit to keep the current note; an empty string clears it."),
 			}),
+			annotations: writes({ destructive: false, idempotent: true }),
 		},
 		(input) => run(() => ops.setVerdict(input.id, input.option, input.verdict, input.note)),
 	);
@@ -119,6 +151,8 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: `Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh. The previous files are kept as a version (the last ${LIMITS.keptVersions}) that rollback_page can bring back.`,
 			inputSchema: z.object({ id, ...content }),
+			// The replaced files stay as a version that rollback_page brings back.
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		({ id, ...content }) => run(() => ops.update(id, content)),
 	);
@@ -133,6 +167,7 @@ function server(ops: Operations, host: string): McpServer {
 				files: fileList.optional().describe("Files to add or replace"),
 				remove: z.array(z.string()).optional().describe('Paths to delete, e.g. ["old.css"]; a path ending in "/" deletes that folder, e.g. ["b/"]'),
 			}),
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		({ id, ...changes }) => run(() => ops.patch(id, changes)),
 	);
@@ -149,6 +184,7 @@ function server(ops: Operations, host: string): McpServer {
 				visibility,
 				password,
 			}),
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		(input) => run(() => ops.uploadUrl(input)),
 	);
@@ -159,6 +195,7 @@ function server(ops: Operations, host: string): McpServer {
 			description:
 				`Change when a page expires. On a page with a ttl, a duration adds to its current expiry (at most ${durationText(LIMITS.maxTtl)} from now) and "permanent" stops it expiring. On a permanent page (the default), a duration makes it expire that long from now.`,
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).describe('A duration like "2h" or "7d", or "permanent"') }),
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		(input) => run(() => ops.extend(input.id, input.ttl)),
 	);
@@ -168,7 +205,7 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: "Delete a page now. Its URL immediately starts answering 410 Gone.",
 			inputSchema: z.object({ id }),
-			annotations: { destructiveHint: true },
+			annotations: writes({ destructive: true, idempotent: true }),
 		},
 		(input) => run(() => ops.delete(input.id)),
 	);
@@ -182,6 +219,8 @@ function server(ops: Operations, host: string): McpServer {
 				visibility: z.enum(["public", "private"]),
 				password: password.describe("A password for a private page (8+ characters). Omit to keep a private page's current password; an empty string clears it. Making a page public always drops it."),
 			}),
+			// Revoking share links can't be undone, and each call revokes the ones made since the last.
+			annotations: writes({ destructive: true, idempotent: false }),
 		},
 		(input) => run(() => ops.setVisibility(input.id, input.visibility, input.password)),
 	);
@@ -191,6 +230,8 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility and rollback_page revoke these.",
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe(`How long the link works: "2h", "7d" (up to ${durationText(LIMITS.maxTtl)}); defaults to ${durationText(LIMITS.temporaryTtl)}`) }),
+			// Stores nothing, but hands out access to a private page, so it isn't read-only.
+			annotations: writes({ destructive: false, idempotent: false }),
 		},
 		(input) => run(() => ops.shareLink(input.id, input.ttl)),
 	);
@@ -200,9 +241,24 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: `List the versions a page keeps (the last ${LIMITS.keptVersions}, newest first), and which one it's serving.`,
 			inputSchema: z.object({ id }),
-			annotations: { readOnlyHint: true },
+			annotations: READ,
 		},
 		(input) => run(() => ops.versions(input.id)),
+	);
+
+	mcp.registerTool(
+		"diff_versions",
+		{
+			description:
+				"Which files differ between two kept versions of a page: the paths added, removed and changed, and how many are unchanged. With no versions given, compares the version being served with the one before it. Use read_file with version to see a changed file's old content.",
+			inputSchema: z.object({
+				id,
+				from: z.number().int().optional().describe("The older version, from list_versions; defaults to the kept version just before to"),
+				to: z.number().int().optional().describe("The newer version; defaults to the one being served"),
+			}),
+			annotations: READ,
+		},
+		(input) => run(() => ops.diff(input.id, input.from, input.to)),
 	);
 
 	mcp.registerTool(
@@ -210,6 +266,7 @@ function server(ops: Operations, host: string): McpServer {
 		{
 			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top. On a private page it revokes every pass and share link handed out so far.",
 			inputSchema: z.object({ id, version: z.number().int().describe("A version number from list_versions") }),
+			annotations: writes({ destructive: false, idempotent: true }),
 		},
 		(input) => run(() => ops.rollback(input.id, input.version)),
 	);
@@ -217,11 +274,53 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"list_pages",
 		{
-			description: "List live pages (soonest to expire first) with their URLs, labels and expiry times, plus storage usage.",
-			inputSchema: z.object({}),
-			annotations: { readOnlyHint: true },
+			description: `Find live pages, newest-updated first. Each row has the id, url, label, kind, updatedAt and expiresAt (null: permanent), and for a mockup set how many options are pending, picked and rejected; get_page has the rest. Returns ${LIST_LIMITS.default} rows unless given a limit; when nextCursor isn't null, pass it as cursor for the next ones. Also returns storage usage.`,
+			inputSchema: z.object({
+				query: z.string().optional().describe('Part of a label or id, e.g. "report"; ASCII letters match in either case'),
+				agent: z.string().optional().describe('Only pages published by this agent, e.g. "claude-code"'),
+				kind: z.enum(["page", "mockup"]).optional().describe('"mockup" for mockup sets only, "page" for everything else'),
+				project: z.string().optional().describe("Only mockup sets of this project"),
+				limit: z.number().int().min(1).max(LIST_LIMITS.max).optional().describe(`How many rows, 1 to ${LIST_LIMITS.max}; defaults to ${LIST_LIMITS.default}`),
+				cursor: z.string().optional().describe("The nextCursor of the previous call, to continue the list"),
+			}),
+			annotations: READ,
 		},
-		() => run(() => ops.list()),
+		(input) => run(() => ops.list(input)),
+	);
+
+	mcp.registerTool(
+		"get_page",
+		{
+			description:
+				"One page's details: url, label, agent, created/updated/expiry times, version, visibility, and its files' paths and sizes. For a mockup set, also each option with its verdict and note. Use it before changing a page you didn't publish in this session; read_file reads a file's content.",
+			inputSchema: z.object({ id }),
+			annotations: READ,
+		},
+		(input) => run(() => ops.get(input.id)),
+	);
+
+	mcp.registerTool(
+		"read_file",
+		{
+			description: `Read one file of a page back, from the version it serves or an older kept one, e.g. to patch a page another session published. Returns its content as text (encoding "utf8"), or base64 (encoding "base64") for images and other binary files. Files over ${bytesText(READ_LIMIT)} are refused; get_page lists paths and sizes.`,
+			inputSchema: z.object({
+				id,
+				path: z.string().describe('The file\'s path inside the page, as get_page lists it, e.g. "index.html" or "css/app.css"'),
+				version: z.number().int().optional().describe("A kept version from list_versions; defaults to the one being served"),
+			}),
+			annotations: READ,
+		},
+		(input) => run(() => ops.readFile(input.id, input.path, input.version)),
+	);
+
+	mcp.registerTool(
+		"rename_page",
+		{
+			description: "Change the label of a page or mockup set, as shown in list_pages and the dashboard. The URL stays the same.",
+			inputSchema: z.object({ id, label: z.string().describe("The new label; an empty string clears it") }),
+			annotations: writes({ destructive: false, idempotent: true }),
+		},
+		(input) => run(() => ops.edit(input.id, { label: input.label })),
 	);
 
 	return mcp;

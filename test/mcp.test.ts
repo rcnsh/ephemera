@@ -130,7 +130,7 @@ describe("mockup MCP tools", () => {
 		expect(patched.data.options.map((o: { name: string }) => o.name)).toEqual(["b", "c"]);
 
 		const listed = await tool("list_pages", {});
-		expect(listed.data.pages.find((p: { id: string }) => p.id === id).options).toHaveLength(2);
+		expect(listed.data.pages.find((p: { id: string }) => p.id === id).verdicts).toEqual({ pending: 1, picked: 1, rejected: 0 });
 		expect(listed.data.usage.mockups).toBe(1);
 
 		expect((await tool("set_visibility", { id, visibility: "private" })).data.visibility).toBe("private");

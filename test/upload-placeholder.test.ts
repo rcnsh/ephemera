@@ -11,8 +11,8 @@ interface Upload {
 	id: string;
 	url: string;
 	uploadUrl: string;
-	uploadExpiresAt: number;
-	expiresAt: number | null;
+	uploadExpiresAt: string;
+	expiresAt: string | null;
 	permanent: boolean;
 }
 
@@ -32,7 +32,7 @@ describe("upload_url's placeholder page", () => {
 	it("expires with the upload URL if nothing is uploaded", async () => {
 		const created = await startUpload({});
 		expect(created).toMatchObject({ permanent: false, expiresAt: created.uploadExpiresAt });
-		vi.spyOn(Date, "now").mockReturnValue(created.uploadExpiresAt + 1);
+		vi.spyOn(Date, "now").mockReturnValue(Date.parse(created.uploadExpiresAt) + 1);
 		expect((await call(created.url)).status).toBe(410);
 	});
 
@@ -41,7 +41,7 @@ describe("upload_url's placeholder page", () => {
 		const response = await upload(created.uploadUrl, { "index.html": "<h1>up</h1>" });
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({ permanent: true, expiresAt: null });
-		vi.spyOn(Date, "now").mockReturnValue(created.uploadExpiresAt + 365 * 24 * HOUR);
+		vi.spyOn(Date, "now").mockReturnValue(Date.parse(created.uploadExpiresAt) + 365 * 24 * HOUR);
 		expect(await (await call(created.url)).text()).toBe("<h1>up</h1>");
 	});
 
@@ -50,7 +50,7 @@ describe("upload_url's placeholder page", () => {
 		const start = Date.now();
 		vi.spyOn(Date, "now").mockReturnValue(start + 30 * 60_000);
 		const first = (await (await upload(created.uploadUrl, { "index.html": "one" })).json()) as Upload;
-		expect(first).toMatchObject({ permanent: false, expiresAt: start + 30 * 60_000 + 48 * HOUR });
+		expect(first).toMatchObject({ permanent: false, expiresAt: new Date(start + 30 * 60_000 + 48 * HOUR).toISOString() });
 
 		// Later uploads, each with a URL of its own, leave the expiry alone.
 		vi.spyOn(Date, "now").mockReturnValue(start + 40 * 60_000);
@@ -78,7 +78,7 @@ describe("upload_url's placeholder page", () => {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ files: [{ path: "index.html", content: "patched" }] }),
 		});
-		expect(await patch.json()).toMatchObject({ permanent: false, expiresAt: start + 10 * 60_000 + 24 * HOUR });
+		expect(await patch.json()).toMatchObject({ permanent: false, expiresAt: new Date(start + 10 * 60_000 + 24 * HOUR).toISOString() });
 
 		// Both survive past the upload window.
 		vi.spyOn(Date, "now").mockReturnValue(start + 2 * HOUR);

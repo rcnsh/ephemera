@@ -33,8 +33,8 @@ describe("publishing", () => {
 	});
 
 	it("accepts durations, seconds and permanent", async () => {
-		expect((await publish({ ttl: "5m" })).expiresAt).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
-		expect((await publish({ ttl: 7200 })).expiresAt).toBeLessThanOrEqual(Date.now() + 2 * HOUR);
+		expect(Date.parse((await publish({ ttl: "5m" })).expiresAt!)).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+		expect(Date.parse((await publish({ ttl: 7200 })).expiresAt!)).toBeLessThanOrEqual(Date.now() + 2 * HOUR);
 		const forever = await publish({ ttl: "permanent" });
 		expect(forever.permanent).toBe(true);
 		expect(forever.expiresAt).toBeNull();
@@ -304,10 +304,10 @@ describe("updating and expiry", () => {
 
 	it("extends from the current expiry, capped at 30 days from now", async () => {
 		const page = await publish({ ttl: "1h" });
-		const extended = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "1d" }) })).json()) as { expiresAt: number };
-		expect(extended.expiresAt).toBe(page.expiresAt! + DAY);
-		const capped = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "30d" }) })).json()) as { expiresAt: number };
-		expect(capped.expiresAt).toBeLessThanOrEqual(Date.now() + 30 * DAY);
+		const extended = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "1d" }) })).json()) as { expiresAt: string };
+		expect(Date.parse(extended.expiresAt)).toBe(Date.parse(page.expiresAt!) + DAY);
+		const capped = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "30d" }) })).json()) as { expiresAt: string };
+		expect(Date.parse(capped.expiresAt)).toBeLessThanOrEqual(Date.now() + 30 * DAY);
 	});
 
 	it("needs a ttl to extend, rather than taking the permanent default", async () => {
@@ -315,7 +315,7 @@ describe("updating and expiry", () => {
 		const response = await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: null }) });
 		expect(response.status).toBe(400);
 		expect(await response.text()).toMatch(/ttl is required/);
-		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "new", ttl: null }) })).json()) as { label: string; expiresAt: number };
+		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "new", ttl: null }) })).json()) as { label: string; expiresAt: string };
 		expect(renamed).toMatchObject({ label: "new", expiresAt: page.expiresAt });
 		expect((await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "newer", ttl: "0" }) })).status).toBe(400);
 		expect(((await (await api(`/pages/${page.id}`)).json()) as { label: string }).label).toBe("new");
@@ -325,9 +325,9 @@ describe("updating and expiry", () => {
 		const page = await publish();
 		const forever = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "permanent" }) })).json()) as { permanent: boolean };
 		expect(forever.permanent).toBe(true);
-		const back = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "2h" }) })).json()) as { permanent: boolean; expiresAt: number };
+		const back = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ ttl: "2h" }) })).json()) as { permanent: boolean; expiresAt: string };
 		expect(back.permanent).toBe(false);
-		expect(back.expiresAt).toBeLessThanOrEqual(Date.now() + 2 * HOUR);
+		expect(Date.parse(back.expiresAt)).toBeLessThanOrEqual(Date.now() + 2 * HOUR);
 	});
 
 	it("deletes a page immediately", async () => {
@@ -345,14 +345,17 @@ describe("updating and expiry", () => {
 		expect(await objectCount(page.id)).toBe(0);
 	});
 
-	it("lists live pages soonest-expiring first, with usage", async () => {
+	it("lists live pages newest-updated first, with usage", async () => {
 		const later = await publish({ ttl: "3h", label: "later" });
 		const sooner = await publish({ ttl: "1h", label: "sooner" });
 		const forever = await publish({ ttl: "permanent", label: "forever" });
 		const gone = await publish();
 		await api(`/pages/${gone.id}`, { method: "DELETE" });
+		// Touching a page moves it to the top.
+		await api(`/pages/${later.id}`, { method: "PATCH", body: JSON.stringify({ label: "later, renamed" }) });
 		const body = (await (await api("/pages")).json()) as { pages: { id: string }[]; usage: { temporaryPages: number; permanentPages: number; bytes: number } };
-		expect(body.pages.map((p) => p.id)).toEqual([sooner.id, later.id, forever.id]);
+		expect(new Set(body.pages.map((p) => p.id))).toEqual(new Set([sooner.id, later.id, forever.id]));
+		expect(body.pages[0]!.id).toBe(later.id);
 		expect(body.usage).toMatchObject({ temporaryPages: 2, permanentPages: 1 });
 		expect(body.usage.bytes).toBeGreaterThan(0);
 	});

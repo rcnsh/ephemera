@@ -49,7 +49,8 @@ export const HELLO = [{ path: "index.html", content: "<!doctype html><h1>hello</
 export interface PublishedPage {
 	id: string;
 	url: string;
-	expiresAt: number | null;
+	/** ISO 8601. */
+	expiresAt: string | null;
 	permanent: boolean;
 	warnings: string[];
 	[key: string]: unknown;
@@ -71,4 +72,30 @@ export function zip(files: Record<string, string>): Uint8Array {
 
 export async function objectCount(id: string): Promise<number> {
 	return (await env.BUCKET.list({ prefix: `pages/${id}/` })).objects.length;
+}
+
+let nextRpcId = 1;
+
+/** A JSON-RPC call to the MCP server; the result, or the error. */
+export async function mcp(method: string, params: Record<string, unknown> = {}): Promise<any> {
+	const response = await call(`${PAGES}/mcp`, {
+		method: "POST",
+		headers: {
+			authorization: `Bearer ${TOKEN}`,
+			"content-type": "application/json",
+			accept: "application/json, text/event-stream",
+			"mcp-protocol-version": "2025-06-18",
+		},
+		body: JSON.stringify({ jsonrpc: "2.0", id: nextRpcId++, method, params }),
+	});
+	const text = await response.text();
+	const json = text.startsWith("{") ? JSON.parse(text) : JSON.parse(text.split("\n").find((line) => line.startsWith("data:"))!.slice(5));
+	return json.result ?? json.error;
+}
+
+/** Calls a tool: its JSON result, or its error text with `isError`. `raw` is the text as the agent sees it. */
+export async function mcpTool(name: string, args: Record<string, unknown> = {}): Promise<{ isError?: boolean; data: any; raw: string }> {
+	const result = await mcp("tools/call", { name, arguments: args });
+	const raw = result.content[0].text as string;
+	return { isError: result.isError, data: result.isError ? raw : JSON.parse(raw), raw };
 }

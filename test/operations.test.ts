@@ -16,6 +16,7 @@ afterEach(async () => {
 
 const START = Date.UTC(2026, 0, 1);
 const HTML = { html: "<h1>hi</h1>" };
+const iso = (ms: number) => new Date(ms).toISOString();
 
 /** Operations over a store with a clock the test moves by hand. */
 function operations() {
@@ -29,15 +30,15 @@ describe("lifetimes", () => {
 		const { ops, clock } = operations();
 		const page = await ops.publish({ content: HTML });
 		clock.now += 1000;
-		expect(await ops.makeTemporary(page.id)).toMatchObject({ permanent: false, expiresAt: clock.now + LIMITS.temporaryTtl });
+		expect(await ops.makeTemporary(page.id)).toMatchObject({ permanent: false, expiresAt: iso(clock.now + LIMITS.temporaryTtl) });
 		clock.now += 1000;
-		expect(await ops.makeTemporary(page.id)).toMatchObject({ permanent: false, expiresAt: START + 1000 + LIMITS.temporaryTtl, updatedAt: START + 1000 });
+		expect(await ops.makeTemporary(page.id)).toMatchObject({ permanent: false, expiresAt: iso(START + 1000 + LIMITS.temporaryTtl), updatedAt: iso(START + 1000) });
 	});
 
 	it("extends by the ttls the dashboard offers", async () => {
 		const { ops } = operations();
 		const page = await ops.publish({ content: HTML, ttl: "1h" });
-		expect((await ops.extend(page.id, "1d")).expiresAt).toBe(START + 25 * 3_600_000);
+		expect((await ops.extend(page.id, "1d")).expiresAt).toBe(iso(START + 25 * 3_600_000));
 		expect(await ops.extend(page.id, "permanent")).toMatchObject({ permanent: true, expiresAt: null });
 	});
 });
@@ -57,7 +58,8 @@ describe("overview", () => {
 		expect(overview.usage).toMatchObject({ temporaryPages: 1, permanentPages: 0, mockups: 1 });
 
 		const listed = await ops.list();
-		expect(listed.pages.map((p) => p.id)).toEqual([page.id, set.id]);
+		// The dashboard's overview keeps its own order; the agents' list is newest-updated first.
+		expect(new Set(listed.pages.map((p) => p.id))).toEqual(new Set([page.id, set.id]));
 		expect(listed.usage).toEqual(overview.usage);
 	});
 });
