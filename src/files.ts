@@ -39,6 +39,9 @@ export function decodeFiles(files: unknown): PageFile[] {
 	return files.map((file: Partial<InlineFile> | null) => {
 		if (typeof file?.path !== "string" || typeof file.content !== "string") throw new PageError(400, "Every file needs a path and a content, both strings");
 		const path = normalizePath(file.path);
+		if (file.encoding !== undefined && file.encoding !== null && file.encoding !== "utf8" && file.encoding !== "base64") {
+			throw new PageError(400, `File "${path}" has encoding ${JSON.stringify(file.encoding)}; use "utf8" (the default) or "base64"`);
+		}
 		if (file.encoding === "base64") {
 			try {
 				return { path, body: Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0)) };
@@ -70,10 +73,14 @@ export function hasFiles(content: Content): boolean {
 	return given(content.files) || given(content.zip);
 }
 
-/** Turns content into the page's files, or throws. `title` names a Markdown page. */
-export function decodeContent(content: Content, title?: string | null): PageFile[] {
+/**
+ * Turns content into the files of a page of `kind`, or throws. `title` names
+ * a Markdown page. `options` are the option names of the mockup set being
+ * replaced, if there is one (see `unzipFiles`).
+ */
+export function decodeContent(content: Content, title?: string | null, kind: PageKind = "page", options: string[] = []): PageFile[] {
 	if ([content.files, content.html, content.markdown, content.zip].filter(given).length !== 1) throw new PageError(400, "Give exactly one of files, html or markdown (or a zip)");
-	if (content.zip) return unzipFiles(content.zip);
+	if (content.zip) return unzipFiles(content.zip, kind, options);
 	if (given(content.html)) {
 		if (typeof content.html !== "string") throw new PageError(400, "html must be a string");
 		return [{ path: "index.html", body: new TextEncoder().encode(content.html) }];
@@ -92,9 +99,14 @@ const JUNK = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/;
  * Unpacks a zip bundle. Sizes are checked from the zip headers before anything
  * is inflated, so a zip bomb is rejected without being expanded. When every
  * file sits under one top-level folder and there's no root index.html (what
- * `zip -r site.zip site/` produces), that folder is stripped.
+ * `zip -r site.zip site/` produces), that folder is stripped. For a mockup
+ * set, a folder that is itself an option is kept: one with its own
+ * index.html and no option folders inside it (`site/a/index.html` makes it a
+ * wrapper). An option can have sub-pages, so when a zip replaces an existing
+ * set, a folder named after one of its `options` (the ones that have a
+ * folder) is kept, unless one of the folders inside it is an option too.
  */
-export function unzipFiles(zip: Uint8Array): PageFile[] {
+export function unzipFiles(zip: Uint8Array, kind: PageKind = "page", options: string[] = []): PageFile[] {
 	let declaredBytes = 0;
 	let declaredFiles = 0;
 	let entries: Record<string, Uint8Array>;
@@ -116,8 +128,14 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
 
 	let names = Object.keys(entries);
 	const roots = new Set(names.map((name) => name.split("/")[0]));
-	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/"))) {
-		const prefix = `${[...roots][0]}/`;
+	const prefix = `${[...roots][0]}/`;
+	// The folders inside it that would be options if it were a wrapper.
+	const inner = names.flatMap((name) => /^([^/]+)\/index\.html$/.exec(name.slice(prefix.length))?.[1] ?? []);
+	const isOption =
+		kind === "mockup" &&
+		names.includes(`${prefix}index.html`) &&
+		(inner.length === 0 || (options.includes(prefix.slice(0, -1)) && !inner.some((name) => options.includes(name))));
+	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/")) && !isOption) {
 		entries = Object.fromEntries(names.map((name) => [name.slice(prefix.length), entries[name]!]));
 		names = Object.keys(entries);
 	}

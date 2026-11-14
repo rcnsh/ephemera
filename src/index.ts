@@ -3,8 +3,9 @@ import { checkUploadToken, hasToken } from "./auth.ts";
 import { cat, rootPage } from "./cat.ts";
 import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
-import { normalizePath } from "./files.ts";
+import { contentType, normalizePath } from "./files.ts";
 import { rewriteLinks } from "./links.ts";
+import { logRequest, redact } from "./logging.ts";
 import { favicon } from "./logo.ts";
 import { handleMcp } from "./mcp.ts";
 import { mockupIndex } from "./mockups.ts";
@@ -92,7 +93,11 @@ async function servePageTimed(request: Request, env: Env, pages: Pages, id: stri
 		return text("Not found\n", 404);
 	}
 
-	const file = await timings.time("file", pages.files.serve(page, path, request.headers.get("if-none-match")), (served) => (served ? (served.cached ? "hit" : "miss") : null));
+	// Files that get gzipped are always sent whole, and only GET takes a range.
+	const rangeable = !COMPRESSIBLE.test(contentType(path));
+	const rangeHeader = request.method === "GET" && rangeable ? request.headers.get("range") : null;
+	const range = rangeHeader ? { range: rangeHeader, ifRange: request.headers.get("if-range") } : null;
+	const file = await timings.time("file", pages.files.serve(page, path, request.headers.get("if-none-match"), range), (served) => (served ? (served.cached ? "hit" : "miss") : null));
 	const cacheControl = pass ? "private, no-cache, no-transform" : "no-cache, no-transform";
 	if (!file && path === "index.html" && page.kind === "mockup") {
 		// A mockup set without its own index shows its options side by side.
@@ -112,10 +117,20 @@ async function servePageTimed(request: Request, env: Env, pages: Pages, id: stri
 	// no-transform stops Cloudflare editing pages (injected scripts, Rocket
 	// Loader), which would also strip the ETag; so we compress text ourselves.
 	const headers = new Headers({ "content-type": file.contentType, etag: file.etag, "cache-control": cacheControl });
+	if (rangeable) headers.set("accept-ranges", "bytes");
+	if (file.range && !file.range.satisfiable) {
+		return new Response(null, { status: 416, headers: { "content-range": `bytes */${file.range.size}`, "cache-control": cacheControl } });
+	}
 	if (!file.body) return new Response(null, { status: 304, headers });
 	if (request.method === "HEAD") {
 		await file.body.cancel();
 		return new Response(null, { headers });
+	}
+	if (file.range) {
+		const { start, end, size } = file.range;
+		headers.set("content-range", `bytes ${start}-${end}/${size}`);
+		headers.set("content-length", String(end - start + 1));
+		return new Response(file.body, { status: 206, headers });
 	}
 	const response = new Response(file.body, { headers });
 	return gzip(request, file.contentType.startsWith("text/html") ? rewriteLinks(response, id, pass) : response);
@@ -137,9 +152,9 @@ async function handleAgent(request: Request, env: Env, ctx: ExecutionContext, pa
 	const ops = new Operations(pages, env.PAGES_HOST, env.EPHEMERA_TOKEN);
 	try {
 		if (pathname.startsWith("/upload/")) {
-			const id = await checkUploadToken(env.EPHEMERA_TOKEN, pathname.slice("/upload/".length));
-			if (!id) return Response.json({ error: "This upload URL is wrong or has expired; ask for a new one" }, { status: 403 });
-			return await handleUpload(request, ops, id);
+			const upload = await checkUploadToken(env.EPHEMERA_TOKEN, pathname.slice("/upload/".length));
+			if (!upload) return Response.json({ error: "This upload URL is wrong or has expired; ask for a new one" }, { status: 403 });
+			return await handleUpload(request, ops, upload);
 		}
 		if (!(await hasToken(request, env.EPHEMERA_TOKEN))) return Response.json({ error: "Missing or wrong bearer token" }, { status: 401 });
 		return pathname === "/mcp" ? await handleMcp(request, env, ctx, ops) : await handleApi(request, ops);
@@ -175,20 +190,27 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	}
 }
 
+async function respond(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const { hostname } = new URL(request.url);
+	const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work), cacheOrigin: `https://${env.PAGES_HOST}` });
+	try {
+		if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
+		if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);
+		return text("Not found\n", 404);
+	} catch (error) {
+		// Each host's handler answers PageErrors in its own format; anything left is a bug.
+		console.error(redact(error instanceof Error ? (error.stack ?? String(error)) : String(error)));
+		const response = text("Something went wrong\n", 500);
+		return hostname === env.PAGES_HOST ? withPageHeaders(response) : response;
+	}
+}
+
 export default {
 	async fetch(request, env, ctx) {
-		const { hostname } = new URL(request.url);
-		const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work), cacheOrigin: `https://${env.PAGES_HOST}` });
-		try {
-			if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
-			if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);
-			return text("Not found\n", 404);
-		} catch (error) {
-			// Each host's handler answers PageErrors in its own format; anything left is a bug.
-			console.error(error);
-			const response = text("Something went wrong\n", 500);
-			return hostname === env.PAGES_HOST ? withPageHeaders(response) : response;
-		}
+		const started = performance.now();
+		const response = await respond(request, env, ctx);
+		logRequest(request, response, performance.now() - started);
+		return response;
 	},
 
 	async scheduled(_controller, env, ctx) {

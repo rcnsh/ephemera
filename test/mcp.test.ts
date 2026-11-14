@@ -119,7 +119,7 @@ describe("mockup MCP tools", () => {
 		const published = await tool("publish_mockup", { project: "app", name: "Inventory grid", files: TWO_OPTIONS });
 		expect(published.isError).toBeFalsy();
 		const id = published.data.id as string;
-		expect(id).toMatch(/^app-inventory-grid-[a-z2-7]{6}$/);
+		expect(id).toMatch(/^app-inventory-grid-[a-z2-7]{10}$/);
 		expect(published.data).toMatchObject({ url: `${PAGES}/${id}/`, kind: "mockup", project: "app", permanent: true, visibility: "public" });
 
 		const picked = await tool("set_verdict", { id, option: "b", verdict: "picked", note: "cleaner" });
@@ -130,7 +130,7 @@ describe("mockup MCP tools", () => {
 		expect(patched.data.options.map((o: { name: string }) => o.name)).toEqual(["b", "c"]);
 
 		const listed = await tool("list_pages", {});
-		expect(listed.data.pages.find((p: { id: string }) => p.id === id).options).toHaveLength(2);
+		expect(listed.data.pages.find((p: { id: string }) => p.id === id).verdicts).toEqual({ pending: 1, picked: 1, rejected: 0 });
 		expect(listed.data.usage.mockups).toBe(1);
 
 		expect((await tool("set_visibility", { id, visibility: "private" })).data.visibility).toBe("private");

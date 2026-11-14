@@ -19,7 +19,8 @@ function post(path: string, body: unknown): Promise<Response> {
 }
 
 async function shareLink(id: string, ttl?: string): Promise<{ url: string; expiresAt: number }> {
-	return (await post(`/pages/${id}/share`, ttl ? { ttl } : {})).json();
+	const link = (await (await post(`/pages/${id}/share`, ttl ? { ttl } : {})).json()) as { url: string; expiresAt: string };
+	return { ...link, expiresAt: Date.parse(link.expiresAt) };
 }
 
 function unlock(id: string, password: string, next = ""): Promise<Response> {
@@ -139,6 +140,17 @@ describe("private pages", () => {
 		expect((await shareLink(page.id)).url).toBe(page.url);
 	});
 
+	it("revoke share links on a rollback, so a link handed out while unwanted content was live stops working", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "oops" }] }) });
+		const link = await shareLink(page.id, "7d");
+		expect(await (await call(link.url)).text()).toBe("oops");
+		expect((await post(`/pages/${page.id}/rollback`, { version: 1 })).status).toBe(200);
+		expect((await call(link.url)).status).toBe(401);
+		const fresh = await shareLink(page.id);
+		expect((await call(`${fresh.url}docs/`)).status).toBe(200);
+	});
+
 	it("clear the password when made public, and keep it off public pages", async () => {
 		const page = await publish({ password: "correct horse" });
 		const made = (await (await post(`/pages/${page.id}/visibility`, { visibility: "public" })).json()) as { hasPassword: boolean };
@@ -146,5 +158,91 @@ describe("private pages", () => {
 		const unlocked = await unlock(page.id, "correct horse", "docs/");
 		expect(unlocked.status).toBe(303);
 		expect(unlocked.headers.get("location")).toBe(`${page.url}docs/`);
+	});
+});
+
+function guess(id: string, password: string, client = "192.0.2.1", init: { env?: Record<string, unknown> } = {}): Promise<Response> {
+	return call(
+		`${PAGES}/${id}/_unlock`,
+		{ method: "POST", headers: { "cf-connecting-ip": client }, body: new URLSearchParams({ password, next: "" }) },
+		init.env ? { env: init.env } : {},
+	);
+}
+
+describe("password guesses", () => {
+	it("are limited per client, before the password is hashed, with a 429 gate", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		for (let i = 0; i < 5; i++) expect((await guess(page.id, `wrong ${i}`)).status).toBe(401);
+		const deriveBits = vi.spyOn(crypto.subtle, "deriveBits");
+		const limited = await guess(page.id, "correct horse");
+		expect(limited.status).toBe(429);
+		expect(limited.headers.get("retry-after")).toBe("60");
+		expect(limited.headers.get("content-security-policy")).toMatch(/^sandbox/);
+		const html = await limited.text();
+		expect(html).toContain("Too many password attempts");
+		expect(html).toContain(`href="${ADMIN}/open/${page.id}/"`);
+		expect(deriveBits).not.toHaveBeenCalled();
+		// Another client isn't held up by the first one's guesses.
+		expect((await guess(page.id, "correct horse", "192.0.2.2")).status).toBe(303);
+	});
+
+	it("are limited per page across clients, so many addresses can't guess freely", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		for (let i = 0; i < 30; i++) expect((await guess(page.id, "wrong", `198.51.100.${i}`)).status, `guess ${i}`).toBe(401);
+		expect((await guess(page.id, "correct horse", "203.0.113.1")).status).toBe(429);
+		// A different page keeps its own allowance.
+		const other = await publish({ files: FILES, password: "correct horse" });
+		expect((await guess(other.id, "correct horse", "203.0.113.1")).status).toBe(303);
+	});
+
+	it("still open the page through Access and share links while locked out", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		const link = await shareLink(page.id);
+		for (let i = 0; i < 6; i++) await guess(page.id, "wrong");
+		expect((await guess(page.id, "correct horse")).status).toBe(429);
+		expect((await call(link.url)).status).toBe(200);
+		const opened = await call(`${ADMIN}/open/${page.id}/`, {}, { accessAud: AUD });
+		expect((await call(opened.headers.get("location")!)).status).toBe(200);
+	});
+
+	it("let the right password in again once the limit lifts", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		let open = false;
+		const limiter = { limit: async () => ({ success: open }) };
+		const env = { PASSWORD_GUESSES: limiter, PAGE_PASSWORD_GUESSES: limiter };
+		expect((await guess(page.id, "correct horse", undefined, { env })).status).toBe(429);
+		open = true;
+		expect((await guess(page.id, "correct horse", undefined, { env })).status).toBe(303);
+	});
+
+	it("are refused with the gate, not an error, when the limiter fails", async () => {
+		const page = await publish({ files: FILES, visibility: "private", password: "correct horse" });
+		const limit = vi.fn(async () => {
+			throw new Error("limiter down");
+		});
+		const env = { PASSWORD_GUESSES: { limit }, PAGE_PASSWORD_GUESSES: { limit } };
+		const response = await guess(page.id, "correct horse", undefined, { env });
+		expect(response.status).toBe(429);
+		expect(await response.text()).toContain("Sign in");
+	});
+
+	it("aren't counted on pages without a password", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		const limit = vi.fn(async () => ({ success: false }));
+		const env = { PASSWORD_GUESSES: { limit }, PAGE_PASSWORD_GUESSES: { limit } };
+		expect((await guess(page.id, "anything", undefined, { env })).status).toBe(401);
+		expect(limit).not.toHaveBeenCalled();
+	});
+});
+
+describe("referrer policy", () => {
+	it("is no-referrer on a sandboxed document, so a pass in the URL isn't sent to other sites", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		const response = await call((await shareLink(page.id)).url);
+		expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+		// The opaque origin the sandbox gives the document is what stops markup or script loosening the policy.
+		const csp = response.headers.get("content-security-policy")!;
+		expect(csp).toMatch(/\bsandbox\b/);
+		expect(csp).not.toContain("allow-same-origin");
 	});
 });
