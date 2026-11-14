@@ -14,6 +14,8 @@ export const VERDICTS: readonly Verdict[] = ["pending", "picked", "rejected"];
 
 export interface MockupOption {
 	name: string;
+	/** Where the option is inside its set, relative to the set's URL: `a/`, or "" for a set that is a single page. */
+	path: string;
 	verdict: Verdict;
 	note: string | null;
 	updatedAt: number;
@@ -37,11 +39,21 @@ export function slugify(text: string, max = SLUG_LENGTH): string {
 		.replace(/-+$/, "");
 }
 
-/** The options of a bundle given as its canonical paths: the top-level folders with an index.html, by name. */
-export function mockupOptions(paths: string[]): string[] {
+/** An option as found in a bundle's files: its name, and whether it has a top-level folder of its own. */
+export interface FoundOption {
+	name: string;
+	folder: boolean;
+}
+
+/**
+ * The options of a bundle given as its canonical paths: the top-level folders
+ * with an index.html, by name. Failing those, a root index.html is the one
+ * option `main`, with no folder.
+ */
+export function mockupOptions(paths: string[]): FoundOption[] {
 	const folders = new Set(paths.filter((path) => /^[^/]+\/index\.html$/.test(path)).map((path) => path.split("/")[0]!));
-	if (folders.size) return [...folders].sort();
-	return paths.includes("index.html") ? [MAIN_OPTION] : [];
+	if (folders.size) return [...folders].sort().map((name) => ({ name, folder: true }));
+	return paths.includes("index.html") ? [{ name: MAIN_OPTION, folder: false }] : [];
 }
 
 /** The path of an option inside its set, given whether the set has a folder for it. */
@@ -67,7 +79,7 @@ function escape(text: string): string {
 export function mockupIndex(title: string, options: MockupOption[]): string {
 	const figures = options
 		.map((option, i) => {
-			const path = optionPath(option.name, true);
+			const path = option.path;
 			const name = escape(option.name);
 			const hash = `#option=${encodeURIComponent(option.name)}`;
 			const picked = option.verdict === "picked";

@@ -1,7 +1,7 @@
 import { checkCsrf, csrfToken } from "./auth.ts";
 import { bytesText, PageError, pageUrl } from "./domain.ts";
 import { FAVICON_LINK, favicon, mark } from "./logo.ts";
-import { MAIN_OPTION, type MockupOption, optionPath, VERDICTS } from "./mockups.ts";
+import { type MockupOption, VERDICTS } from "./mockups.ts";
 import { Operations } from "./operations.ts";
 import { ID_SOURCE, type Page, type Pages, type Usage, type Version } from "./pages.ts";
 import { passFor, passUrl, safeRest } from "./privacy.ts";
@@ -184,19 +184,14 @@ ${versionList(page, versions, csrf, now)}
 </article>`;
 }
 
-/** The path of an option inside its set. A lone `main` option is the set's root page. */
-function optionHref(options: MockupOption[], option: MockupOption): string {
-	return optionPath(option.name, !(options.length === 1 && option.name === MAIN_OPTION));
-}
-
-function optionFigure(page: Page, options: MockupOption[], option: MockupOption, open: string, csrf: string): string {
+function optionFigure(page: Page, option: MockupOption, open: string, csrf: string): string {
 	const buttons = (["picked", "rejected", "pending"] as const)
 		.filter((verdict) => verdict !== option.verdict)
 		.map((verdict) => `<button name="verdict" value="${verdict}">${{ picked: "pick", rejected: "reject", pending: "undecide" }[verdict]}</button>`)
 		.join("");
 	const badge = option.verdict === "pending" ? "" : ` <span class="badge ${option.verdict}">${option.verdict}</span>`;
 	return `<figure class="option ${option.verdict}">
-<a class="shot" href="${open}${optionHref(options, option)}" target="_blank" rel="noopener noreferrer"><img src="/thumbnails/${page.id}/${encodeURIComponent(option.name)}.png?v=${page.version}" loading="lazy" alt=""></a>
+<a class="shot" href="${open}${option.path}" target="_blank" rel="noopener noreferrer"><img src="/thumbnails/${page.id}/${encodeURIComponent(option.name)}.png?v=${page.version}" loading="lazy" alt=""></a>
 <figcaption>${escape(option.name)}${badge}</figcaption>
 <form class="verdict" method="post" action="/pages/${page.id}/verdict">${hidden(page, csrf)}<input type="hidden" name="option" value="${escape(option.name)}"><input name="note" value="${escape(option.note ?? "")}" placeholder="note" maxlength="200" aria-label="Note">${buttons}</form>
 </figure>`;
@@ -219,7 +214,7 @@ function mockupSet(page: Page, options: MockupOption[], versions: Version[], hos
 	return `<article class="set" data-search="${escape(search)}" data-verdicts="${verdicts}">
 <p class="meta"><strong>${escape(page.label ?? page.id)}</strong> · <a href="${open}" target="_blank" rel="noopener noreferrer">${page.id}</a> <button type="button" data-copy="${url}">copy</button> · ${duration(now - page.createdAt)} old · ${bytesText(page.size)} · v${page.version} ${badges}</p>
 <div class="options">
-${options.map((option) => optionFigure(page, options, option, open, csrf)).join("\n")}
+${options.map((option) => optionFigure(page, option, open, csrf)).join("\n")}
 </div>
 <div class="actions">${visibility}</div>
 ${share}
@@ -354,12 +349,7 @@ const shooting = new Map<string, Promise<Map<string, Uint8Array | null>>>();
 async function shootOptions(env: Env, ctx: ExecutionContext, pages: Pages, page: Page): Promise<Map<string, Uint8Array | null>> {
 	const options = await pages.options(page.id);
 	const pass = page.visibility === "private" ? await passFor(env.EPHEMERA_TOKEN, page, Date.now(), THUMBNAIL_PASS) : null;
-	const urls = await Promise.all(
-		options.map(async (option) => {
-			const path = optionPath(option.name, await pages.hasFile(page, `${option.name}/index.html`));
-			return pass ? passUrl(env.PAGES_HOST, page.id, pass, path) : `${pageUrl(env.PAGES_HOST, page.id)}${path}`;
-		}),
-	);
+	const urls = options.map((option) => (pass ? passUrl(env.PAGES_HOST, page.id, pass, option.path) : `${pageUrl(env.PAGES_HOST, page.id)}${option.path}`));
 	const pngs = await screenshotOptions(env.BROWSER, urls);
 	const shots = new Map(options.map((option, i) => [option.name, pngs[i] ?? null]));
 	for (const [option, png] of shots) if (png) ctx.waitUntil(pages.saveOptionThumbnail(page, option, png));

@@ -27,7 +27,7 @@ interface MockupView {
 	project: string | null;
 	label: string | null;
 	permanent: boolean;
-	options: { name: string; verdict: string; note: string | null }[];
+	options: { name: string; path: string; verdict: string; note: string | null }[];
 	[key: string]: unknown;
 }
 
@@ -122,17 +122,19 @@ describe("mockup limits", () => {
 
 describe("mockup options", () => {
 	it("are the top-level folders with an index.html, or main for a single page", () => {
-		expect(mockupOptions(["compact/index.html", "a/index.html", "a/app.css", "assets/logo.png", "notes/readme.txt"])).toEqual(["a", "compact"]);
-		expect(mockupOptions(["index.html", "style.css"])).toEqual(["main"]);
-		expect(mockupOptions(["index.html", "a/index.html"])).toEqual(["a"]);
-		expect(mockupOptions(["a/b/index.html"])).toEqual([]);
+		const names = (paths: string[]) => mockupOptions(paths).map((option) => `${option.name}${option.folder ? "/" : ""}`);
+		expect(names(["compact/index.html", "a/index.html", "a/app.css", "assets/logo.png", "notes/readme.txt"])).toEqual(["a/", "compact/"]);
+		expect(names(["index.html", "style.css"])).toEqual(["main"]);
+		expect(names(["main/index.html"])).toEqual(["main/"]);
+		expect(names(["index.html", "a/index.html"])).toEqual(["a/"]);
+		expect(names(["a/b/index.html"])).toEqual([]);
 	});
 
 	it("start pending when a set is published", async () => {
 		const set = await publishMockup();
 		expect(set.options).toEqual([
-			{ name: "a", verdict: "pending", note: null, updatedAt: expect.any(Number) },
-			{ name: "b", verdict: "pending", note: null, updatedAt: expect.any(Number) },
+			{ name: "a", path: "a/", verdict: "pending", note: null, updatedAt: expect.any(Number) },
+			{ name: "b", path: "b/", verdict: "pending", note: null, updatedAt: expect.any(Number) },
 		]);
 		const single = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
 		expect(single.options.map((o) => o.name)).toEqual(["main"]);
@@ -240,8 +242,8 @@ describe("the set page", () => {
 
 	it("shows a picked option's note, and keeps the label out of reach of the script", () => {
 		const html = mockupIndex("</script><b>", [
-			{ name: "a", verdict: "picked", note: "denser <but> fine", updatedAt: 0 },
-			{ name: "b", verdict: "rejected", note: "too busy", updatedAt: 0 },
+			{ name: "a", path: "a/", verdict: "picked", note: "denser <but> fine", updatedAt: 0 },
+			{ name: "b", path: "b/", verdict: "rejected", note: "too busy", updatedAt: 0 },
 		]);
 		expect(html).toContain('<p class="note">denser &#60;but&#62; fine</p>');
 		expect(html).not.toContain("too busy");
@@ -249,7 +251,7 @@ describe("the set page", () => {
 	});
 
 	it("escapes option names and the label", () => {
-		const html = mockupIndex("<b>x</b>", [{ name: 'a"<', verdict: "pending", note: null, updatedAt: 0 }]);
+		const html = mockupIndex("<b>x</b>", [{ name: 'a"<', path: "a%22%3C/", verdict: "pending", note: null, updatedAt: 0 }]);
 		expect(html).toContain("&#60;b&#62;x&#60;/b&#62;");
 		expect(html).toContain('src="a%22%3C/"');
 	});
@@ -342,5 +344,36 @@ describe("the dashboard's Mockups tab", () => {
 		const set = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
 		await admin(`/thumbnails/${set.id}/main.png`);
 		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([set.url]);
+	});
+
+	it("links, shoots and shows an option in its folder even when it's a lone main/", async () => {
+		vi.mocked(screenshotOptions).mockResolvedValue([new Uint8Array([1])]);
+		const set = await publishMockup({ files: [{ path: "main/index.html", content: "<p>one</p>" }] });
+		expect(set.options).toEqual([expect.objectContaining({ name: "main", path: "main/" })]);
+		const html = await (await admin("/mockups")).text();
+		expect(html).toContain(`<a class="shot" href="${set.url}main/"`);
+		await admin(`/thumbnails/${set.id}/main.png`);
+		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([`${set.url}main/`]);
+		expect(await (await call(set.url)).text()).toContain('data-src="main/"');
+	});
+
+	it("links a single-page set's main option to the set's root", async () => {
+		const set = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
+		expect(set.options).toEqual([expect.objectContaining({ name: "main", path: "" })]);
+		expect(await (await admin("/mockups")).text()).toContain(`<a class="shot" href="${set.url}"`);
+	});
+
+	it("encodes an option's folder into its path", async () => {
+		const set = await publishMockup({ files: [{ path: "a b#1/index.html", content: "<p>one</p>" }, { path: "c/index.html", content: "<p>two</p>" }] });
+		expect(set.options.map((option) => option.path)).toEqual(["a%20b%231/", "c/"]);
+		expect(await (await call(set.url)).text()).toContain('<iframe src="a%20b%231/"');
+		const html = await (await admin("/mockups")).text();
+		expect(html).toContain(`<a class="shot" href="${set.url}a%20b%231/"`);
+	});
+
+	it("moves an option between the root and its folder when an update does", async () => {
+		const set = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
+		await api(`/pages/${set.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "main/index.html", content: "<p>one</p>" }] }) });
+		expect(await options(set.id)).toEqual([expect.objectContaining({ name: "main", path: "main/" })]);
 	});
 });
