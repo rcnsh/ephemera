@@ -19,7 +19,7 @@ async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 		const query = (name: string) => url.searchParams.get(name) ?? undefined;
 		return { content: { zip: new Uint8Array(await request.arrayBuffer()) }, ttl: query("ttl"), label: query("label"), agent: query("agent"), visibility: query("visibility") };
 	}
-	const body = (await request.json().catch(() => null)) as { files?: unknown; html?: unknown; markdown?: unknown; ttl?: TtlInput; label?: string; agent?: string; visibility?: unknown; password?: unknown } | null;
+	const body = (await request.json().catch(() => null)) as { files?: unknown; html?: unknown; markdown?: unknown; ttl?: unknown; label?: unknown; agent?: unknown; visibility?: unknown; password?: unknown } | null;
 	if (typeof body !== "object" || body === null) throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent }) or a zip file");
 	const { files, html, markdown, ttl, label, agent, visibility, password } = body;
 	return { content: { files, html, markdown }, ttl, label, agent, visibility, password };
@@ -44,7 +44,7 @@ async function readJson<T>(request: Request): Promise<Partial<T>> {
 /** PUT /upload/<token>: replaces the files of the page the token is for. The caller has checked the token. */
 export async function handleUpload(request: Request, ops: Operations, id: string): Promise<Response> {
 	if (request.method !== "PUT" && request.method !== "POST") return json({ error: "Method not allowed; PUT a zip" }, 405);
-	return json(await ops.update(id, (await readBundle(request, new URL(request.url))).content));
+	return json(await ops.upload(id, (await readBundle(request, new URL(request.url))).content));
 }
 
 /**
@@ -68,7 +68,7 @@ export async function handleUpload(request: Request, ops: Operations, id: string
 export async function handleApi(request: Request, ops: Operations): Promise<Response> {
 	const url = new URL(request.url);
 	if (url.pathname === "/api/uploads" && request.method === "POST") {
-		return json(await ops.uploadUrl(await readJson<{ id: string; ttl: TtlInput; label: string; agent: string; visibility: unknown; password: unknown }>(request)), 201);
+		return json(await ops.uploadUrl(await readJson<{ id: unknown; ttl: unknown; label: unknown; agent: unknown; visibility: unknown; password: unknown }>(request)), 201);
 	}
 	if (url.pathname === "/api/mockups" && request.method === "POST") return json(await ops.publishMockup(await readMockup(request, url)), 201);
 	const match = /^\/api\/pages(?:\/([^/]+)(?:\/(versions|rollback|files|visibility|share|verdict))?)?\/?$/.exec(url.pathname);

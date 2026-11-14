@@ -543,19 +543,32 @@ export class Pages {
 
 	/**
 	 * Makes a page public or private, and sets or clears its password (only
-	 * private pages have one). Either way, every pass handed out so far stops
-	 * working.
+	 * private pages have one; undefined keeps a private page's current one).
+	 * Either way, every pass handed out so far stops working.
 	 */
-	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null): Promise<Page> {
-		const page = await this.get(id);
-		const hash = visibility === "private" ? passwordHash : null;
+	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null | undefined): Promise<Page> {
+		await this.get(id);
+		const keep = visibility === "private" && passwordHash === undefined;
 		const now = this.now();
-		const result = await this.db
-			.prepare(`UPDATE pages SET visibility = ?, password_hash = ?, share_epoch = share_epoch + 1, updated_at = ? WHERE id = ? AND ${LIVE}`)
-			.bind(visibility, hash, now, id, now)
-			.run();
+		const row = await this.db
+			.prepare(
+				`UPDATE pages SET visibility = ?, password_hash = CASE WHEN ? THEN password_hash ELSE ? END, share_epoch = share_epoch + 1, updated_at = ?
+				WHERE id = ? AND ${LIVE} RETURNING *`,
+			)
+			.bind(visibility, keep ? 1 : 0, visibility === "private" ? (passwordHash ?? null) : null, now, id, now)
+			.first<PageRow>();
+		if (!row) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		return toPage(row);
+	}
+
+	/** Sets a page to expire `ttl` from now, or never. Unlike `extend`, the current expiry doesn't count. */
+	async expireIn(id: string, ttl: Ttl): Promise<Page> {
+		const page = await this.get(id);
+		const now = this.now();
+		const expiresAt = ttl === "permanent" ? null : now + ttl;
+		const result = await this.db.prepare(`UPDATE pages SET expires_at = ? WHERE id = ? AND ${LIVE}`).bind(expiresAt, id, now).run();
 		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
-		return { ...page, visibility, passwordHash: hash, shareEpoch: page.shareEpoch + 1, updatedAt: now };
+		return { ...page, expiresAt, permanent: expiresAt === null };
 	}
 
 	async setLabel(id: string, label: string | null): Promise<Page> {
