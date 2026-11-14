@@ -330,7 +330,7 @@ async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: stri
 	const found = await pages.lookup(id);
 	if (found.state !== "live") return new Response("Not found", { status: 404 });
 	const page = found.page;
-	const cached = await pages.thumbnail(page);
+	const cached = await pages.files.thumbnail(page);
 	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
 	if (cached) return new Response(cached.body, { headers });
 
@@ -338,7 +338,7 @@ async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: stri
 	const png = await screenshot(env.BROWSER, url);
 	// Not cached, so the next dashboard load tries again.
 	if (!png) return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": "no-store" } });
-	ctx.waitUntil(pages.saveThumbnail(page, png));
+	ctx.waitUntil(pages.files.saveThumbnail(page, png));
 	return new Response(png, { headers });
 }
 
@@ -352,7 +352,7 @@ async function shootOptions(env: Env, ctx: ExecutionContext, pages: Pages, page:
 	const urls = options.map((option) => (pass ? passUrl(env.PAGES_HOST, page.id, pass, option.path) : `${pageUrl(env.PAGES_HOST, page.id)}${option.path}`));
 	const pngs = await screenshotOptions(env.BROWSER, urls);
 	const shots = new Map(options.map((option, i) => [option.name, pngs[i] ?? null]));
-	for (const [option, png] of shots) if (png) ctx.waitUntil(pages.saveOptionThumbnail(page, option, png));
+	for (const [option, png] of shots) if (png) ctx.waitUntil(pages.files.saveThumbnail(page, png, option));
 	return shots;
 }
 
@@ -361,7 +361,7 @@ async function optionThumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id
 	const found = await pages.lookup(id);
 	if (found.state !== "live" || found.page.kind !== "mockup") return new Response("Not found", { status: 404 });
 	const page = found.page;
-	const cached = await pages.optionThumbnail(page, option);
+	const cached = await pages.files.thumbnail(page, option);
 	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
 	if (cached) return new Response(cached.body, { headers });
 

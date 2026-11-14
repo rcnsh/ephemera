@@ -1,10 +1,11 @@
-import { checkBundle, contentType, normalizePath, type PageFile, type PageKind, validateBundle } from "./files.ts";
+import { checkBundle, normalizePath, type PageFile, type PageKind, validateBundle } from "./files.ts";
 import { LIMITS, PageError, type Ttl } from "./domain.ts";
 import { type MockupOption, mockupOptions, optionPath, slugify, type Verdict } from "./mockups.ts";
+import { type PageFiles, VersionFiles } from "./version-files.ts";
 
 /**
  * The page store. D1 holds one row per page and one per version it keeps;
- * R2 holds the files under `pages/<id>/<version>/<path>`. Updating a page
+ * `files` (see version-files.ts) holds each version's files. Updating a page
  * adds a version and keeps the last `LIMITS.keptVersions`; rolling back
  * points the page at an older one. A page is live until it's deleted or its
  * `expires_at` passes (NULL means permanent). After that it's "gone": the
@@ -12,12 +13,6 @@ import { type MockupOption, mockupOptions, optionPath, slugify, type Verdict } f
  * once the grace period is over the row is dropped and the id answers 404.
  * Mockup sets are pages too (`kind` 'mockup'), with a row per option in
  * `verdicts`. The table is created by the migrations in /migrations.
- *
- * A version's files never change, so `serveFile` keeps them in the edge cache
- * under their version (see `PagesOptions.cacheOrigin`): R2 is read once per
- * file per data centre rather than on every view. Each frame of a mockup set
- * is a sandboxed opaque origin with a cache partition of its own, so browsers
- * can't share files between frames and every frame asks the Worker again.
  */
 
 interface Storage {
@@ -165,46 +160,19 @@ function clean(text: string | undefined | null, max: number): string | null {
 }
 
 export interface PagesOptions {
-	/** Keeps background work (deleting replaced files) alive after the response; `ctx.waitUntil` in the Worker. */
+	/** Keeps background work (deleting replaced files, filling the cache) alive after the response; `ctx.waitUntil` in the Worker. */
 	defer: (work: Promise<unknown>) => void;
 	now?: () => number;
-	/**
-	 * An origin of this Worker's zone (`https://PAGES_HOST`) to key cached files
-	 * under, at paths no request reaches. Without it nothing is cached.
-	 */
+	/** See `VersionFilesOptions.cacheOrigin`. */
 	cacheOrigin?: string;
 }
 
-/** A file as served: `body` is null when the caller's ETag already matches. */
-export interface ServedFile {
-	etag: string;
-	contentType: string;
-	body: ReadableStream | null;
-	/** Whether it came from the edge cache rather than R2. */
-	cached: boolean;
-}
-
-/**
- * How long a data centre keeps a cached file. Views of a page cluster soon
- * after it's published; a short life means a deleted page's copies (which no
- * request can reach) don't linger.
- */
-const CACHE_SECONDS = 24 * 60 * 60;
-
-/** Marks a cached answer that a version has no file at a path. */
-const MISSING = "x-ephemera-missing";
-
-/** Whether an If-None-Match header names `etag` (weakly, as browsers compare). */
-function matches(ifNoneMatch: string | null, etag: string): boolean {
-	if (!ifNoneMatch) return false;
-	const bare = (tag: string) => tag.trim().replace(/^W\//, "");
-	return ifNoneMatch.split(",").some((tag) => tag.trim() === "*" || bare(tag) === bare(etag));
-}
-
 export class Pages {
+	/** Each version's files and the pages' thumbnails. Serve and check a page's files through it with the `Page` itself. */
+	readonly files: PageFiles;
+	private readonly store: VersionFiles;
 	private readonly defer: (work: Promise<unknown>) => void;
 	private readonly now: () => number;
-	private readonly cacheOrigin: string | undefined;
 
 	constructor(
 		private readonly storage: Storage,
@@ -212,7 +180,8 @@ export class Pages {
 	) {
 		this.defer = options.defer;
 		this.now = options.now ?? Date.now;
-		this.cacheOrigin = options.cacheOrigin;
+		this.store = new VersionFiles(storage.BUCKET, { defer: options.defer, cacheOrigin: options.cacheOrigin });
+		this.files = this.store;
 	}
 
 	private get db() {
@@ -235,69 +204,6 @@ export class Pages {
 		if (found.state === "live") return found.page;
 		if (found.state === "gone") throw new PageError(410, `Page ${id} has expired or been deleted`);
 		throw new PageError(404, `No page with id "${id}"`);
-	}
-
-	/** A file of the page, straight from R2. */
-	async file(page: Page, path: string): Promise<R2ObjectBody | null> {
-		return this.storage.BUCKET.get(`pages/${page.id}/${page.version}/${path}`);
-	}
-
-	/** Where the edge cache keeps a version's file. `_files` can't be a page id, so no request maps here. */
-	private cacheKey(id: string, version: number, path: string): string | null {
-		if (!this.cacheOrigin) return null;
-		return `${this.cacheOrigin}/_files/${id}/${version}/${path.split("/").map(encodeURIComponent).join("/")}`;
-	}
-
-	private cacheFile(id: string, version: number, path: string, file: { etag: string; contentType: string; body: BodyInit } | null): Promise<void> {
-		const key = this.cacheKey(id, version, path);
-		if (!key) return Promise.resolve();
-		const headers = new Headers({ "cache-control": `public, max-age=${CACHE_SECONDS}` });
-		if (file) {
-			headers.set("etag", file.etag);
-			headers.set("content-type", file.contentType);
-		} else headers.set(MISSING, "1");
-		return caches.default.put(key, new Response(file?.body ?? null, { headers })).catch((error) => console.warn(`caching ${key} failed: ${error}`));
-	}
-
-	/**
-	 * A file of the page to send, or null if it has none at `path`. Answers
-	 * from the edge cache when it can, and fills it from R2 when it can't.
-	 * With an `ifNoneMatch` naming the file's ETag, the body is null.
-	 */
-	async serveFile(page: Page, path: string, ifNoneMatch: string | null = null): Promise<ServedFile | null> {
-		const key = this.cacheKey(page.id, page.version, path);
-		const cached = key ? await caches.default.match(key) : undefined;
-		if (cached) {
-			if (cached.headers.has(MISSING)) return null;
-			const etag = cached.headers.get("etag")!;
-			const fresh = matches(ifNoneMatch, etag);
-			if (fresh) await cached.body?.cancel();
-			return { etag, contentType: cached.headers.get("content-type")!, body: fresh ? null : cached.body, cached: true };
-		}
-		const object = await this.file(page, path);
-		if (!object) {
-			// Only a missing index is worth remembering: it's how a mockup set
-			// without one of its own is shown, on every view.
-			if (path === "index.html") this.defer(this.cacheFile(page.id, page.version, path, null));
-			return null;
-		}
-		const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
-		if (matches(ifNoneMatch, file.etag)) {
-			if (!key) {
-				await object.body.cancel();
-				return { ...file, body: null };
-			}
-			this.defer(this.cacheFile(page.id, page.version, path, { ...file, body: object.body }));
-			return { ...file, body: null };
-		}
-		// The cache gets its own read rather than a tee: a tee would hold
-		// whatever a slow client hasn't taken yet in memory, up to a whole page.
-		if (key) this.defer(this.file(page, path).then((copy) => (copy ? this.cacheFile(page.id, page.version, path, { ...file, body: copy.body }) : undefined)));
-		return { ...file, body: object.body };
-	}
-
-	async hasFile(page: Page, path: string): Promise<boolean> {
-		return (await this.storage.BUCKET.head(`pages/${page.id}/${page.version}/${path}`)) !== null;
 	}
 
 	async usage(): Promise<Usage> {
@@ -326,61 +232,7 @@ export class Pages {
 	}
 
 	/**
-	 * Writes `files`, and copies the `carried` paths over from the version `from`.
-	 * Waits for every write to settle, even after one fails, so a cleanup that
-	 * follows sees them all.
-	 *
-	 * Returns `warm`, which puts the new files in the edge cache: whoever
-	 * published is usually the first to look, from the same data centre. Call
-	 * it only once the version is committed, since a version number that
-	 * failed to commit is used again.
-	 */
-	private async writeFiles(id: string, version: number, files: PageFile[], carried: string[] = [], from?: Page): Promise<() => void> {
-		const key = (path: string) => `pages/${id}/${version}/${path}`;
-		const written: { path: string; etag: string; contentType: string; body: Uint8Array }[] = [];
-		const results = await Promise.allSettled([
-			...files.map(async (file) => {
-				const type = contentType(file.path);
-				const object = await this.storage.BUCKET.put(key(file.path), file.body, { httpMetadata: { contentType: type } });
-				written.push({ path: file.path, etag: object.httpEtag, contentType: type, body: file.body });
-			}),
-			...carried.map(async (path) => {
-				const object = await this.file(from!, path);
-				if (!object) throw new Error(`pages/${id}/${from!.version}/${path} vanished while copying`);
-				await this.storage.BUCKET.put(key(path), object.body, { httpMetadata: object.httpMetadata });
-			}),
-		]);
-		const failed = results.find((result) => result.status === "rejected");
-		if (failed) throw failed.reason;
-		return () => {
-			for (const { path, ...file } of written) this.defer(this.cacheFile(id, version, path, file));
-		};
-	}
-
-	/** The paths and sizes of the files of a version of a page. */
-	private async listFiles(id: string, version: number): Promise<Map<string, number>> {
-		const prefix = `pages/${id}/${version}/`;
-		const files = new Map<string, number>();
-		let cursor: string | undefined;
-		do {
-			const listing = await this.storage.BUCKET.list({ prefix, cursor, limit: 1000 });
-			for (const object of listing.objects) files.set(object.key.slice(prefix.length), object.size);
-			cursor = listing.truncated ? listing.cursor : undefined;
-		} while (cursor);
-		return files;
-	}
-
-	private async deletePrefix(prefix: string): Promise<void> {
-		let cursor: string | undefined;
-		do {
-			const listing = await this.storage.BUCKET.list({ prefix, cursor, limit: 1000 });
-			if (listing.objects.length) await this.storage.BUCKET.delete(listing.objects.map((object) => object.key));
-			cursor = listing.truncated ? listing.cursor : undefined;
-		} while (cursor);
-	}
-
-	/**
-	 * Files go to R2 before the row goes to D1, and are deleted again if either
+	 * Files are written before the row goes to D1, and are deleted again if either
 	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
 	 * set: its id comes from the project and name.
 	 */
@@ -416,7 +268,7 @@ export class Pages {
 		};
 		let warm: () => void;
 		try {
-			warm = await this.writeFiles(row.id, row.version, files);
+			warm = await this.store.write(row, files);
 			await this.db.batch([
 				this.db
 					.prepare(
@@ -443,7 +295,7 @@ export class Pages {
 				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
 			]);
 		} catch (error) {
-			await this.deletePrefix(`pages/${row.id}/`);
+			await this.store.deletePage(row.id);
 			throw error;
 		}
 		warm();
@@ -491,7 +343,7 @@ export class Pages {
 	async update(id: string, input: PageFile[]): Promise<Page> {
 		const page = await this.get(id);
 		const { files, size } = validateBundle(input, page.kind);
-		return this.addVersionOf(page, size, files.map((file) => file.path), (version) => this.writeFiles(id, version, files));
+		return this.addVersionOf(page, size, files.map((file) => file.path), (version) => this.store.write({ id, version }, files));
 	}
 
 	/**
@@ -503,7 +355,7 @@ export class Pages {
 		const page = await this.get(id);
 		const put = changes.files.map((file) => ({ path: normalizePath(file.path), body: file.body }));
 		const putPaths = new Set(put.map((file) => file.path));
-		const existing = await this.listFiles(id, page.version);
+		const existing = await this.store.list(page);
 		const remove = new Set<string>();
 		for (const raw of changes.remove) {
 			if (raw.trim().endsWith("/")) {
@@ -527,7 +379,7 @@ export class Pages {
 			carried.reduce((total, path) => total + existing.get(path)!, 0) + put.reduce((total, file) => total + file.body.byteLength, 0),
 			page.kind,
 		);
-		return this.addVersionOf(page, size, paths, (version) => this.writeFiles(id, version, put, carried, page));
+		return this.addVersionOf(page, size, paths, (version) => this.store.write({ id, version }, put, { from: page.version, paths: carried }));
 	}
 
 	/** Writes a new version of `page` with `write`, then serves it. `paths` are the files it will have. */
@@ -549,7 +401,7 @@ export class Pages {
 		try {
 			warm = await write(version);
 		} catch (error) {
-			await this.deletePrefix(`pages/${id}/${version}/`);
+			await this.store.deleteVersion({ id, version });
 			throw error;
 		}
 		const now = this.now();
@@ -568,11 +420,11 @@ export class Pages {
 			committed = result!.meta.changes === 1;
 		} catch (error) {
 			// The number is never used again, so nothing else would clear its files.
-			await this.deletePrefix(`pages/${id}/${version}/`);
+			await this.store.deleteVersion({ id, version });
 			throw error;
 		}
 		if (!committed) {
-			await this.deletePrefix(`pages/${id}/${version}/`);
+			await this.store.deleteVersion({ id, version });
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
 		warm();
@@ -625,7 +477,7 @@ export class Pages {
 			.first<VersionRow>();
 		if (!target) throw new PageError(404, `Page ${id} has no version ${version}; list_versions shows the ones it keeps`);
 		const now = this.now();
-		const options = page.kind === "mockup" ? this.syncOptions(id, version, now, [...(await this.listFiles(id, version)).keys()]) : [];
+		const options = page.kind === "mockup" ? this.syncOptions(id, version, now, [...(await this.store.list({ id, version })).keys()]) : [];
 		const [result] = await this.db.batch([
 			this.db
 				.prepare(
@@ -657,7 +509,7 @@ export class Pages {
 				.prepare("DELETE FROM versions WHERE page_id = ? AND version = ? AND version != (SELECT version FROM pages WHERE id = ?)")
 				.bind(id, version, id)
 				.run();
-			if (deleted.meta.changes === 1) await this.deletePrefix(`pages/${id}/${version}/`);
+			if (deleted.meta.changes === 1) await this.store.deleteVersion({ id, version });
 		}
 	}
 
@@ -715,36 +567,6 @@ export class Pages {
 		return { ...page, label: cleaned, updatedAt: now };
 	}
 
-	/** The page's thumbnail, if one was made for the version it's serving. It lives with the files, so it goes when they do. */
-	async thumbnail(page: Page): Promise<R2ObjectBody | null> {
-		const object = await this.storage.BUCKET.get(`pages/${page.id}/thumbnail.png`);
-		if (object && object.customMetadata?.version === String(page.version)) return object;
-		await object?.body.cancel();
-		return null;
-	}
-
-	async saveThumbnail(page: Page, png: Uint8Array): Promise<void> {
-		await this.storage.BUCKET.put(`pages/${page.id}/thumbnail.png`, png, {
-			httpMetadata: { contentType: "image/png" },
-			customMetadata: { version: String(page.version) },
-		});
-	}
-
-	/** The thumbnail of one option of a mockup set, if one was made for the version it's serving. */
-	async optionThumbnail(page: Page, option: string): Promise<R2ObjectBody | null> {
-		const object = await this.storage.BUCKET.get(`pages/${page.id}/thumbnails/${option}.png`);
-		if (object && object.customMetadata?.version === String(page.version)) return object;
-		await object?.body.cancel();
-		return null;
-	}
-
-	async saveOptionThumbnail(page: Page, option: string, png: Uint8Array): Promise<void> {
-		await this.storage.BUCKET.put(`pages/${page.id}/thumbnails/${option}.png`, png, {
-			httpMetadata: { contentType: "image/png" },
-			customMetadata: { version: String(page.version) },
-		});
-	}
-
 	/** The options of a mockup set, by name, with their verdicts. */
 	async options(id: string): Promise<MockupOption[]> {
 		const { results } = await this.db.prepare("SELECT * FROM verdicts WHERE page_id = ? ORDER BY option").bind(id).all<VerdictRow>();
@@ -795,7 +617,7 @@ export class Pages {
 	}
 
 	private async purge(id: string): Promise<void> {
-		await this.deletePrefix(`pages/${id}/`);
+		await this.store.deletePage(id);
 		await this.db.prepare("UPDATE pages SET purged = 1 WHERE id = ?").bind(id).run();
 	}
 

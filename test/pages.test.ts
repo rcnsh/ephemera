@@ -2,6 +2,7 @@ import { createExecutionContext, createScheduledController, env, reset, waitOnEx
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
 import { LIMITS } from "../src/domain.ts";
+import { Pages } from "../src/pages.ts";
 import { PAGES, api, call, objectCount, publish, zip } from "./helpers.ts";
 
 afterEach(async () => {
@@ -155,10 +156,9 @@ describe("serving", () => {
 		expect(await changed.text()).toContain("v2");
 	});
 
-	it("serves a version's files from the edge cache, without R2, until the page changes or goes", async () => {
+	it("serves a version's files from the edge cache once published, until the page changes or goes", async () => {
 		const page = await publish({ files: [{ path: "index.html", content: "<h1>v1</h1>" }, { path: "a b/c.css", content: "p{}" }] });
-		// Publishing warms the cache, so the files survive losing their R2 copies.
-		await env.BUCKET.delete([`pages/${page.id}/1/index.html`, `pages/${page.id}/1/a b/c.css`]);
+		// Publishing warms the cache (version-files.test.ts covers misses and fills).
 		const cached = await call(`${PAGES}/${page.id}/`);
 		expect(cached.status).toBe(200);
 		expect(await cached.text()).toContain("v1");
@@ -166,7 +166,6 @@ describe("serving", () => {
 		expect(await (await call(`${PAGES}/${page.id}/a%20b/c.css`)).text()).toBe("p{}");
 		const etag = cached.headers.get("etag")!;
 		expect((await call(`${PAGES}/${page.id}/`, { headers: { "if-none-match": `W/${etag}` } })).status).toBe(304);
-		expect((await call(`${PAGES}/${page.id}/nope.css`)).status).toBe(404);
 		expect((await call(`${PAGES}/${page.id}/nope.css`)).status).toBe(404);
 
 		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "<h1>v2</h1>" }, { path: "nope.css", content: "q{}" }] }) });
@@ -177,16 +176,13 @@ describe("serving", () => {
 		expect((await call(`${PAGES}/${page.id}/`)).status).toBe(410);
 	});
 
-	it("fills the edge cache from R2 for files it doesn't have", async () => {
-		const page = await publish();
-		const key = `https://pages.example.com/_files/${page.id}/1/index.html`;
-		await caches.default.delete(key);
+	it("reports a file the edge cache didn't have as a miss, and has it next time", async () => {
+		// Published without a cache origin, so nothing warmed the cache.
+		const page = await new Pages(env, { defer: () => {} }).publish({ files: [{ path: "index.html", body: new TextEncoder().encode("hello") }], ttl: "permanent" });
 		const missed = await call(`${PAGES}/${page.id}/`);
 		expect(missed.headers.get("server-timing")).toMatch(/\bfile;desc=miss;dur=\d+/);
-		expect(await missed.text()).toContain("hello");
-		expect(await caches.default.match(key)).toBeTruthy();
-		await env.BUCKET.delete(`pages/${page.id}/1/index.html`);
-		expect(await (await call(`${PAGES}/${page.id}/`)).text()).toContain("hello");
+		expect(await missed.text()).toBe("hello");
+		expect((await call(`${PAGES}/${page.id}/`)).headers.get("server-timing")).toMatch(/\bfile;desc=hit;dur=\d+/);
 	});
 
 	it("gzips text files itself and keeps their ETag", async () => {
