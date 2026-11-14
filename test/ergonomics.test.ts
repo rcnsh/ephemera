@@ -108,9 +108,38 @@ describe("upload URLs", () => {
 		expect(uploaded.status).toBe(200);
 		expect(await (await call(created.url)).text()).toBe("<h1>uploaded</h1>");
 
-		// It can be used again until it expires.
-		expect((await upload(created.uploadUrl, zip({ "index.html": "again" }))).status).toBe(200);
-		expect(await (await call(created.url)).text()).toBe("again");
+		// It works once.
+		const again = await upload(created.uploadUrl, zip({ "index.html": "again" }));
+		expect(again.status).toBe(403);
+		expect(((await again.json()) as { error: string }).error).toMatch(/already been used/);
+		expect(await (await call(created.url)).text()).toBe("<h1>uploaded</h1>");
+	});
+
+	it("can't push a page's kept versions out by being replayed", async () => {
+		const page = await publish();
+		const created = (await (await post("/uploads", { id: page.id })).json()) as Upload;
+		const statuses: number[] = [];
+		for (let n = 1; n <= 6; n++) statuses.push((await upload(created.uploadUrl, zip({ "index.html": `v${n}` }))).status);
+		expect(statuses).toEqual([200, 403, 403, 403, 403, 403]);
+		const { versions } = (await (await api(`/pages/${page.id}/versions`)).json()) as { versions: { version: number }[] };
+		expect(versions.map((v) => v.version)).toEqual([2, 1]);
+	});
+
+	it("stops working once the page has been updated some other way", async () => {
+		const page = await publish();
+		const created = (await (await post("/uploads", { id: page.id })).json()) as Upload;
+		await post(`/pages/${page.id}/files`, { files: [{ path: "a.css", content: "x" }] });
+		expect((await upload(created.uploadUrl, zip({ "index.html": "late" }))).status).toBe(403);
+		// A fresh one works.
+		const fresh = (await (await post("/uploads", { id: page.id })).json()) as Upload;
+		expect((await upload(fresh.uploadUrl, zip({ "index.html": "late" }))).status).toBe(200);
+	});
+
+	it("lets only one of two uploads with the same URL through at once", async () => {
+		const page = await publish();
+		const created = (await (await post("/uploads", { id: page.id })).json()) as Upload;
+		const results = await Promise.all([upload(created.uploadUrl, zip({ "index.html": "a" })), upload(created.uploadUrl, zip({ "index.html": "b" }))]);
+		expect(results.map((r) => r.status).sort()).toEqual([200, 403]);
 	});
 
 	it("uploads new files for an existing page", async () => {

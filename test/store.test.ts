@@ -1,11 +1,14 @@
 import { env, reset } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { LIMITS, PageError } from "../src/domain.ts";
 import type { PageFile } from "../src/files.ts";
 import { Pages } from "../src/pages.ts";
 import { objectCount } from "./helpers.ts";
 
-afterEach(() => reset());
+afterEach(async () => {
+	vi.restoreAllMocks();
+	await reset();
+});
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -154,6 +157,17 @@ describe("versions", () => {
 		expect(await status(pages.rollback(page.id, 9))).toBe(404);
 	});
 
+	it("revokes passes on a rollback, so a link handed out while the old version was live stops working", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
+		await pages.update(page.id, [file("index.html", "v2")]);
+		const before = (await pages.get(page.id)).shareEpoch;
+		expect((await pages.rollback(page.id, 1)).shareEpoch).toBe(before + 1);
+		expect((await pages.get(page.id)).shareEpoch).toBe(before + 1);
+		// Rolling back to the version already served changes nothing.
+		expect((await pages.rollback(page.id, 1)).shareEpoch).toBe(before + 1);
+	});
+
 	it("never prunes the version being served", async () => {
 		const { pages, settle } = store();
 		const page = await pages.publish({ files: [file("index.html", "v1")], ttl: HOUR });
@@ -210,6 +224,80 @@ describe("storage failures", () => {
 		const { pages } = store(bucket);
 		await expect(pages.publish({ files: [...INDEX, file("a.txt")], ttl: HOUR })).rejects.toThrow("put failed");
 		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
+		expect(await pageRows()).toBe(0);
+	});
+
+	it("leaves a failed publish to the sweep when cleaning up after it fails too", async () => {
+		const puts = flaky("put", 1);
+		const deletes = flaky("delete");
+		// One bucket failing both: the second put, and every delete.
+		const bucket = new Proxy(env.BUCKET, {
+			get(target, name) {
+				if (name === "put") return Reflect.get(puts.bucket, "put");
+				if (name === "delete") return Reflect.get(deletes.bucket, "delete");
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const { pages, clock } = store(bucket);
+		await expect(pages.publish({ files: [...INDEX, file("a.txt")], ttl: HOUR })).rejects.toThrow("put failed");
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+		expect(await pages.list()).toEqual([]);
+
+		const healthy = store();
+		healthy.clock.now = clock.now + 1000;
+		expect((await healthy.pages.sweep()).purged).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
+		healthy.clock.now = START + LIMITS.goneGrace + 1;
+		expect((await healthy.pages.sweep()).forgotten).toBe(1);
+		expect(await pageRows()).toBe(0);
+	});
+
+	it("sweeps up after a publish that died between reserving its id and committing, once it's clearly abandoned", async () => {
+		const { pages, clock } = store();
+		// A database whose commit never comes back, as if the Worker died there.
+		let reached: () => void;
+		const atCommit = new Promise<void>((resolve) => (reached = resolve));
+		const db = new Proxy(env.DB, {
+			get(target, name) {
+				if (name === "batch") {
+					return () => {
+						reached();
+						return new Promise(() => {});
+					};
+				}
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const dying = new Pages({ DB: db, BUCKET: env.BUCKET }, { now: () => START, defer: () => {} });
+		void dying.publish({ files: INDEX, ttl: HOUR });
+		await atCommit;
+		expect(await pageRows()).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+
+		// Still in progress, as far as the sweep can tell.
+		clock.now = START + 30 * 60_000;
+		expect((await pages.sweep()).purged).toBe(0);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+
+		clock.now = START + 2 * HOUR;
+		expect((await pages.sweep()).purged).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
+		// Once is enough: later sweeps leave it alone until it's forgotten.
+		clock.now += 10 * 60_000;
+		expect((await pages.sweep()).purged).toBe(0);
+		clock.now = START + LIMITS.goneGrace + 1;
+		expect((await pages.sweep()).forgotten).toBe(1);
+		expect(await pageRows()).toBe(0);
+	});
+
+	it("never takes a live page for an abandoned reservation", async () => {
+		const { pages, clock } = store();
+		const page = await pages.publish({ files: INDEX, ttl: "permanent" });
+		clock.now = START + 2 * HOUR;
+		expect((await pages.sweep()).purged).toBe(0);
+		expect(await objectCount(page.id)).toBe(1);
 	});
 
 	it("retries deleting a page's files on the next sweep if the first try fails", async () => {
@@ -225,5 +313,93 @@ describe("storage failures", () => {
 		failing.on = false;
 		expect((await pages.sweep()).purged).toBe(1);
 		expect(await objectCount(page.id)).toBe(0);
+	});
+});
+
+async function pageRows(): Promise<number> {
+	return (await env.DB.prepare("SELECT COUNT(*) AS n FROM pages").first<{ n: number }>())!.n;
+}
+
+/** Makes the next `times` ids drawn come out the same: every random character is "a". */
+function repeatIds(times: number) {
+	const spy = vi.spyOn(crypto, "getRandomValues");
+	for (let i = 0; i < times; i++) {
+		spy.mockImplementationOnce(<T extends ArrayBufferView | null>(array: T): T => {
+			(array as unknown as Uint8Array).fill(0);
+			return array;
+		});
+	}
+}
+
+describe("page ids", () => {
+	async function body(pages: Pages, page: { id: string; version: number }, path: string): Promise<string> {
+		return new Response((await pages.files.serve(page, path))!.body).text();
+	}
+
+	it("gives a mockup set 10 random characters after its slug", async () => {
+		const { pages } = store();
+		const set = await pages.publish({ files: [file("a/index.html")], ttl: "permanent", mockup: { project: "Web", name: "Nav" } });
+		expect(set.id).toMatch(/^web-nav-[a-z2-7]{10}$/);
+	});
+
+	it("never touches another set's files when a mockup id comes up twice", async () => {
+		const { pages } = store();
+		const mockup = { project: "web", name: "nav" };
+		repeatIds(2);
+		const first = await pages.publish({ files: [file("a/index.html", "first")], ttl: "permanent", mockup });
+		expect(first.id).toBe("web-nav-aaaaaaaaaa");
+		const second = await pages.publish({ files: [file("b/index.html", "second")], ttl: "permanent", mockup });
+		expect(second.id).not.toBe(first.id);
+
+		expect(await objectCount(first.id)).toBe(1);
+		expect(await body(pages, first, "a/index.html")).toBe("first");
+		expect((await pages.options(first.id)).map((option) => option.name)).toEqual(["a"]);
+		expect(await body(pages, second, "b/index.html")).toBe("second");
+		expect((await pages.options(second.id)).map((option) => option.name)).toEqual(["b"]);
+	});
+
+	it("does the same for plain pages", async () => {
+		const { pages } = store();
+		repeatIds(2);
+		const first = await pages.publish({ files: [file("index.html", "first")], ttl: HOUR });
+		const second = await pages.publish({ files: [file("index.html", "second")], ttl: HOUR });
+		expect(second.id).not.toBe(first.id);
+		expect(await body(pages, first, "index.html")).toBe("first");
+		expect(await body(pages, second, "index.html")).toBe("second");
+	});
+
+	it("gives up after a few clashes, leaving the page that has the id alone", async () => {
+		const { pages } = store();
+		const mockup = { project: "web", name: "nav" };
+		repeatIds(1);
+		const first = await pages.publish({ files: [file("a/index.html", "first")], ttl: "permanent", mockup });
+		repeatIds(20);
+		expect(await status(pages.publish({ files: [file("b/index.html", "second")], ttl: "permanent", mockup }))).toBe(503);
+		expect(await pageRows()).toBe(1);
+		expect(await objectCount(first.id)).toBe(1);
+		expect(await body(pages, first, "a/index.html")).toBe("first");
+	});
+
+	it("keeps a reserved id out of sight, and out of the sweep's way, while its files are written", async () => {
+		const seen: { live: number; state: string; swept: number }[] = [];
+		const { pages } = store();
+		const watching = new Proxy(env.BUCKET, {
+			get(target, name) {
+				if (name === "put") {
+					return async (key: string, ...rest: unknown[]) => {
+						const id = key.split("/")[1]!;
+						seen.push({ live: (await pages.list()).length, state: (await pages.lookup(id)).state, swept: (await pages.sweep()).purged });
+						return (target.put as (...args: unknown[]) => unknown).call(target, key, ...rest);
+					};
+				}
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const page = await store(watching).pages.publish({ files: INDEX, ttl: HOUR });
+		expect(seen).toEqual([{ live: 0, state: "gone", swept: 0 }]);
+		expect((await pages.lookup(page.id)).state).toBe("live");
+		expect(await objectCount(page.id)).toBe(1);
+		expect((await pages.usage()).temporaryPages).toBe(1);
 	});
 });

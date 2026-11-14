@@ -39,6 +39,9 @@ export function decodeFiles(files: unknown): PageFile[] {
 	return files.map((file: Partial<InlineFile> | null) => {
 		if (typeof file?.path !== "string" || typeof file.content !== "string") throw new PageError(400, "Every file needs a path and a content, both strings");
 		const path = normalizePath(file.path);
+		if (file.encoding !== undefined && file.encoding !== null && file.encoding !== "utf8" && file.encoding !== "base64") {
+			throw new PageError(400, `File "${path}" has encoding ${JSON.stringify(file.encoding)}; use "utf8" (the default) or "base64"`);
+		}
 		if (file.encoding === "base64") {
 			try {
 				return { path, body: fromBase64(file.content) };
@@ -89,10 +92,14 @@ export function hasFiles(content: Content): boolean {
 	return given(content.files) || given(content.zip);
 }
 
-/** Turns content into the page's files, or throws. `title` names a Markdown page. */
-export function decodeContent(content: Content, title?: string | null): PageFile[] {
+/**
+ * Turns content into the files of a page of `kind`, or throws. `title` names
+ * a Markdown page. `options` are the option names of the mockup set being
+ * replaced, if there is one (see `unzipFiles`).
+ */
+export function decodeContent(content: Content, title?: string | null, kind: PageKind = "page", options: string[] = []): PageFile[] {
 	if ([content.files, content.html, content.markdown, content.zip].filter(given).length !== 1) throw new PageError(400, "Give exactly one of files, html or markdown (or a zip)");
-	if (content.zip) return unzipFiles(content.zip);
+	if (content.zip) return unzipFiles(content.zip, kind, options);
 	if (given(content.html)) {
 		if (typeof content.html !== "string") throw new PageError(400, "html must be a string");
 		return [{ path: "index.html", body: new TextEncoder().encode(content.html) }];
@@ -119,6 +126,13 @@ interface ZipEntry {
 
 class InvalidZip extends Error {}
 
+/**
+ * The most entries a zip's directory may list, skipped ones (folders, junk)
+ * included. Far above any real page, and low enough that a directory of
+ * millions of tiny entries is refused before it costs memory.
+ */
+const MAX_ZIP_ENTRIES = 5_000;
+
 function u16(bytes: Uint8Array, at: number): number {
 	return bytes[at]! | (bytes[at + 1]! << 8);
 }
@@ -131,8 +145,13 @@ function u64(bytes: Uint8Array, at: number): number {
 	return u32(bytes, at) + u32(bytes, at + 4) * 2 ** 32;
 }
 
-/** Reads a zip's central directory (zip64 included), where every entry's name and sizes are, whatever its local headers say. */
-function zipEntries(zip: Uint8Array): ZipEntry[] {
+/**
+ * Reads a zip's central directory (zip64 included), where every entry's name
+ * and sizes are, whatever its local headers say. `keep` sees each entry as
+ * it's read and may throw to stop there, so limits hold before the rest of
+ * the directory is read; only kept entries are held.
+ */
+function zipEntries(zip: Uint8Array, keep: (entry: ZipEntry) => boolean): ZipEntry[] {
 	// The end record is 22 bytes, followed by a comment of up to 65535.
 	const stop = Math.max(0, zip.length - 22 - 0xffff);
 	let end = zip.length - 22;
@@ -148,6 +167,7 @@ function zipEntries(zip: Uint8Array): ZipEntry[] {
 		count = u64(zip, record + 32);
 		at = u64(zip, record + 48);
 	}
+	if (count > MAX_ZIP_ENTRIES) throw new PageError(413, `Zip lists more than ${MAX_ZIP_ENTRIES} entries`);
 	const entries: ZipEntry[] = [];
 	for (let i = 0; i < count; i++) {
 		if (at + 46 > zip.length || u32(zip, at) !== 0x02014b50) throw new InvalidZip();
@@ -168,7 +188,8 @@ function zipEntries(zip: Uint8Array): ZipEntry[] {
 			if (compressedSize === 0xffffffff) (compressedSize = u64(zip, value)), (value += 8);
 			if (headerOffset === 0xffffffff) headerOffset = u64(zip, value);
 		}
-		entries.push({ name, flags, method: u16(zip, at + 10), compressedSize, size, headerOffset });
+		const entry = { name, flags, method: u16(zip, at + 10), compressedSize, size, headerOffset };
+		if (keep(entry)) entries.push(entry);
 		at = extraEnd + u16(zip, at + 32);
 	}
 	return entries;
@@ -197,14 +218,19 @@ function entryData(zip: Uint8Array, entry: ZipEntry): Uint8Array {
  * is inflated, so a zip bomb is rejected without being expanded; then entries
  * are unpacked one at a time, and stored ones aren't copied at all. When every
  * file sits under one top-level folder and there's no root index.html (what
- * `zip -r site.zip site/` produces), that folder is stripped.
+ * `zip -r site.zip site/` produces), that folder is stripped. For a mockup
+ * set, a folder that is itself an option is kept: one with its own
+ * index.html and no option folders inside it (`site/a/index.html` makes it a
+ * wrapper). An option can have sub-pages, so when a zip replaces an existing
+ * set, a folder named after one of its `options` (the ones that have a
+ * folder) is kept, unless one of the folders inside it is an option too.
  */
-export function unzipFiles(zip: Uint8Array): PageFile[] {
+export function unzipFiles(zip: Uint8Array, kind: PageKind = "page", options: string[] = []): PageFile[] {
 	let declaredBytes = 0;
 	let declaredFiles = 0;
 	let entries = new Map<string, Uint8Array>();
 	try {
-		const wanted = zipEntries(zip).filter((entry) => {
+		const wanted = zipEntries(zip, (entry) => {
 			if (entry.name.endsWith("/") || JUNK.test(entry.name)) return false;
 			declaredBytes += entry.size;
 			declaredFiles += 1;
@@ -220,8 +246,14 @@ export function unzipFiles(zip: Uint8Array): PageFile[] {
 
 	let names = [...entries.keys()];
 	const roots = new Set(names.map((name) => name.split("/")[0]));
-	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/"))) {
-		const prefix = `${[...roots][0]}/`;
+	const prefix = `${[...roots][0]}/`;
+	// The folders inside it that would be options if it were a wrapper.
+	const inner = names.flatMap((name) => /^([^/]+)\/index\.html$/.exec(name.slice(prefix.length))?.[1] ?? []);
+	const isOption =
+		kind === "mockup" &&
+		names.includes(`${prefix}index.html`) &&
+		(inner.length === 0 || (options.includes(prefix.slice(0, -1)) && !inner.some((name) => options.includes(name))));
+	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/")) && !isOption) {
 		entries = new Map(names.map((name) => [name.slice(prefix.length), entries.get(name)!]));
 		names = [...entries.keys()];
 	}

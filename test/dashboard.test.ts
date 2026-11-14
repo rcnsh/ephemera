@@ -211,10 +211,10 @@ describe("dashboard", () => {
 describe("renaming through the API", () => {
 	it("takes a label in PATCH, with or without a ttl", async () => {
 		const page = await publish({ ttl: "1h" });
-		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "x" }) })).json()) as { label: string; expiresAt: number };
+		const renamed = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "x" }) })).json()) as { label: string; expiresAt: string };
 		expect(renamed).toMatchObject({ label: "x", expiresAt: page.expiresAt });
-		const both = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "y", ttl: "1h" }) })).json()) as { label: string; expiresAt: number };
+		const both = (await (await api(`/pages/${page.id}`, { method: "PATCH", body: JSON.stringify({ label: "y", ttl: "1h" }) })).json()) as { label: string; expiresAt: string };
 		expect(both.label).toBe("y");
-		expect(both.expiresAt).toBe(page.expiresAt! + 3_600_000);
+		expect(Date.parse(both.expiresAt)).toBe(Date.parse(page.expiresAt!) + 3_600_000);
 	});
 });

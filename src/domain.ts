@@ -37,7 +37,7 @@ export type Ttl = number | "permanent";
 const UNITS: Record<string, number> = { s: 1000, m: MINUTE, h: HOUR, d: DAY };
 
 /** Whether an agent left the ttl out. */
-export function ttlOmitted(input: string | number | undefined | null): input is undefined | null | "" {
+export function ttlOmitted(input: unknown): input is undefined | null | "" {
 	return input === undefined || input === null || input === "";
 }
 
@@ -45,8 +45,9 @@ export function ttlOmitted(input: string | number | undefined | null): input is 
  * Parses a TTL as given by an agent: "permanent", a duration like "30m", "2h"
  * or "7d", or a bare number of seconds. Omitted means permanent.
  */
-export function parseTtl(input: string | number | undefined | null): Ttl {
+export function parseTtl(input: unknown): Ttl {
 	if (ttlOmitted(input) || input === "permanent") return "permanent";
+	if (typeof input !== "string" && typeof input !== "number") throw new PageError(400, 'ttl must be a string like "2h" or "permanent", or a number of seconds');
 	let ms: number;
 	if (typeof input === "number") {
 		ms = input * 1000;
@@ -85,4 +86,11 @@ export function durationText(ms: number): string {
 		if (ms >= size && ms % size === 0) return `${ms / size} ${unit}${ms === size ? "" : "s"}`;
 	}
 	return `${Math.round(ms / 1000)} seconds`;
+}
+
+/** A time as agents see it: ISO 8601 in UTC, which models read reliably where epoch milliseconds get misread. Null stays null. */
+export function isoTime(ms: number): string;
+export function isoTime(ms: number | null): string | null;
+export function isoTime(ms: number | null): string | null {
+	return ms === null ? null : new Date(ms).toISOString();
 }

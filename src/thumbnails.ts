@@ -1,4 +1,5 @@
 import puppeteer, { TimeoutError } from "@cloudflare/puppeteer";
+import { redact } from "./logging.ts";
 
 type Browser = Awaited<ReturnType<typeof puppeteer.launch>>;
 type BrowserBinding = Parameters<typeof puppeteer.launch>[0];
@@ -58,7 +59,7 @@ export async function screenshots(browserBinding: BrowserBinding, shots: Shot[])
 				tab = await browser.newPage();
 				results.push(shot.kind === "page" ? await pageShot(tab, shot.url) : await optionShot(tab, shot.url));
 			} catch (error) {
-				console.warn(`thumbnail of ${shot.url} failed: ${error}`);
+				console.warn(redact(`thumbnail of ${shot.url} failed: ${error}`));
 				// A browser that dropped mid-batch says nothing about this page.
 				results.push(browser.connected ? "failed" : null);
 			} finally {
