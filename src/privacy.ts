@@ -114,7 +114,8 @@ ${password}
 
 /** POST /<id>/_unlock: checks the password and redirects behind a fresh pass. */
 export async function unlock(request: Request, env: Env, pages: Pages, id: string): Promise<Response> {
-	const found = await pages.lookup(id);
+	// Fresh, not memoized: a password changed or removed a moment ago through another isolate must stop working at once.
+	const found = await pages.lookup(id, { fresh: true });
 	if (found.state !== "live") return new Response("Not found\n", { status: found.state === "gone" ? 410 : 404 });
 	const page = found.page;
 	const form = await request.formData().catch(() => new FormData());

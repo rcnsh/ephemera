@@ -252,12 +252,12 @@ export class Pages {
 	/**
 	 * Whether a page is live, gone or missing, for serving it. The row may come
 	 * from `lookupMemo` (see there for how stale it can be); writes go through
-	 * `get`, which always reads D1.
+	 * `get`, which always reads D1, and so does `fresh`.
 	 */
-	async lookup(id: string): Promise<Lookup> {
+	async lookup(id: string, { fresh = false }: { fresh?: boolean } = {}): Promise<Lookup> {
 		if (!ID_PATTERN.test(id)) return { state: "missing" };
 		const now = this.now();
-		const memo = lookupMemo.get(id);
+		const memo = fresh ? undefined : lookupMemo.get(id);
 		if (memo && now - memo.at >= 0 && now - memo.at < LOOKUP_MEMO_MS) return this.state(memo.row, now);
 		return this.state(await this.readRow(id), now);
 	}

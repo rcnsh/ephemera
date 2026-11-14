@@ -330,66 +330,109 @@ function placeholder(maxAge: number): Response {
 	return new Response(PLACEHOLDER, { headers: { "content-type": "image/svg+xml", "cache-control": cacheControl } });
 }
 
-/**
- * Thumbnails asked for within `BATCH_WINDOW` of each other (a dashboard
- * load's worth) are shot in one browser, up to `BATCH_SIZE` at a time, and
- * this isolate starts a browser at most once per `LAUNCH_GAP`: Browser Run
- * allows 3 launches a second per account, and a launch per thumbnail would
- * fail most of them.
+/*
+ * Making missing thumbnails. A dashboard load asks for each one in a request
+ * of its own, and Browser Run allows only 3 browser launches a second, so the
+ * requests of a load share browsers: one request (the owner) shoots up to
+ * `BATCH_SIZE` queued thumbnails in one browser while the others wait.
+ *
+ * No request ever waits on a promise another request resolves: the runtime
+ * cancels a request whose own context has nothing pending, as hung. So what
+ * requests share is plain data (the queue, the outcomes, the lease), and each
+ * waits in its own context on its own timer. Nothing shared is cleared by
+ * whoever set it, either: the owner holds a lease it renews on a timer, and
+ * every taken job carries the same deadline, so if the owner's request is
+ * cancelled (its client went away; `waitUntil` would only give it 30 more
+ * seconds, short of a batch) its timer stops, the lease lapses within
+ * `LEASE`, and a waiting request takes over the jobs that are left.
  */
-const BATCH_WINDOW = 100;
+const BATCH_WINDOW = 150;
 const BATCH_SIZE = 10;
+/** This isolate starts a browser at most this often: Browser Run allows 3 launches a second per account. */
 const LAUNCH_GAP = 400;
+const LEASE = 3_000;
+const HEARTBEAT = 1_000;
+/** How long a request waits for its thumbnail before answering with a blank tile (not remembered, so the next load asks again). */
+const WAIT = 60_000;
+const POLL = 200;
+/** How long a finished shot is kept for the requests waiting on it. */
+const OUTCOME_LIFE = 60_000;
 
 interface Job {
 	page: Page;
 	option: string | undefined;
-	/** Undefined when the set has no such option. */
-	resolve: (result: ShotResult | undefined) => void;
+	queuedAt: number;
+	/** While an owner is shooting it; 0 when free. */
+	takenUntil: number;
 }
 
-/** The batch still taking jobs, if any. */
-let gathering: Job[] | null = null;
+/** What became of a shot: a PNG, "failed", null when no browser could be had, undefined when the set has no such option. */
+type Outcome = ShotResult | undefined;
+
+const jobs = new Map<string, Job>();
+const outcomes = new Map<string, { outcome: Outcome; at: number }>();
+let lease = { owner: 0, until: 0 };
+let owners = 0;
 let nextLaunch = 0;
-/** Thumbnails being made, by page, version and option, so asking twice shares one shot. */
-const making = new Map<string, Promise<ShotResult | undefined>>();
 
-/**
- * Makes a thumbnail of `page` (or of one of its options), in the batch
- * that's gathering or a new one. When this call starts the batch, `batch`
- * is its whole run: the browser's work belongs to this request, so the
- * caller must wait for all of it before answering, and it's kept alive past
- * a client that goes away, since other requests are waiting on it.
- */
-function make(env: Env, ctx: ExecutionContext, pages: Pages, page: Page, option: string | undefined): { result: Promise<ShotResult | undefined>; batch?: Promise<void> } {
-	const key = JSON.stringify([page.id, page.version, option ?? null]);
-	const shared = making.get(key);
-	if (shared) return { result: shared };
-	let batch: Promise<void> | undefined;
-	const result = new Promise<ShotResult | undefined>((resolve) => {
-		if (!gathering || gathering.length >= BATCH_SIZE) {
-			const jobs: Job[] = [];
-			gathering = jobs;
-			batch = shoot(env, pages, jobs);
-			ctx.waitUntil(batch);
-		}
-		gathering.push({ page, option, resolve });
-	}).finally(() => making.delete(key));
-	making.set(key, result);
-	return { result, batch };
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Waits for the batch to gather, then shoots it in one browser, keeping each thumbnail (or its failure) as it comes. */
-async function shoot(env: Env, pages: Pages, jobs: Job[]): Promise<void> {
-	const wait = Math.max(BATCH_WINDOW, nextLaunch - Date.now());
-	nextLaunch = Date.now() + wait + LAUNCH_GAP;
-	await new Promise((resolve) => setTimeout(resolve, wait));
-	if (gathering === jobs) gathering = null;
+function forgetOld(now: number): void {
+	for (const [key, { at }] of outcomes) if (now - at > OUTCOME_LIFE) outcomes.delete(key);
+	for (const [key, job] of jobs) if (job.takenUntil <= now && now - job.queuedAt > WAIT) jobs.delete(key);
+}
+
+/** Queues a thumbnail of `page` (or of one of its options) and waits for it, shooting the queue itself when nobody else is. "timeout" if it took too long. */
+async function waitForShot(env: Env, pages: Pages, page: Page, option: string | undefined): Promise<Outcome | "timeout"> {
+	const key = JSON.stringify([page.id, page.version, option ?? null]);
+	const deadline = Date.now() + WAIT;
+	forgetOld(Date.now());
+	// A browser that couldn't be had earlier may be had now; anything else that finished is what's kept.
+	if (outcomes.get(key)?.outcome === null) outcomes.delete(key);
+	if (!outcomes.has(key) && !jobs.has(key)) jobs.set(key, { page, option, queuedAt: Date.now(), takenUntil: 0 });
+	while (Date.now() < deadline) {
+		const done = outcomes.get(key);
+		if (done) return done.outcome;
+		const now = Date.now();
+		if (lease.until <= now && [...jobs.values()].some((job) => job.takenUntil <= now)) await shoot(env, pages);
+		else await sleep(POLL);
+	}
+	return "timeout";
+}
+
+/** Takes the lease and shoots up to `BATCH_SIZE` free jobs in one browser, keeping each shot (or its failure) in R2 as it comes. */
+async function shoot(env: Env, pages: Pages): Promise<void> {
+	const owner = ++owners;
+	const ours = () => lease.owner === owner;
+	lease = { owner, until: Date.now() + LEASE };
+	const taken: [string, Job][] = [];
+	const renew = () => {
+		if (!ours()) return;
+		lease.until = Date.now() + LEASE;
+		for (const [, job] of taken) job.takenUntil = lease.until;
+	};
+	const heartbeat = setInterval(renew, HEARTBEAT);
+	const finish = (key: string, outcome: Outcome) => {
+		outcomes.set(key, { outcome, at: Date.now() });
+		jobs.delete(key);
+	};
 	try {
+		// Let the rest of the dashboard's requests queue, and keep to the launch rate.
+		await sleep(Math.max(BATCH_WINDOW, nextLaunch - Date.now()));
+		if (!ours()) return;
+		nextLaunch = Date.now() + LAUNCH_GAP;
+		const now = Date.now();
+		for (const entry of jobs) {
+			if (taken.length === BATCH_SIZE) break;
+			if (entry[1].takenUntil <= now) taken.push(entry);
+		}
+		renew();
 		// An option's URL needs its path, read once per set.
 		const sets = new Map<string, Promise<MockupOption[]>>();
 		const planned = await Promise.all(
-			jobs.map(async (job): Promise<Shot | undefined> => {
+			taken.map(async ([, job]): Promise<Shot | undefined> => {
 				const url = await viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, job.page, Date.now(), { ttl: THUMBNAIL_PASS });
 				if (job.option === undefined) return { url, kind: "page" };
 				let options = sets.get(job.page.id);
@@ -398,28 +441,31 @@ async function shoot(env: Env, pages: Pages, jobs: Job[]): Promise<void> {
 				return found && { url: `${url}${found.path}`, kind: "option" };
 			}),
 		);
-		const wanted = jobs.flatMap((job, i) => (planned[i] ? [{ job, shot: planned[i] }] : []));
-		for (const [i, job] of jobs.entries()) if (!planned[i]) job.resolve(undefined);
+		const wanted = taken.flatMap(([key, job], i) => (planned[i] ? [{ key, job, shot: planned[i] }] : (finish(key, undefined), [])));
 		if (!wanted.length) return;
+		const keep = async (i: number, result: ShotResult) => {
+			const { key, job } = wanted[i]!;
+			if (!jobs.has(key)) return;
+			try {
+				if (result instanceof Uint8Array) await pages.files.saveThumbnail(job.page, result, job.option);
+				else if (result === "failed") await pages.files.saveThumbnailFailure(job.page, Date.now(), job.option);
+			} catch (error) {
+				console.warn(`keeping the thumbnail of ${job.page.id} failed: ${error}`);
+			}
+			finish(key, result);
+		};
 		const results = await screenshots(
 			env.BROWSER,
 			wanted.map(({ shot }) => shot),
+			keep,
 		);
-		await Promise.all(
-			wanted.map(async ({ job }, i) => {
-				const result = results[i] ?? null;
-				try {
-					if (result instanceof Uint8Array) await pages.files.saveThumbnail(job.page, result, job.option);
-					else if (result === "failed") await pages.files.saveThumbnailFailure(job.page, Date.now(), job.option);
-				} catch (error) {
-					console.warn(`keeping the thumbnail of ${job.page.id} failed: ${error}`);
-				}
-				job.resolve(result);
-			}),
-		);
+		// Any the browser didn't report one by one.
+		for (const [i, result] of results.entries()) await keep(i, result);
 	} finally {
-		// Whatever went wrong, nobody waits forever; resolving twice changes nothing.
-		for (const job of jobs) job.resolve(null);
+		clearInterval(heartbeat);
+		// Jobs left over (something threw) go back to the queue at once.
+		for (const [key, job] of taken) if (jobs.get(key) === job) job.takenUntil = 0;
+		if (ours()) lease = { owner: 0, until: 0 };
 	}
 }
 
@@ -427,9 +473,9 @@ async function shoot(env: Env, pages: Pages, jobs: Job[]): Promise<void> {
  * GET /thumbnails/<id>.png, and /thumbnails/<id>/<option>.png for an option
  * of a mockup set: the screenshot kept for the version being served, made on
  * first request. A failure is remembered for `FAILURE_MEMORY`; when no
- * browser could be had, the next load tries again.
+ * browser could be had, or the shot took too long, the next load tries again.
  */
-async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: string, option?: string): Promise<Response> {
+async function thumbnail(env: Env, pages: Pages, id: string, option?: string): Promise<Response> {
 	const found = await pages.lookup(id);
 	if (found.state !== "live" || (option !== undefined && found.page.kind !== "mockup")) return new Response("Not found", { status: 404 });
 	const page = found.page;
@@ -439,9 +485,7 @@ async function thumbnail(env: Env, ctx: ExecutionContext, pages: Pages, id: stri
 	const remembered = kept ? kept.failedAt + FAILURE_MEMORY - Date.now() : 0;
 	if (remembered > 0) return placeholder(remembered);
 
-	const { result, batch } = make(env, ctx, pages, page, option);
-	const made = await result;
-	await batch;
+	const made = await waitForShot(env, pages, page, option);
 	if (made === undefined) return new Response("Not found", { status: 404 });
 	if (made instanceof Uint8Array) return new Response(made, { headers });
 	return placeholder(made === "failed" ? FAILURE_MEMORY : 0);
@@ -466,7 +510,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 	}
 
 	const thumb = new RegExp(`^/thumbnails/(${ID_SOURCE})\\.png$`).exec(url.pathname);
-	if (request.method === "GET" && thumb) return thumbnail(env, ctx, pages, thumb[1]!);
+	if (request.method === "GET" && thumb) return thumbnail(env, pages, thumb[1]!);
 	const optionThumb = new RegExp(`^/thumbnails/(${ID_SOURCE})/([^/]+)\\.png$`).exec(url.pathname);
 	if (request.method === "GET" && optionThumb) {
 		let option: string;
@@ -475,7 +519,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		} catch {
 			return new Response("Not found", { status: 404 });
 		}
-		return thumbnail(env, ctx, pages, optionThumb[1]!, option);
+		return thumbnail(env, pages, optionThumb[1]!, option);
 	}
 
 	// Signing in to a private page: Access has checked who this is, so hand out a pass.

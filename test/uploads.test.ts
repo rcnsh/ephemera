@@ -97,6 +97,23 @@ describe("unpacking zips", () => {
 		expect(status(() => unzipFiles(many))).toBe(413);
 	});
 
+	it("refuses a directory of far more entries than any page, junk and folders included, before reading it", () => {
+		// 20,000 entries the reader would skip (macOS resource forks): only their number says no.
+		const huge = zipSync(Object.fromEntries(Array.from({ length: 20_000 }, (_, i) => [`__MACOSX/._${i}`, new Uint8Array(0)])));
+		expect(status(() => unzipFiles(huge))).toBe(413);
+	});
+
+	it("stops reading the directory at the first file over the limit", () => {
+		const files = LIMITS.pageFiles + 100;
+		const upload = zipSync(Object.fromEntries(Array.from({ length: files }, (_, i) => [`f${i}.txt`, strToU8("x")])));
+		// Wreck the directory just past the limit: a reader that went on would call it invalid (400), not too big (413).
+		const entries: number[] = [];
+		for (let at = 0; at + 4 <= upload.length; at++) if (upload[at] === 0x50 && upload[at + 1] === 0x4b && upload[at + 2] === 1 && upload[at + 3] === 2) entries.push(at);
+		expect(entries).toHaveLength(files);
+		upload.fill(0xff, entries[LIMITS.pageFiles + 1]!, entries[LIMITS.pageFiles + 50]!);
+		expect(status(() => unzipFiles(upload))).toBe(413);
+	});
+
 	it("calls anything else not a valid zip", () => {
 		const good = zipSync({ "index.html": strToU8("<h1>hi</h1>".repeat(20)) });
 		const cases = [new Uint8Array(0), strToU8("not a zip at all"), good.subarray(0, good.length - 30), good.subarray(20)];

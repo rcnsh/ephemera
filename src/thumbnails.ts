@@ -40,10 +40,11 @@ async function load(tab: Tab, url: string): Promise<void> {
 
 /**
  * Makes each of `shots` in one browser launch, one after another, and says
- * how each went. Browser Run allows a few launches a second per account, so
- * a dashboard full of missing thumbnails must share browsers, not start one each.
+ * how each went, to `onShot` as each is done and all together at the end.
+ * Browser Run allows a few launches a second per account, so a dashboard
+ * full of missing thumbnails must share browsers, not start one each.
  */
-export async function screenshots(browserBinding: BrowserBinding, shots: Shot[]): Promise<ShotResult[]> {
+export async function screenshots(browserBinding: BrowserBinding, shots: Shot[], onShot?: (index: number, result: ShotResult) => Promise<void>): Promise<ShotResult[]> {
 	let browser: Browser;
 	try {
 		browser = await puppeteer.launch(browserBinding);
@@ -65,6 +66,7 @@ export async function screenshots(browserBinding: BrowserBinding, shots: Shot[])
 			} finally {
 				await tab?.close().catch(() => {});
 			}
+			await onShot?.(results.length - 1, results.at(-1)!);
 		}
 		return results;
 	} finally {
