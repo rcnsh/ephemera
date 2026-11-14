@@ -1,5 +1,5 @@
 import { handleApi, handleUpload } from "./api.ts";
-import { checkUploadToken, checkViewPass, hasToken, PASS_PATTERN } from "./auth.ts";
+import { checkUploadToken, hasToken } from "./auth.ts";
 import { cat, rootPage } from "./cat.ts";
 import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
@@ -10,7 +10,7 @@ import { handleMcp } from "./mcp.ts";
 import { mockupIndex } from "./mockups.ts";
 import { Operations } from "./operations.ts";
 import { ID_PATTERN, ID_SOURCE, Pages } from "./pages.ts";
-import { gate, unlock } from "./privacy.ts";
+import { access, gate, unlock } from "./privacy.ts";
 
 /**
  * Every response from the pages host goes out with these. Agent-written HTML
@@ -79,23 +79,10 @@ async function servePageTimed(request: Request, env: Env, pages: Pages, id: stri
 	const page = found.page;
 	const url = new URL(request.url);
 
-	// A private page needs a pass as its first path segment: /<id>/~<pass>/<rest>.
-	let pass: string | null = null;
-	let rest = subpath;
-	const [first = "", ...after] = subpath.split("/");
-	if (PASS_PATTERN.test(first)) {
-		// A pass on a page that has since been made public: drop it.
-		if (page.visibility === "public") return new Response(null, { status: 301, headers: { location: `/${id}/${after.join("/")}${url.search}` } });
-		if (!(await checkViewPass(env.EPHEMERA_TOKEN, id, page.shareEpoch, first))) {
-			return gate(env, page, after.join("/"), "This link has expired or been revoked.");
-		}
-		if (after.length === 0) return new Response(null, { status: 301, headers: { location: `/${id}/${first}/${url.search}` } });
-		pass = first;
-		rest = after.join("/");
-	} else if (page.visibility === "private") {
-		return gate(env, page, subpath);
-	}
-	const base = pass ? `/${id}/${pass}` : `/${id}`;
+	const decided = await access(env.EPHEMERA_TOKEN, page, subpath, url.search, Date.now());
+	if (decided.kind === "redirect") return new Response(null, { status: 301, headers: { location: decided.location } });
+	if (decided.kind === "gate") return gate(env, page, decided.rest, decided.message);
+	const { rest, base, pass } = decided;
 
 	let path: string;
 	try {

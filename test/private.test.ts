@@ -143,6 +143,8 @@ describe("private pages", () => {
 		const page = await publish({ password: "correct horse" });
 		const made = (await (await post(`/pages/${page.id}/visibility`, { visibility: "public" })).json()) as { hasPassword: boolean };
 		expect(made.hasPassword).toBe(false);
-		expect((await unlock(page.id, "correct horse")).status).toBe(303);
+		const unlocked = await unlock(page.id, "correct horse", "docs/");
+		expect(unlocked.status).toBe(303);
+		expect(unlocked.headers.get("location")).toBe(`${page.url}docs/`);
 	});
 });

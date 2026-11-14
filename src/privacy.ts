@@ -1,33 +1,66 @@
-import { checkPassword, viewPass } from "./auth.ts";
-import { LIMITS } from "./domain.ts";
+import { checkPassword, checkViewPass, PASS_PATTERN, viewPass } from "./auth.ts";
+import { LIMITS, pageUrl } from "./domain.ts";
 import { FAVICON_LINK } from "./logo.ts";
 import type { Page, Pages } from "./pages.ts";
 
 /**
- * Private pages. Without a pass in its path a private page answers with a
- * gate: a link to sign in through Access on the dashboard host, and a
- * password form if the page has a password. Both hand out a pass and
- * redirect to `/<id>/~<pass>/`.
+ * Who may see a page, and through which URL. Public pages are served to
+ * anyone at `/<id>/`. A private page needs a pass as its first path segment,
+ * `/<id>/~<pass>/`; without one it answers with a gate: a link to sign in
+ * through Access on the dashboard host, and a password form if the page has a
+ * password. Both hand out a pass and redirect behind it.
+ *
+ * `access` decides how to answer a request for a page; `viewerUrl` hands out
+ * a URL to open one. Nothing else needs to know what a pass looks like.
  */
+
+/** How to answer a request for a path of a live page. */
+export type Access =
+	/** Serve `rest` (the path inside the page). Relative links resolve under `base`, which carries `pass`. */
+	| { kind: "serve"; rest: string; base: string; pass: string | null }
+	| { kind: "redirect"; location: string }
+	/** Answer with `gate(env, page, rest, message)`. */
+	| { kind: "gate"; rest: string; message?: string };
+
+/**
+ * How to answer a request for `subpath` (the path after `/<id>/`, with
+ * `search` its query string) of `page` at time `now`.
+ */
+export async function access(secret: string, page: Page, subpath: string, search: string, now: number): Promise<Access> {
+	const [first = "", ...after] = subpath.split("/");
+	if (PASS_PATTERN.test(first)) {
+		const rest = after.join("/");
+		// A pass on a page that has since been made public: drop it.
+		if (page.visibility === "public") return { kind: "redirect", location: `/${page.id}/${safeRest(rest)}${search}` };
+		if (!(await checkViewPass(secret, page.id, page.shareEpoch, first, now))) return { kind: "gate", rest, message: "This link has expired or been revoked." };
+		// Without the slash after the pass, relative links would drop it.
+		if (after.length === 0) return { kind: "redirect", location: `/${page.id}/${first}/${search}` };
+		return { kind: "serve", rest, base: `/${page.id}/${first}`, pass: first };
+	}
+	if (page.visibility === "private") return { kind: "gate", rest: subpath };
+	return { kind: "serve", rest: subpath, base: `/${page.id}`, pass: null };
+}
+
+/**
+ * A URL that opens `page` at path `rest` inside it: the plain URL of a public
+ * page, or a private page's behind a fresh pass that lasts `ttl` from `now`
+ * (by default as long as signing in does). A `rest` that could leave the page
+ * is dropped. Without a `rest` it ends in "/", so a relative path can follow.
+ */
+export async function viewerUrl(secret: string, host: string, page: Page, now: number, { rest = "", ttl = LIMITS.passTtl }: { rest?: string; ttl?: number } = {}): Promise<string> {
+	if (page.visibility === "public") return `${pageUrl(host, page.id)}${safeRest(rest)}`;
+	const pass = await viewPass(secret, page.id, page.shareEpoch, now + ttl);
+	return `${pageUrl(host, page.id)}${pass}/${safeRest(rest)}`;
+}
 
 function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
 /** Keeps a path that gets passed along inside the page. */
-export function safeRest(rest: string): string {
+function safeRest(rest: string): string {
 	const clean = rest.replace(/^\/+/, "");
 	return clean.split("/").some((segment) => segment === ".." || segment === ".") || clean.includes("\\") ? "" : clean;
-}
-
-/** The URL of a private page (or a path in it) behind `pass`. */
-export function passUrl(host: string, id: string, pass: string, rest = ""): string {
-	return `https://${host}/${id}/${pass}/${safeRest(rest)}`;
-}
-
-/** Mints a pass for `page`, valid for `ttl` (the default for people signing in). */
-export function passFor(secret: string, page: Page, now: number, ttl: number = LIMITS.passTtl): Promise<string> {
-	return viewPass(secret, page.id, page.shareEpoch, now + ttl);
 }
 
 export function gate(env: Env, page: Page, rest: string, message = "", status = 401): Response {
@@ -74,10 +107,11 @@ export async function unlock(request: Request, env: Env, pages: Pages, id: strin
 	const page = found.page;
 	const form = await request.formData().catch(() => new FormData());
 	const next = String(form.get("next") ?? "");
-	if (page.visibility !== "private") return Response.redirect(`https://${env.PAGES_HOST}/${id}/${safeRest(next)}`, 303);
+	const open = () => viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { rest: next });
+	if (page.visibility !== "private") return Response.redirect(await open(), 303);
 	const password = String(form.get("password") ?? "");
 	if (!page.passwordHash || !password || !(await checkPassword(password, page.passwordHash))) {
 		return gate(env, page, next, "Wrong password");
 	}
-	return Response.redirect(passUrl(env.PAGES_HOST, id, await passFor(env.EPHEMERA_TOKEN, page, Date.now()), next), 303);
+	return Response.redirect(await open(), 303);
 }
