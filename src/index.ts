@@ -105,7 +105,7 @@ async function servePageTimed(request: Request, env: Env, pages: Pages, id: stri
 		return text("Not found\n", 404);
 	}
 
-	const file = await timings.time("file", pages.serveFile(page, path, request.headers.get("if-none-match")), (served) => (served ? (served.cached ? "hit" : "miss") : null));
+	const file = await timings.time("file", pages.files.serve(page, path, request.headers.get("if-none-match")), (served) => (served ? (served.cached ? "hit" : "miss") : null));
 	const cacheControl = pass ? "private, no-cache, no-transform" : "no-cache, no-transform";
 	if (!file && path === "index.html" && page.kind === "mockup") {
 		// A mockup set without its own index shows its options side by side.
@@ -114,7 +114,7 @@ async function servePageTimed(request: Request, env: Env, pages: Pages, id: stri
 		const headers = { "content-type": "text/html; charset=utf-8", "cache-control": cacheControl };
 		return gzip(request, new Response(request.method === "HEAD" ? null : html, { headers }));
 	}
-	if (!file && !rest.endsWith("/") && rest !== "" && (await pages.hasFile(page, `${path}/index.html`))) {
+	if (!file && !rest.endsWith("/") && rest !== "" && (await pages.files.exists(page, `${path}/index.html`))) {
 		// A folder without its trailing slash: redirect so relative links inside it resolve.
 		return new Response(null, { status: 301, headers: { location: `${base}/${rest}/${url.search}` } });
 	}

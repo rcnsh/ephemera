@@ -104,16 +104,16 @@ describe("page lifecycle", () => {
 	it("normalizes paths itself, whoever calls it", async () => {
 		const { pages } = store();
 		const page = await pages.publish({ files: [file("./index.html"), file("/css/a.css")], ttl: HOUR });
-		expect(await pages.hasFile(page, "index.html")).toBe(true);
-		expect(await pages.hasFile(page, "css/a.css")).toBe(true);
+		expect(await pages.files.exists(page, "index.html")).toBe(true);
+		expect(await pages.files.exists(page, "css/a.css")).toBe(true);
 		expect(await status(pages.publish({ files: [file("index.html"), file("../x")], ttl: HOUR }))).toBe(400);
 	});
 });
 
 describe("versions", () => {
 	async function text(pages: Pages, id: string): Promise<string> {
-		const object = (await pages.file(await pages.get(id), "index.html")) as R2ObjectBody;
-		return object.text();
+		const served = await pages.files.serve(await pages.get(id), "index.html");
+		return new Response(served!.body).text();
 	}
 
 	it("lets one of two updates at once win, without the other touching its files", async () => {
