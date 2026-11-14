@@ -1,4 +1,5 @@
 import puppeteer from "@cloudflare/puppeteer";
+import { redact } from "./logging.ts";
 
 type Browser = Awaited<ReturnType<typeof puppeteer.launch>>;
 type BrowserBinding = Parameters<typeof puppeteer.launch>[0];
@@ -16,7 +17,7 @@ export async function screenshot(browserBinding: BrowserBinding, url: string): P
 		await tab.goto(url, { waitUntil: "networkidle0", timeout: 15_000 });
 		return new Uint8Array(await tab.screenshot({ type: "png" }));
 	} catch (error) {
-		console.warn(`thumbnail of ${url} failed: ${error}`);
+		console.warn(redact(`thumbnail of ${url} failed: ${error}`));
 		return null;
 	} finally {
 		await browser?.close().catch(() => {});
@@ -93,13 +94,13 @@ export async function screenshotOptions(browserBinding: BrowserBinding, urls: st
 				shots.push(new Uint8Array(await tab.screenshot({ type: "png", clip: { ...box, height, scale } })));
 				await tab.close();
 			} catch (error) {
-				console.warn(`thumbnail of ${url} failed: ${error}`);
+				console.warn(redact(`thumbnail of ${url} failed: ${error}`));
 				shots.push(null);
 			}
 		}
 		return shots;
 	} catch (error) {
-		console.warn(`thumbnails of ${urls.join(", ")} failed: ${error}`);
+		console.warn(redact(`thumbnails of ${urls.join(", ")} failed: ${error}`));
 		return urls.map(() => null);
 	} finally {
 		await browser?.close().catch(() => {});

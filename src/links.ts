@@ -44,7 +44,45 @@ export function rewriteLinks(response: Response, id: string, pass: string | null
 			);
 		},
 	});
+	if (pass) keepNoReferrer(rewriter);
 	return rewriter.transform(response);
+}
+
+/**
+ * Removes what lets a document loosen the `Referrer-Policy: no-referrer` it's
+ * served with, so the pass in its URL doesn't reach other sites in Referer: a
+ * `<meta name="referrer">` (the last one parsed replaces the header's policy),
+ * `referrerpolicy` on any element, and either of those inside an iframe's
+ * `srcdoc` (whose requests send the parent's URL). Script can still choose a
+ * policy itself (`fetch`'s `referrerPolicy`, or adding these elements), and
+ * no CSP directive can forbid that.
+ */
+function keepNoReferrer(rewriter: HTMLRewriter): HTMLRewriter {
+	return rewriter
+		.on('meta[name="referrer" i]', { element: (element) => void element.remove() })
+		.on("[referrerpolicy]", { element: (element) => void element.removeAttribute("referrerpolicy") })
+		.on("iframe[srcdoc]", {
+			async element(element) {
+				const html = decodeMarkup(element.getAttribute("srcdoc")!);
+				if (!/referrer/i.test(html)) return;
+				element.setAttribute("srcdoc", await keepNoReferrer(new HTMLRewriter()).transform(new Response(html)).text());
+			},
+		});
+}
+
+const MARKUP: Record<string, string> = { quot: '"', apos: "'", lt: "<", gt: ">" };
+
+/**
+ * A raw srcdoc value with the character references that could hide markup
+ * (quotes, angle brackets, and numeric references) decoded. `&` stays encoded,
+ * so setting the result back (which escapes `"`) means the same to a browser.
+ */
+function decodeMarkup(raw: string): string {
+	return raw.replace(/&(?:#(\d+)|#x([0-9a-f]+)|(quot|apos|lt|gt));/gi, (reference, decimal?: string, hex?: string, name?: string) => {
+		if (name) return MARKUP[name.toLowerCase()]!;
+		const code = decimal ? Number(decimal) : parseInt(hex!, 16);
+		return code === 38 || code > 0x10ffff ? reference : String.fromCodePoint(code);
+	});
 }
 
 const PATTERNS: { types: RegExp; pattern: RegExp }[] = [

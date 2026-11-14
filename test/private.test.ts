@@ -148,3 +148,91 @@ describe("private pages", () => {
 		expect(unlocked.headers.get("location")).toBe(`${page.url}docs/`);
 	});
 });
+
+function guess(id: string, password: string, client = "192.0.2.1", init: { env?: Record<string, unknown> } = {}): Promise<Response> {
+	return call(
+		`${PAGES}/${id}/_unlock`,
+		{ method: "POST", headers: { "cf-connecting-ip": client }, body: new URLSearchParams({ password, next: "" }) },
+		init.env ? { env: init.env } : {},
+	);
+}
+
+describe("password guesses", () => {
+	it("are limited per client, before the password is hashed, with a 429 gate", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		for (let i = 0; i < 5; i++) expect((await guess(page.id, `wrong ${i}`)).status).toBe(401);
+		const deriveBits = vi.spyOn(crypto.subtle, "deriveBits");
+		const limited = await guess(page.id, "correct horse");
+		expect(limited.status).toBe(429);
+		expect(limited.headers.get("retry-after")).toBe("60");
+		expect(limited.headers.get("content-security-policy")).toMatch(/^sandbox/);
+		const html = await limited.text();
+		expect(html).toContain("Too many password attempts");
+		expect(html).toContain(`href="${ADMIN}/open/${page.id}/"`);
+		expect(deriveBits).not.toHaveBeenCalled();
+		// Another client isn't held up by the first one's guesses.
+		expect((await guess(page.id, "correct horse", "192.0.2.2")).status).toBe(303);
+	});
+
+	it("are limited per page across clients, so many addresses can't guess freely", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		for (let i = 0; i < 30; i++) expect((await guess(page.id, "wrong", `198.51.100.${i}`)).status, `guess ${i}`).toBe(401);
+		expect((await guess(page.id, "correct horse", "203.0.113.1")).status).toBe(429);
+		// A different page keeps its own allowance.
+		const other = await publish({ files: FILES, password: "correct horse" });
+		expect((await guess(other.id, "correct horse", "203.0.113.1")).status).toBe(303);
+	});
+
+	it("still open the page through Access and share links while locked out", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		const link = await shareLink(page.id);
+		for (let i = 0; i < 6; i++) await guess(page.id, "wrong");
+		expect((await guess(page.id, "correct horse")).status).toBe(429);
+		expect((await call(link.url)).status).toBe(200);
+		const opened = await call(`${ADMIN}/open/${page.id}/`, {}, { accessAud: AUD });
+		expect((await call(opened.headers.get("location")!)).status).toBe(200);
+	});
+
+	it("let the right password in again once the limit lifts", async () => {
+		const page = await publish({ files: FILES, password: "correct horse" });
+		let open = false;
+		const limiter = { limit: async () => ({ success: open }) };
+		const env = { PASSWORD_GUESSES: limiter, PAGE_PASSWORD_GUESSES: limiter };
+		expect((await guess(page.id, "correct horse", undefined, { env })).status).toBe(429);
+		open = true;
+		expect((await guess(page.id, "correct horse", undefined, { env })).status).toBe(303);
+	});
+
+	it("aren't counted on pages without a password", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		const limit = vi.fn(async () => ({ success: false }));
+		const env = { PASSWORD_GUESSES: { limit }, PAGE_PASSWORD_GUESSES: { limit } };
+		expect((await guess(page.id, "anything", undefined, { env })).status).toBe(401);
+		expect(limit).not.toHaveBeenCalled();
+	});
+});
+
+describe("referrer policy", () => {
+	const LOOSE = [
+		{ path: "index.html", content: '<meta name="referrer" content="unsafe-url"><META NAME="Referrer" CONTENT="origin"><a href="https://elsewhere.example/" referrerpolicy="unsafe-url">x</a><img src="https://elsewhere.example/i.png" REFERRERPOLICY="origin"><iframe srcdoc="<meta name=&quot;referrer&quot; content=&quot;unsafe-url&quot;><img src=x referrerpolicy=unsafe-url>"></iframe>' },
+	];
+
+	it("can't be loosened by a page served behind a pass", async () => {
+		const page = await publish({ files: LOOSE, visibility: "private" });
+		const response = await call((await shareLink(page.id)).url);
+		expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+		const html = await response.text();
+		expect(html).not.toMatch(/<meta[^>]*referrer/i);
+		expect(html).not.toMatch(/referrerpolicy/i);
+		expect(html).toContain('href="https://elsewhere.example/"');
+		const srcdoc = /srcdoc="([^"]*)"/.exec(html)![1]!;
+		expect(srcdoc).not.toMatch(/referrer/i);
+		expect(srcdoc).toContain("<img src=x");
+	});
+
+	it("is left as published on public pages", async () => {
+		const page = await publish({ files: LOOSE });
+		const html = await (await call(page.url)).text();
+		expect(html).toBe(LOOSE[0]!.content);
+	});
+});

@@ -110,8 +110,30 @@ export async function unlock(request: Request, env: Env, pages: Pages, id: strin
 	const open = () => viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { rest: next });
 	if (page.visibility !== "private") return Response.redirect(await open(), 303);
 	const password = String(form.get("password") ?? "");
-	if (!page.passwordHash || !password || !(await checkPassword(password, page.passwordHash))) {
-		return gate(env, page, next, "Wrong password");
+	if (!page.passwordHash || !password) return gate(env, page, next, "Wrong password");
+	// Checked before the hash, which is the expensive part of a guess.
+	if (!(await mayGuess(request, env, page.id))) {
+		const limited = gate(env, page, next, "Too many password attempts. Try again in a minute, or sign in instead.", 429);
+		limited.headers.set("retry-after", String(GUESS_PERIOD));
+		return limited;
 	}
+	if (!(await checkPassword(password, page.passwordHash))) return gate(env, page, next, "Wrong password");
 	return Response.redirect(await open(), 303);
+}
+
+/** The window, in seconds, of both guess limits in cloudflare.config.ts. */
+const GUESS_PERIOD = 60;
+
+/**
+ * Whether another password guess at page `id` may be checked: each client
+ * address gets 5 a minute (PASSWORD_GUESSES), and the page 30 a minute from
+ * everyone (PAGE_PASSWORD_GUESSES), so many addresses can't guess freely
+ * either. Both are per Cloudflare location and lift a minute after the
+ * guessing stops; signing in and share links aren't limited.
+ */
+async function mayGuess(request: Request, env: Env, id: string): Promise<boolean> {
+	// Set by Cloudflare on every request; a client can't choose it.
+	const client = request.headers.get("cf-connecting-ip") ?? "unknown";
+	if (!(await env.PASSWORD_GUESSES.limit({ key: `${id}:${client}` })).success) return false;
+	return (await env.PAGE_PASSWORD_GUESSES.limit({ key: id })).success;
 }
