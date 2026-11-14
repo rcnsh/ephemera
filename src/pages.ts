@@ -1,6 +1,6 @@
 import { checkBundle, contentType, normalizePath, type PageFile, type PageKind, validateBundle } from "./files.ts";
 import { LIMITS, PageError, type Ttl } from "./domain.ts";
-import { type MockupOption, mockupOptions, slugify, type Verdict } from "./mockups.ts";
+import { type MockupOption, mockupOptions, optionPath, slugify, type Verdict } from "./mockups.ts";
 
 /**
  * The page store. D1 holds one row per page and one per version it keeps;
@@ -50,10 +50,11 @@ interface VerdictRow {
 	verdict: Verdict;
 	note: string | null;
 	updated_at: number;
+	folder: number;
 }
 
 function toOption(row: VerdictRow): MockupOption {
-	return { name: row.option, verdict: row.verdict, note: row.note, updatedAt: row.updated_at };
+	return { name: row.option, path: optionPath(row.option, row.folder === 1), verdict: row.verdict, note: row.note, updatedAt: row.updated_at };
 }
 
 interface VersionRow {
@@ -132,9 +133,9 @@ function mockupId(project: string, name: string): string {
 	return `${slug}-${randomChars(6)}`;
 }
 
-/** Options as a JSON array, to go through `json_each` in SQL. */
+/** Options as a JSON array of `{ name, folder }`, to go through `json_each` in SQL. */
 function optionsJson(paths: string[]): string {
-	return JSON.stringify(mockupOptions(paths));
+	return JSON.stringify(mockupOptions(paths).map((option) => ({ name: option.name, folder: option.folder ? 1 : 0 })));
 }
 
 function toPage(row: PageRow): Page {
@@ -461,19 +462,23 @@ export class Pages {
 
 	/**
 	 * Brings a mockup set's verdicts in step with the options of the version
-	 * given by its `paths`: new options start pending, and the verdicts of
-	 * options that went go too. Like `addVersion`, it only applies if the page
-	 * is serving `version` by then.
+	 * given by its `paths`: new options start pending, the verdicts of options
+	 * that went go too, and every option's folder follows the files. Like
+	 * `addVersion`, it only applies if the page is serving `version` by then.
 	 */
 	private syncOptions(id: string, version: number, now: number, paths: string[]): D1PreparedStatement[] {
 		const options = optionsJson(paths);
 		const serving = "EXISTS (SELECT 1 FROM pages WHERE id = ? AND version = ?)";
 		return [
 			this.db
-				.prepare(`DELETE FROM verdicts WHERE page_id = ? AND option NOT IN (SELECT value FROM json_each(?)) AND ${serving}`)
+				.prepare(`DELETE FROM verdicts WHERE page_id = ? AND option NOT IN (SELECT value ->> 'name' FROM json_each(?)) AND ${serving}`)
 				.bind(id, options, id, version),
 			this.db
-				.prepare(`INSERT OR IGNORE INTO verdicts (page_id, option, verdict, updated_at) SELECT ?, value, 'pending', ? FROM json_each(?) WHERE ${serving}`)
+				.prepare(
+					`INSERT INTO verdicts (page_id, option, verdict, updated_at, folder)
+					SELECT ?, value ->> 'name', 'pending', ?, value ->> 'folder' FROM json_each(?) WHERE ${serving}
+					ON CONFLICT (page_id, option) DO UPDATE SET folder = excluded.folder`,
+				)
 				.bind(id, now, options, id, version),
 		];
 	}

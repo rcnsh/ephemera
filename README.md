@@ -54,7 +54,7 @@ Pages given a ttl expire. Every request checks the expiry, so a page stops worki
 
 A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2/`.
 
-- **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`.
+- **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`. Each option in a set's `options` carries its `path` relative to the set's URL (`a/`, or empty for that root `main`).
 - **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
 - **The set's URL shows the options side by side** when it has no root `index.html`. Each option renders at a real desktop, tablet or phone viewport and is scaled down to fit its card; clicking one opens it full size, with tabs and arrow keys to flip between options. Picked options get a badge and their note; rejected ones aren't marked. A root `index.html` replaces this page.
 - Everything else (private sets, versions, rollback, delete) works as for any page.
