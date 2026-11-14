@@ -208,6 +208,76 @@ describe("storage failures", () => {
 		expect(await pageRows()).toBe(0);
 	});
 
+	it("leaves a failed publish to the sweep when cleaning up after it fails too", async () => {
+		const puts = flaky("put", 1);
+		const deletes = flaky("delete");
+		// One bucket failing both: the second put, and every delete.
+		const bucket = new Proxy(env.BUCKET, {
+			get(target, name) {
+				if (name === "put") return Reflect.get(puts.bucket, "put");
+				if (name === "delete") return Reflect.get(deletes.bucket, "delete");
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const { pages, clock } = store(bucket);
+		await expect(pages.publish({ files: [...INDEX, file("a.txt")], ttl: HOUR })).rejects.toThrow("put failed");
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+		expect(await pages.list()).toEqual([]);
+
+		const healthy = store();
+		healthy.clock.now = clock.now;
+		expect((await healthy.pages.sweep()).purged).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
+		healthy.clock.now = START + LIMITS.goneGrace;
+		expect((await healthy.pages.sweep()).forgotten).toBe(1);
+		expect(await pageRows()).toBe(0);
+	});
+
+	it("sweeps up after a publish that died between reserving its id and committing, once it's clearly abandoned", async () => {
+		const { pages, clock } = store();
+		// A database whose commit never comes back, as if the Worker died there.
+		let reached: () => void;
+		const atCommit = new Promise<void>((resolve) => (reached = resolve));
+		const db = new Proxy(env.DB, {
+			get(target, name) {
+				if (name === "batch") {
+					return () => {
+						reached();
+						return new Promise(() => {});
+					};
+				}
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const dying = new Pages({ DB: db, BUCKET: env.BUCKET }, { now: () => START, defer: () => {} });
+		void dying.publish({ files: INDEX, ttl: HOUR });
+		await atCommit;
+		expect(await pageRows()).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+
+		// Still in progress, as far as the sweep can tell.
+		clock.now = START + 30 * 60_000;
+		expect((await pages.sweep()).purged).toBe(0);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(1);
+
+		clock.now = START + 2 * HOUR;
+		expect((await pages.sweep()).purged).toBe(1);
+		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
+		clock.now = START + LIMITS.goneGrace;
+		expect((await pages.sweep()).forgotten).toBe(1);
+		expect(await pageRows()).toBe(0);
+	});
+
+	it("never takes a live page for an abandoned reservation", async () => {
+		const { pages, clock } = store();
+		const page = await pages.publish({ files: INDEX, ttl: "permanent" });
+		clock.now = START + 2 * HOUR;
+		expect((await pages.sweep()).purged).toBe(0);
+		expect(await objectCount(page.id)).toBe(1);
+	});
+
 	it("retries deleting a page's files on the next sweep if the first try fails", async () => {
 		const { pages } = store();
 		const page = await pages.publish({ files: INDEX, ttl: HOUR });

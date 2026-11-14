@@ -121,10 +121,44 @@ describe("zipped mockup sets", () => {
 		expect(await (await call(`${set.url}compact/`)).text()).toBe("<p>compact</p>");
 	});
 
-	it("still drop a folder that wraps the option folders", async () => {
+	it("still drop a folder that wraps the option folders, with or without an index of its own", async () => {
 		const set = (await (await zipMockup({ "site/a/index.html": "a", "site/b/index.html": "b" })).json()) as MockupView;
 		expect(set.options.map((o) => o.name)).toEqual(["a", "b"]);
+		const indexed = (await (await zipMockup({ "site/index.html": "all", "site/a/index.html": "a", "site/b/index.html": "b" })).json()) as MockupView;
+		expect(indexed.options.map((o) => o.name)).toEqual(["a", "b"]);
+		expect(await (await call(indexed.url)).text()).toBe("all");
 	});
+
+	/** Replaces a set's files with a zip, by PUT or through an upload URL. */
+	async function replaceWithZip(id: string, files: Record<string, string>, by: "put" | "upload"): Promise<Response> {
+		const headers = { "content-type": "application/zip" };
+		if (by === "put") return api(`/pages/${id}`, { method: "PUT", headers, body: zip(files) });
+		const created = (await (await api("/uploads", { method: "POST", body: JSON.stringify({ id }) })).json()) as { uploadUrl: string };
+		return call(created.uploadUrl, { method: "PUT", headers, body: zip(files) });
+	}
+
+	for (const by of ["put", "upload"] as const) {
+		it(`keep verdicts when a zip that wraps the options replaces a set's files (${by})`, async () => {
+			const set = await publishMockup();
+			await verdict(set.id, { option: "a", verdict: "picked", note: "keep" });
+			const response = await replaceWithZip(set.id, { "site/index.html": "all", "site/a/index.html": "a2", "site/b/index.html": "b2" }, by);
+			expect(response.status).toBe(200);
+			expect((await options(set.id)).map((o) => [o.name, o.verdict, o.note])).toEqual([
+				["a", "picked", "keep"],
+				["b", "pending", null],
+			]);
+			expect(await (await call(`${set.url}a/`)).text()).toBe("a2");
+		});
+
+		it(`keep a lone option with a sub-page of its own when a zip replaces it (${by})`, async () => {
+			const set = await publishMockup({ files: [{ path: "compact/index.html", content: "v1" }, { path: "compact/docs/index.html", content: "docs" }] });
+			await verdict(set.id, { option: "compact", verdict: "picked", note: "this one" });
+			const response = await replaceWithZip(set.id, { "compact/index.html": "v2", "compact/docs/index.html": "docs2" }, by);
+			expect(response.status).toBe(200);
+			expect(await options(set.id)).toMatchObject([{ name: "compact", verdict: "picked", note: "this one" }]);
+			expect(await (await call(`${set.url}compact/docs/`)).text()).toBe("docs2");
+		});
+	}
 
 	it("keep a lone option, its verdict and note when a zip replaces the set's files", async () => {
 		const set = await publishMockup({ files: [{ path: "compact/index.html", content: "v1" }] });
@@ -250,6 +284,14 @@ describe("verdicts", () => {
 		expect((await options(set.id))[0]).toMatchObject({ verdict: "rejected", note: "denser but fine" });
 		await verdict(set.id, { option: "a", verdict: "pending", note: "" });
 		expect((await options(set.id))[0]).toMatchObject({ verdict: "pending", note: null });
+	});
+
+	it("change just the note when no verdict is given, and want one or the other", async () => {
+		const set = await publishMockup();
+		await verdict(set.id, { option: "a", verdict: "picked" });
+		expect((await verdict(set.id, { option: "a", note: "only the note" })).status).toBe(200);
+		expect((await options(set.id))[0]).toMatchObject({ verdict: "picked", note: "only the note" });
+		expect((await verdict(set.id, { option: "a" })).status).toBe(400);
 	});
 
 	it("rejects unknown options and verdicts, and plain pages", async () => {
@@ -395,17 +437,19 @@ describe("the dashboard's Mockups tab", () => {
 		return admin(`/pages/${id}/verdict`, { method: "POST", headers: { origin: ADMIN, "content-type": "application/x-www-form-urlencoded" }, body: sent });
 	}
 
-	it("saves a note on Enter without changing the verdict", async () => {
+	it("saves a note on Enter without sending a verdict, so one set since stays", async () => {
 		const set = await publishMockup();
-		await verdict(set.id, { option: "a", verdict: "picked" });
 		const { form, csrf } = await verdictForm(set.id, "a");
-		// Enter submits with the form's first submit button.
+		// An agent picks the option after the dashboard loaded.
+		await verdict(set.id, { option: "a", verdict: "picked" });
+		// Enter submits with the form's first submit button, which sends nothing of its own.
 		const first = /<button[^>]*>/.exec(form)![0];
-		expect(first).toContain('name="verdict"');
-		expect(first).toContain('value="picked"');
-		const [, value] = /name="verdict" value="([^"]+)"/.exec(first)!;
-		expect((await submit(set.id, form, csrf, { note: "the one", verdict: value! })).status).toBe(303);
+		expect(first).not.toContain("name=");
+		expect((await submit(set.id, form, csrf, { note: "the one" })).status).toBe(303);
 		expect((await options(set.id))[0]).toMatchObject({ name: "a", verdict: "picked", note: "the one" });
+		// With the note unchanged too, there's nothing to save.
+		expect((await submit(set.id, form, csrf, {})).status).toBe(303);
+		expect((await options(set.id))[0]).toMatchObject({ verdict: "picked", note: "the one" });
 	});
 
 	it("doesn't overwrite a newer note with the one the page loaded with", async () => {

@@ -124,6 +124,8 @@ export const ID_PATTERN = new RegExp(`^(?:[a-z2-7]{12}|(?=.{1,51}$)${SLUG_SOURCE
 
 /** How many ids `publish` draws before giving up: one clash is already unlikely, several in a row means something's wrong. */
 const ID_ATTEMPTS = 5;
+/** How old a reservation (see `Pages.reserve`) that never became a page must be before the sweep takes it for abandoned. A publish takes seconds. */
+const ABANDONED_AFTER = 60 * 60 * 1000;
 
 function randomChars(length: number): string {
 	// 32 divides 256 evenly, so masking keeps every character equally likely.
@@ -246,8 +248,10 @@ export class Pages {
 	 * every listing and out of the sweep's way, while the files are written.
 	 * Then one batch brings it to life with its version (and a mockup set's
 	 * options). If writing or committing fails, the files and the row are
-	 * deleted again, so nothing is left behind. With `mockup`, publishes a
-	 * mockup set: its id comes from the project and name.
+	 * deleted again, so nothing is left behind; if that fails too, the row is
+	 * left for the sweep to purge, as it does for a publish that died before
+	 * committing. With `mockup`, publishes a mockup set: its id comes from the
+	 * project and name.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -290,12 +294,23 @@ export class Pages {
 			// Only a reservation that's still ours comes to life; anything else is a bug worth failing loudly on.
 			if (result!.meta.changes !== 1) throw new Error(`The reservation for page ${row.id} vanished while publishing`);
 		} catch (error) {
-			await this.store.deletePage(row.id);
-			await this.db.prepare("DELETE FROM pages WHERE id = ? AND deleted_at = ? AND purged = 1").bind(row.id, now).run();
+			await this.abandon(row.id, now).catch((cleanup) => console.warn(`cleaning up after publishing ${row.id} failed; the sweep will: ${cleanup}`));
 			throw error;
 		}
 		warm();
 		return toPage(row);
+	}
+
+	/**
+	 * Clears up a reservation made at `reservedAt` whose publish failed. The
+	 * row is first marked unpurged, so if deleting the files fails the sweep
+	 * purges them, then forgets the row after the grace period.
+	 */
+	private async abandon(id: string, reservedAt: number): Promise<void> {
+		const ours = "id = ? AND deleted_at = ? AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)";
+		await this.db.prepare(`UPDATE pages SET purged = 0 WHERE ${ours}`).bind(id, reservedAt).run();
+		await this.store.deletePage(id);
+		await this.db.prepare(`DELETE FROM pages WHERE ${ours}`).bind(id, reservedAt).run();
 	}
 
 	/**
@@ -425,7 +440,8 @@ export class Pages {
 		const id = page.id;
 		const version = page.latestVersion + 1;
 		// Reserve the version number before writing, so two updates at once
-		// can't write over each other's files. A number that fails is skipped.
+		// can't write over each other's files. A number that fails is given
+		// back once its files are gone (see `release`).
 		const reserved = await this.db
 			.prepare(`UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND ${LIVE}`)
 			.bind(version, id, page.latestVersion, this.now())
@@ -438,7 +454,7 @@ export class Pages {
 		try {
 			warm = await write(version);
 		} catch (error) {
-			await this.store.deleteVersion({ id, version });
+			await this.release(page, version);
 			throw error;
 		}
 		const now = this.now();
@@ -456,8 +472,7 @@ export class Pages {
 			]);
 			committed = result!.meta.changes === 1;
 		} catch (error) {
-			// The number is never used again, so nothing else would clear its files.
-			await this.store.deleteVersion({ id, version });
+			await this.release(page, version);
 			throw error;
 		}
 		if (!committed) {
@@ -467,6 +482,21 @@ export class Pages {
 		warm();
 		this.defer(this.prune(id));
 		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
+	}
+
+	/**
+	 * Deletes the files of a `version` of `page` that failed, then gives its
+	 * number back if nothing has reserved a later one, so an upload URL made
+	 * for the page's latest version still works. A number whose files couldn't
+	 * all be deleted is never used again, so a later version can't pick up
+	 * leftover files; they go when the page does.
+	 */
+	private async release(page: Page, version: number): Promise<void> {
+		await this.store.deleteVersion({ id: page.id, version });
+		await this.db
+			.prepare("UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND version < ?")
+			.bind(page.latestVersion, page.id, version, version)
+			.run();
 	}
 
 	/** The versions every live page keeps, newest first, by page id. */
@@ -627,15 +657,16 @@ export class Pages {
 
 	/**
 	 * Picks, rejects or resets one option of a mockup set. `note` replaces the
-	 * option's note (null or "" clears it); undefined keeps it.
+	 * option's note (null or "" clears it); undefined keeps it, as an undefined
+	 * `verdict` keeps the verdict.
 	 */
-	async setVerdict(id: string, option: string, verdict: Verdict, note?: string | null): Promise<MockupOption[]> {
+	async setVerdict(id: string, option: string, verdict: Verdict | undefined, note?: string | null): Promise<MockupOption[]> {
 		const page = await this.get(id);
 		if (page.kind !== "mockup") throw new PageError(400, `Page ${id} isn't a mockup set; only mockup sets have verdicts`);
 		const now = this.now();
 		const result = await this.db
-			.prepare(`UPDATE verdicts SET verdict = ?, note = CASE WHEN ? THEN ? ELSE note END, updated_at = ? WHERE page_id = ? AND option = ?`)
-			.bind(verdict, note !== undefined ? 1 : 0, clean(note, 200), now, id, option)
+			.prepare(`UPDATE verdicts SET verdict = COALESCE(?, verdict), note = CASE WHEN ? THEN ? ELSE note END, updated_at = ? WHERE page_id = ? AND option = ?`)
+			.bind(verdict ?? null, note !== undefined ? 1 : 0, clean(note, 200), now, id, option)
 			.run();
 		const options = await this.options(id);
 		if (result.meta.changes !== 1) {
@@ -659,6 +690,15 @@ export class Pages {
 	/** Purges the files of pages that have gone, and forgets pages gone longer than the grace period. */
 	async sweep(): Promise<{ purged: number; forgotten: number }> {
 		const now = this.now();
+		// A reservation that never became a page (it has no version) and is
+		// long past any publish still running was abandoned: purge its files.
+		await this.db
+			.prepare(
+				`UPDATE pages SET purged = 0 WHERE purged = 1 AND deleted_at = created_at AND created_at <= ?
+				AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)`,
+			)
+			.bind(now - ABANDONED_AFTER)
+			.run();
 		const { results } = await this.db
 			.prepare(`SELECT id FROM pages WHERE purged = 0 AND ${GONE_AT} <= ? LIMIT 200`)
 			.bind(now)

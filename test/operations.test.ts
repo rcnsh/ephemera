@@ -1,6 +1,7 @@
 import { env, reset } from "cloudflare:test";
 import { zipSync, strToU8 } from "fflate";
 import { afterEach, describe, expect, it } from "vitest";
+import { checkUploadToken } from "../src/auth.ts";
 import { LIMITS, PageError } from "../src/domain.ts";
 import { Operations } from "../src/operations.ts";
 import { Pages } from "../src/pages.ts";
@@ -121,5 +122,36 @@ describe("content", () => {
 		expect(await ops.patch(page.id, { files: [{ path: "b.css", content: "q{}" }] })).toMatchObject({ fileCount: 2 });
 		expect(await status(ops.patch(page.id, { remove: "b.css" }))).toBe(400);
 		expect(await status(ops.patch(page.id, { files: [{ path: "c.css" }] }))).toBe(400);
+	});
+});
+
+describe("upload URLs", () => {
+	/** Operations whose R2 puts fail while `failing.on` is true. */
+	function withFlakyPuts() {
+		const failing = { on: true };
+		const bucket = new Proxy(env.BUCKET, {
+			get(target, name) {
+				if (name === "put" && failing.on) return () => Promise.reject(new Error("put failed"));
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const pages = new Pages({ DB: env.DB, BUCKET: bucket }, { now: () => START, defer: (work) => deferred.push(work) });
+		return { ops: new Operations(pages, "pages.example.com", "secret", () => START), failing };
+	}
+
+	it("still work after an upload that failed, and only once after one that worked", async () => {
+		const { ops } = operations();
+		const page = await ops.publish({ content: HTML });
+		const minted = await ops.uploadUrl({ id: page.id });
+		const token = (await checkUploadToken("secret", minted.uploadUrl.split("/upload/")[1]!, START))!;
+
+		const flaky = withFlakyPuts();
+		await expect(flaky.ops.upload(token.id, token.latestVersion, { html: "<p>first try</p>" })).rejects.toThrow("put failed");
+		expect(await ops.get(page.id)).toMatchObject({ version: 1 });
+
+		flaky.failing.on = false;
+		expect(await flaky.ops.upload(token.id, token.latestVersion, { html: "<p>second try</p>" })).toMatchObject({ version: 2 });
+		expect(await status(flaky.ops.upload(token.id, token.latestVersion, { html: "<p>again</p>" }))).toBe(403);
 	});
 });

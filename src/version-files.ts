@@ -59,15 +59,25 @@ type ByteRange = { offset: number; length?: number } | { suffix: number };
 /**
  * One `bytes=` range, or null for anything else (several ranges, other
  * units, nonsense), which is served as the whole file, as RFC 9110 allows.
+ * No file is anywhere near `Number.MAX_SAFE_INTEGER` bytes, so bigger
+ * numbers are capped there: an offset past it can't be satisfied, and a
+ * longer suffix or end means the rest of the file.
  */
 function parseRange(header: string): ByteRange | null {
 	const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
 	if (!match) return null;
 	const [, first, last] = match as unknown as [string, string, string];
-	if (first === "") return last === "" || Number(last) === 0 ? null : { suffix: Number(last) };
-	const offset = Number(first);
+	const cap = (digits: string) => Math.min(Number(digits), Number.MAX_SAFE_INTEGER);
+	if (first === "") return last === "" || Number(last) === 0 ? null : { suffix: cap(last) };
+	const offset = cap(first);
 	if (last === "") return { offset };
-	return Number(last) < offset ? null : { offset, length: Number(last) - offset + 1 };
+	if (Number(last) < Number(first)) return null;
+	return { offset, length: cap(last) - offset + 1 };
+}
+
+/** Whether a range can only be past the end of any file. */
+function beyondAnyFile(range: ByteRange): boolean {
+	return "offset" in range && range.offset >= Number.MAX_SAFE_INTEGER;
 }
 
 /** The bytes of a file of `size` that `range` asks for, or null if it asks for none of them. */
@@ -198,8 +208,9 @@ export class VersionFiles {
 
 	/**
 	 * A range of a file read from R2, or undefined to read the whole file
-	 * instead: when there's no file, or If-Range says so. R2 refuses a range
-	 * past the end, so then it's asked for the file's size to say so.
+	 * instead: when there's no file, or If-Range says so. Whether the range
+	 * can be served is decided here from the file's size: R2 may refuse one
+	 * past the end (then it's asked for the size), or may answer it anyway.
 	 */
 	private async rangeFromR2(
 		ref: VersionRef,
@@ -209,20 +220,30 @@ export class VersionFiles {
 		ifNoneMatch: string | null,
 		ifRange: string | null,
 	): Promise<ServedFile | undefined> {
+		/** The answer for a range the file at `key` (of `object`'s size) can't serve. */
+		const unsatisfiable = (object: R2Object): ServedFile | undefined => {
+			const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
+			if (matches(ifNoneMatch, file.etag)) return { ...file, body: null };
+			if (!ifRangeHolds(ifRange, file.etag)) return undefined;
+			this.fillFromR2(ref, path, file);
+			return { ...file, body: null, range: { satisfiable: false, size: object.size } };
+		};
 		let object: R2ObjectBody | null;
 		try {
+			if (beyondAnyFile(wanted)) throw new Error(`range ${JSON.stringify(wanted)} is past the end of any file`);
 			object = await this.bucket.get(key, { range: wanted });
 		} catch (error) {
 			const head = await this.bucket.head(key);
 			if (!head) return undefined;
 			if (resolveRange(wanted, head.size)) throw error;
-			const file = { etag: head.httpEtag, contentType: head.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
-			if (matches(ifNoneMatch, file.etag)) return { ...file, body: null };
-			if (!ifRangeHolds(ifRange, file.etag)) return undefined;
-			this.fillFromR2(ref, path, file);
-			return { ...file, body: null, range: { satisfiable: false, size: head.size } };
+			return unsatisfiable(head);
 		}
 		if (!object) return undefined;
+		const resolved = resolveRange(wanted, object.size);
+		if (!resolved) {
+			await object.body.cancel();
+			return unsatisfiable(object);
+		}
 		const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
 		const fresh = matches(ifNoneMatch, file.etag);
 		if (fresh || !ifRangeHolds(ifRange, file.etag)) {
@@ -231,7 +252,6 @@ export class VersionFiles {
 			this.fillFromR2(ref, path, file);
 			return { ...file, body: null };
 		}
-		const resolved = resolveRange(wanted, object.size)!;
 		this.fillFromR2(ref, path, file);
 		return { ...file, body: object.body, range: { satisfiable: true, ...resolved, size: object.size } };
 	}

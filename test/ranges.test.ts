@@ -60,6 +60,13 @@ describe("byte ranges over HTTP", () => {
 		expect(await head.text()).toBe("");
 	});
 
+	it("answers 416 for an absurd offset, never a garbled 206", async () => {
+		const url = await video();
+		const response = await get(url, { range: "bytes=99999999999999999999999-" });
+		expect(response.status).toBe(416);
+		expect(response.headers.get("content-range")).toBe("bytes */100");
+	});
+
 	it("answers 416 for a range past the end", async () => {
 		const response = await get(await video(), { range: "bytes=100-" });
 		expect(response.status).toBe(416);
@@ -163,6 +170,28 @@ describe("byte ranges from R2 and the edge cache", () => {
 			const served = await store.serve(ref, "clip.mp4", null, { range: "bytes=100-", ifRange: null });
 			expect(served).toMatchObject({ body: null, range: { satisfiable: false, size: 100 } });
 		}
+	});
+
+	it("say an absurd offset can't be served, from either", async () => {
+		const { ref, r2, cache } = await stores();
+		for (const store of [r2, cache]) {
+			const served = await store.serve(ref, "clip.mp4", null, { range: "bytes=99999999999999999999999-", ifRange: null });
+			expect(served).toMatchObject({ body: null, range: { satisfiable: false, size: 100 } });
+		}
+	});
+
+	it("say a range can't be served even when R2 answers one past the end with the whole file", async () => {
+		const { ref } = await stores();
+		// R2's docs don't promise to refuse an offset past the end, so suppose it doesn't.
+		const lenient = new Proxy(env.BUCKET, {
+			get(target, name) {
+				if (name === "get") return (key: string) => target.get(key);
+				const value = Reflect.get(target, name);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const served = await new VersionFiles(lenient, { defer: () => {} }).serve(ref, "clip.mp4", null, { range: "bytes=150-", ifRange: null });
+		expect(served).toMatchObject({ body: null, range: { satisfiable: false, size: 100 } });
 	});
 
 	it("serve the whole file when If-Range names another version of it, from either", async () => {

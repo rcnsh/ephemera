@@ -110,12 +110,14 @@ export class Operations {
 		return { ...setView(page, this.host, await this.pages.options(page.id)), warnings: rootRelativeWarnings(files) };
 	}
 
-	/** Picks, rejects or resets an option of a mockup set. */
+	/** Picks, rejects or resets an option of a mockup set. Without a verdict, changes just the note. */
 	async setVerdict(id: string, option: unknown, verdict: unknown, note: unknown) {
 		if (typeof option !== "string") throw new PageError(400, "option must be the name of one of the set's top-level folders");
-		if (!VERDICTS.includes(verdict as Verdict)) throw new PageError(400, `verdict must be one of ${VERDICTS.map((v) => `"${v}"`).join(", ")}`);
+		if (verdict === undefined || verdict === null) {
+			if (note === undefined) throw new PageError(400, `Give a verdict (${VERDICTS.map((v) => `"${v}"`).join(", ")}), a note, or both`);
+		} else if (!VERDICTS.includes(verdict as Verdict)) throw new PageError(400, `verdict must be one of ${VERDICTS.map((v) => `"${v}"`).join(", ")}`);
 		if (note !== undefined && note !== null && typeof note !== "string") throw new PageError(400, "note must be a string, or null to clear it");
-		const options = await this.pages.setVerdict(id, option, verdict as Verdict, note as string | null | undefined);
+		const options = await this.pages.setVerdict(id, option, (verdict ?? undefined) as Verdict | undefined, note as string | null | undefined);
 		return { id, url: pageUrl(this.host, id), options };
 	}
 
@@ -152,7 +154,7 @@ export class Operations {
 	}
 
 	private async replace(id: string, content: Content, ifLatest?: number) {
-		const files = decodeContent(content, null, content.zip ? (await this.pages.get(id)).kind : "page");
+		const files = content.zip ? await this.unzipFor(id, content) : decodeContent(content);
 		const page = await this.pages.update(id, files, { ifLatest });
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
@@ -189,6 +191,13 @@ export class Operations {
 			uploadExpiresAt: expiresAt,
 			command: `(cd <folder> && zip -qr - .) | curl -fsS -X PUT -H "content-type: application/zip" --data-binary @- "${uploadUrl}"`,
 		};
+	}
+
+	/** Decodes a zip that replaces page `id`'s files, as a mockup set's when it is one, knowing its options. */
+	private async unzipFor(id: string, content: Content) {
+		const page = await this.pages.get(id);
+		if (page.kind !== "mockup") return decodeContent(content);
+		return decodeContent(content, null, "mockup", (await this.pages.options(id)).map((option) => option.name));
 	}
 
 	/** Makes a page public or private (optionally with a password), revoking every link handed out so far. */
