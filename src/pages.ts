@@ -39,8 +39,6 @@ interface PageRow {
 	project: string | null;
 	/** See `publish`'s `pendingTtl`: milliseconds, 0 for permanent, NULL for none. */
 	pending_ttl: number | null;
-	/** Mockup sets: whether the served version has a root index.html (see `Page.rootIndex`). Absent until migration 0010. */
-	root_index?: number | null;
 }
 
 interface VerdictRow {
@@ -97,13 +95,6 @@ export interface Page {
 	kind: PageKind;
 	/** Groups mockup sets; a slug. Null for plain pages. */
 	project: string | null;
-	/**
-	 * Mockup sets: whether the version being served has a root index.html,
-	 * which replaces the gallery. Recorded whenever a set's options are
-	 * synced; null for plain pages and for sets not synced since migration
-	 * 0010 (see `hasRootIndex`).
-	 */
-	rootIndex: boolean | null;
 }
 
 export interface Usage {
@@ -193,7 +184,6 @@ function toPage(row: PageRow): Page {
 		shareEpoch: row.share_epoch,
 		kind: row.kind,
 		project: row.project,
-		rootIndex: row.root_index === undefined || row.root_index === null ? null : row.root_index === 1,
 	};
 }
 
@@ -201,6 +191,34 @@ function clean(text: string | undefined | null, max: number): string | null {
 	const value = text?.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 	return value || null;
 }
+
+/**
+ * Page rows this isolate looked up recently, by id (null for no row), so a
+ * burst of requests for one page (its HTML, then every file it loads, or a
+ * mockup set's frames) shares one D1 query: D1 has one primary region, so
+ * each query is a round trip there. Only the row is kept; whether it has
+ * expired is worked out from the current time on every request.
+ *
+ * Every write this isolate makes to a page clears its entry. A write made
+ * through another isolate can take up to `LOOKUP_MEMO_MS` to show here: a
+ * page just made private, or deleted, can still be served for that long.
+ * That's the accepted price of the saved round trips.
+ */
+const lookupMemo = new Map<string, { row: PageRow | null; at: number }>();
+const LOOKUP_MEMO_MS = 2_000;
+const LOOKUP_MEMO_SIZE = 500;
+/** Counts this isolate's writes, so a read that a write overtook isn't memoized. */
+let writes = 0;
+
+/** Forgets every memoized lookup. For tests, which change D1 behind the Worker's back. */
+export function clearLookupMemo(): void {
+	lookupMemo.clear();
+}
+
+/** Live pages each sweep checks for orphaned version folders. */
+const ORPHAN_CHECKS = 10;
+/** How old a version folder no row points at must be before the sweep deletes it: younger, it may be an update in progress. */
+const WRITE_GRACE = 60 * 60_000;
 
 export interface PagesOptions {
 	/** Keeps background work (deleting replaced files, filling the cache) alive after the response; `ctx.waitUntil` in the Worker. */
@@ -231,19 +249,55 @@ export class Pages {
 		return this.storage.DB;
 	}
 
-	async lookup(id: string): Promise<Lookup> {
+	/**
+	 * Whether a page is live, gone or missing, for serving it. The row may come
+	 * from `lookupMemo` (see there for how stale it can be); writes go through
+	 * `get`, which always reads D1, and so does `fresh`.
+	 */
+	async lookup(id: string, { fresh = false }: { fresh?: boolean } = {}): Promise<Lookup> {
 		if (!ID_PATTERN.test(id)) return { state: "missing" };
+		const now = this.now();
+		const memo = fresh ? undefined : lookupMemo.get(id);
+		if (memo && now - memo.at >= 0 && now - memo.at < LOOKUP_MEMO_MS) return this.state(memo.row, now);
+		return this.state(await this.readRow(id), now);
+	}
+
+	private async readRow(id: string): Promise<PageRow | null> {
+		const before = writes;
 		const row = await this.db.prepare("SELECT * FROM pages WHERE id = ?").bind(id).first<PageRow>();
+		// A write that landed while this read was out may have changed the row.
+		// A deleted row (a gone page, or an id reserved by a publish still
+		// running) isn't kept: a reservation comes to life when it commits, and
+		// another isolate's memo would answer 410 for it until it aged out.
+		if (row?.deleted_at != null) {
+			// Whatever this isolate remembered of the page is stale now.
+			lookupMemo.delete(id);
+			return row;
+		}
+		if (writes !== before) return row;
+		lookupMemo.delete(id);
+		if (lookupMemo.size >= LOOKUP_MEMO_SIZE) lookupMemo.delete(lookupMemo.keys().next().value!);
+		lookupMemo.set(id, { row, at: this.now() });
+		return row;
+	}
+
+	/** Clears a page's memoized row; every write to a page calls it. */
+	private changed(id: string): void {
+		writes += 1;
+		lookupMemo.delete(id);
+	}
+
+	private state(row: PageRow | null, now: number): Lookup {
 		if (!row) return { state: "missing" };
 		const goneAt = row.deleted_at ?? row.expires_at;
-		const now = this.now();
 		if (goneAt === null || goneAt > now) return { state: "live", page: toPage(row) };
 		return now - goneAt < LIMITS.goneGrace ? { state: "gone" } : { state: "missing" };
 	}
 
-	/** Like `lookup`, but for operations that need a live page. */
+	/** Like `lookup`, but for operations that need a live page, so always read from D1. */
 	async get(id: string): Promise<Page> {
-		const found = await this.lookup(id);
+		if (!ID_PATTERN.test(id)) throw new PageError(404, `No page with id "${id}"`);
+		const found = this.state(await this.readRow(id), this.now());
 		if (found.state === "live") return found.page;
 		if (found.state === "gone") throw new PageError(410, `Page ${id} has expired or been deleted`);
 		throw new PageError(404, `No page with id "${id}"; list_pages finds pages by label or id`);
@@ -375,6 +429,8 @@ export class Pages {
 		} catch (error) {
 			await this.abandon(row.id, now).catch((cleanup) => console.warn(`cleaning up after publishing ${row.id} failed; the sweep will: ${cleanup}`));
 			throw error;
+		} finally {
+			this.changed(row.id);
 		}
 		warm();
 		return toPage(row);
@@ -454,7 +510,6 @@ export class Pages {
 		const options = optionsJson(paths);
 		const serving = "EXISTS (SELECT 1 FROM pages WHERE id = ? AND version = ?)";
 		return [
-			this.db.prepare("UPDATE pages SET root_index = ? WHERE id = ? AND version = ?").bind(paths.includes("index.html") ? 1 : 0, id, version),
 			this.db
 				.prepare(`DELETE FROM verdicts WHERE page_id = ? AND option NOT IN (SELECT value ->> 'name' FROM json_each(?)) AND ${serving}`)
 				.bind(id, options, id, version),
@@ -537,6 +592,7 @@ export class Pages {
 			await this.get(id); // 410 if it has gone since
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
+		this.changed(id);
 		let warm: () => void;
 		try {
 			warm = await write(version);
@@ -563,12 +619,14 @@ export class Pages {
 			await this.release(page, version);
 			throw error;
 		}
+		this.changed(id);
 		if (!committed) {
 			await this.store.deleteVersion({ id, version });
 			throw new PageError(409, `Page ${id} changed while it was being updated; try again`);
 		}
 		warm();
 		this.defer(this.prune(id));
+		if (page.kind === "mockup") this.defer(this.dropOptionThumbnails(id, paths));
 		const expiresAt = committed.expires_at;
 		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now, expiresAt, permanent: expiresAt === null };
 	}
@@ -585,7 +643,8 @@ export class Pages {
 		await this.db
 			.prepare("UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND version < ?")
 			.bind(page.latestVersion, page.id, version, version)
-			.run();
+			.run()
+			.finally(() => this.changed(page.id));
 	}
 
 	/** The versions every live page keeps, newest first, by page id. */
@@ -637,7 +696,8 @@ export class Pages {
 			.first<VersionRow>();
 		if (!target) throw new PageError(404, `Page ${id} has no version ${version}; list_versions shows the ones it keeps`);
 		const now = this.now();
-		const options = page.kind === "mockup" ? this.syncOptions(id, version, now, [...(await this.store.list({ id, version })).keys()]) : [];
+		const paths = page.kind === "mockup" ? [...(await this.store.list({ id, version })).keys()] : [];
+		const options = page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : [];
 		const [result] = await this.db.batch([
 			this.db
 				.prepare(
@@ -646,15 +706,21 @@ export class Pages {
 				)
 				.bind(version, target.size, target.file_count, now, id, page.version, now, id, version),
 			...options,
-		]);
+		]).finally(() => this.changed(id));
 		if (result!.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
+		if (page.kind === "mockup") this.defer(this.dropOptionThumbnails(id, paths));
 		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now, shareEpoch: page.shareEpoch + 1 };
+	}
+
+	/** Deletes the thumbnails of the options a mockup set no longer has, given the paths of the version it now serves. */
+	private async dropOptionThumbnails(id: string, paths: string[]): Promise<void> {
+		await this.store.deleteOptionThumbnails(id, mockupOptions(paths).map((option) => option.name));
 	}
 
 	/**
 	 * Deletes the versions past the newest `LIMITS.keptVersions`, never the one
 	 * being served. The row goes first, so a rollback can't pick a version whose
-	 * files are half gone; files left by a failure here go when the page does.
+	 * files are half gone; files left by a failure here are found by `sweep`.
 	 */
 	private async prune(id: string): Promise<void> {
 		const { results } = await this.db
@@ -696,7 +762,8 @@ export class Pages {
 			// The owner's choice wins over a ttl still waiting on a first upload.
 			.prepare(`UPDATE pages SET expires_at = ?, pending_ttl = NULL, updated_at = ? WHERE id = ? AND ${LIVE}`)
 			.bind(expiresAt, now, id, now)
-			.run();
+			.run()
+			.finally(() => this.changed(id));
 		if (result.meta.changes !== 1) {
 			// The page expired or was deleted since the lookup.
 			throw new PageError(410, `Page ${id} has expired or been deleted`);
@@ -719,7 +786,8 @@ export class Pages {
 				WHERE id = ? AND ${LIVE} RETURNING *`,
 			)
 			.bind(visibility, keep ? 1 : 0, visibility === "private" ? (passwordHash ?? null) : null, now, id, now)
-			.first<PageRow>();
+			.first<PageRow>()
+			.finally(() => this.changed(id));
 		if (!row) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return toPage(row);
 	}
@@ -728,22 +796,9 @@ export class Pages {
 		const page = await this.get(id);
 		const now = this.now();
 		const cleaned = clean(label, 200);
-		const result = await this.db.prepare(`UPDATE pages SET label = ?, updated_at = ? WHERE id = ? AND ${LIVE}`).bind(cleaned, now, id, now).run();
+		const result = await this.db.prepare(`UPDATE pages SET label = ?, updated_at = ? WHERE id = ? AND ${LIVE}`).bind(cleaned, now, id, now).run().finally(() => this.changed(id));
 		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return { ...page, label: cleaned, updatedAt: now };
-	}
-
-	/**
-	 * Whether a mockup set's served version has a root index.html of its own,
-	 * and so shows it rather than the gallery. Answered from D1; a set last
-	 * synced before migration 0010 is checked in its files once, and the
-	 * answer recorded.
-	 */
-	async hasRootIndex(page: Page): Promise<boolean> {
-		if (page.rootIndex !== null) return page.rootIndex;
-		const found = await this.store.exists(page, "index.html");
-		await this.db.prepare("UPDATE pages SET root_index = ? WHERE id = ? AND version = ? AND root_index IS NULL").bind(found ? 1 : 0, page.id, page.version).run();
-		return found;
 	}
 
 	/** The options of a mockup set, by name, with their verdicts. */
@@ -783,10 +838,10 @@ export class Pages {
 		return options;
 	}
 
-	/** The page is gone as soon as the row says so; if deleting its files fails, the sweep tries again. */
+	/** The page is gone as soon as the row says so (and in this isolate's memo too); if deleting its files fails, the sweep tries again. */
 	async delete(id: string): Promise<void> {
 		await this.get(id);
-		await this.db.prepare("UPDATE pages SET deleted_at = ? WHERE id = ?").bind(this.now(), id).run();
+		await this.db.prepare("UPDATE pages SET deleted_at = ? WHERE id = ?").bind(this.now(), id).run().finally(() => this.changed(id));
 		await this.purge(id);
 	}
 
@@ -795,8 +850,43 @@ export class Pages {
 		await this.db.prepare("UPDATE pages SET purged = 1 WHERE id = ?").bind(id).run();
 	}
 
-	/** Purges the files of pages that have gone, and forgets pages gone longer than the grace period. */
-	async sweep(): Promise<{ purged: number; forgotten: number }> {
+	/**
+	 * Deletes stored version folders that no version row points at: a
+	 * version whose write died after its number was reserved, or one `prune`
+	 * dropped but failed to delete. Each sweep checks `ORPHAN_CHECKS` live
+	 * pages picked at random, so every page is checked now and then without
+	 * listing the whole bucket. A folder written in the last `WRITE_GRACE` may
+	 * be an update still in progress, and is left.
+	 */
+	private async sweepOrphans(now: number): Promise<number> {
+		const { results } = await this.db
+			.prepare(
+				`WITH sample AS (SELECT id FROM pages WHERE ${LIVE} ORDER BY RANDOM() LIMIT ?)
+				SELECT sample.id, versions.version FROM sample LEFT JOIN versions ON versions.page_id = sample.id`,
+			)
+			.bind(now, ORPHAN_CHECKS)
+			.all<{ id: string; version: number | null }>();
+		const kept = new Map<string, Set<number>>();
+		for (const row of results) {
+			const versions = kept.get(row.id) ?? new Set();
+			if (row.version !== null) versions.add(row.version);
+			kept.set(row.id, versions);
+		}
+		let deleted = 0;
+		for (const [id, versions] of kept) {
+			for (const version of await this.store.storedVersions(id)) {
+				if (versions.has(version)) continue;
+				const writtenAt = await this.store.writtenAt({ id, version });
+				if (writtenAt === null || now - writtenAt < WRITE_GRACE) continue;
+				await this.store.deleteVersion({ id, version });
+				deleted += 1;
+			}
+		}
+		return deleted;
+	}
+
+	/** Purges the files of pages that have gone, forgets pages gone longer than the grace period, and deletes some orphaned versions' files (see `sweepOrphans`). */
+	async sweep(): Promise<{ purged: number; forgotten: number; orphans: number }> {
 		const now = this.now();
 		// A reservation that never became a page (it has no version) and is
 		// long past any publish still running was abandoned: purge its files.
@@ -822,6 +912,6 @@ export class Pages {
 			this.db.prepare(`DELETE FROM pages WHERE purged = 1 AND ${GONE_AT} <= ?`).bind(now - LIMITS.goneGrace),
 			this.db.prepare("DELETE FROM verdicts WHERE page_id NOT IN (SELECT id FROM pages)"),
 		]);
-		return { purged: results.length, forgotten: forgotten!.meta.changes };
+		return { purged: results.length, forgotten: forgotten!.meta.changes, orphans: await this.sweepOrphans(now) };
 	}
 }

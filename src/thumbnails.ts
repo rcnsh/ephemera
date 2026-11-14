@@ -1,27 +1,83 @@
-import puppeteer from "@cloudflare/puppeteer";
+import puppeteer, { TimeoutError } from "@cloudflare/puppeteer";
 import { redact } from "./logging.ts";
 
 type Browser = Awaited<ReturnType<typeof puppeteer.launch>>;
 type BrowserBinding = Parameters<typeof puppeteer.launch>[0];
 
+type Tab = Awaited<ReturnType<Browser["newPage"]>>;
+
 /** Pages are shot at a laptop's viewport and scaled down to 320×200. */
 const VIEWPORT = { width: 1280, height: 800, deviceScaleFactor: 0.25 };
 
-/** A PNG of `url` once it has settled, or null if the browser can't be had or the page won't load. */
-export async function screenshot(browserBinding: BrowserBinding, url: string): Promise<Uint8Array | null> {
-	let browser: Browser | undefined;
+/** How long a page gets to settle before it's shot as it is. */
+const SETTLE_MS = 10_000;
+
+/** One thumbnail to make: a whole page at `VIEWPORT`, or a mockup option cropped to its content. */
+export interface Shot {
+	url: string;
+	kind: "page" | "option";
+}
+
+/**
+ * The outcome of one shot: a PNG, "failed" if the browser ran but the page
+ * couldn't be shot, or null if no browser could be had at all (which says
+ * nothing about the page).
+ */
+export type ShotResult = Uint8Array | "failed" | null;
+
+/**
+ * Loads `url` and waits for it to settle (no network for half a second). A
+ * page that keeps polling never settles, so when the wait runs out it's shot
+ * as it is rather than not at all.
+ */
+async function load(tab: Tab, url: string): Promise<void> {
+	try {
+		await tab.goto(url, { waitUntil: "networkidle0", timeout: SETTLE_MS });
+	} catch (error) {
+		if (!(error instanceof TimeoutError)) throw error;
+	}
+}
+
+/**
+ * Makes each of `shots` in one browser launch, one after another, and says
+ * how each went, to `onShot` as each is done and all together at the end.
+ * Browser Run allows a few launches a second per account, so a dashboard
+ * full of missing thumbnails must share browsers, not start one each.
+ */
+export async function screenshots(browserBinding: BrowserBinding, shots: Shot[], onShot?: (index: number, result: ShotResult) => Promise<void>): Promise<ShotResult[]> {
+	let browser: Browser;
 	try {
 		browser = await puppeteer.launch(browserBinding);
-		const tab = await browser.newPage();
-		await tab.setViewport(VIEWPORT);
-		await tab.goto(url, { waitUntil: "networkidle0", timeout: 15_000 });
-		return new Uint8Array(await tab.screenshot({ type: "png" }));
 	} catch (error) {
-		console.warn(redact(`thumbnail of ${url} failed: ${error}`));
-		return null;
-	} finally {
-		await browser?.close().catch(() => {});
+		console.warn(`launching a browser for ${shots.length} thumbnail(s) failed: ${error}`);
+		return shots.map(() => null);
 	}
+	try {
+		const results: ShotResult[] = [];
+		for (const shot of shots) {
+			let tab: Tab | undefined;
+			try {
+				tab = await browser.newPage();
+				results.push(shot.kind === "page" ? await pageShot(tab, shot.url) : await optionShot(tab, shot.url));
+			} catch (error) {
+				console.warn(redact(`thumbnail of ${shot.url} failed: ${error}`));
+				// A browser that dropped mid-batch says nothing about this page.
+				results.push(browser.connected ? "failed" : null);
+			} finally {
+				await tab?.close().catch(() => {});
+			}
+			await onShot?.(results.length - 1, results.at(-1)!);
+		}
+		return results;
+	} finally {
+		await browser.close().catch(() => {});
+	}
+}
+
+async function pageShot(tab: Tab, url: string): Promise<Uint8Array> {
+	await tab.setViewport(VIEWPORT);
+	await load(tab, url);
+	return new Uint8Array(await tab.screenshot({ type: "png" }));
 }
 
 /** Mockup options are cropped to their content and scaled to fit this box. */
@@ -73,36 +129,12 @@ const CONTENT_BOX = String.raw`(() => {
 	return { x, y, width: Math.min(width, Math.ceil(box.right + pad)) - x, height: Math.min(height, Math.ceil(box.bottom + pad)) - y };
 })()`;
 
-/**
- * PNGs of each of `urls` (the options of a mockup set), all shot with one
- * browser: the full page, cropped to its content, then scaled down to fit
- * `OPTION_BOX`. Null for each one that fails.
- */
-export async function screenshotOptions(browserBinding: BrowserBinding, urls: string[]): Promise<(Uint8Array | null)[]> {
-	let browser: Browser | undefined;
-	try {
-		browser = await puppeteer.launch(browserBinding);
-		const shots: (Uint8Array | null)[] = [];
-		for (const url of urls) {
-			try {
-				const tab = await browser.newPage();
-				await tab.setViewport({ width: 1280, height: 800 });
-				await tab.goto(url, { waitUntil: "networkidle0", timeout: 15_000 });
-				const box = (await tab.evaluate(CONTENT_BOX)) as { x: number; y: number; width: number; height: number };
-				const height = Math.min(box.height, MAX_HEIGHT);
-				const scale = Math.min(1, OPTION_BOX.width / box.width, OPTION_BOX.height / height);
-				shots.push(new Uint8Array(await tab.screenshot({ type: "png", clip: { ...box, height, scale } })));
-				await tab.close();
-			} catch (error) {
-				console.warn(redact(`thumbnail of ${url} failed: ${error}`));
-				shots.push(null);
-			}
-		}
-		return shots;
-	} catch (error) {
-		console.warn(redact(`thumbnails of ${urls.join(", ")} failed: ${error}`));
-		return urls.map(() => null);
-	} finally {
-		await browser?.close().catch(() => {});
-	}
+/** The full page, cropped to its content, then scaled down to fit `OPTION_BOX`. */
+async function optionShot(tab: Tab, url: string): Promise<Uint8Array> {
+	await tab.setViewport({ width: 1280, height: 800 });
+	await load(tab, url);
+	const box = (await tab.evaluate(CONTENT_BOX)) as { x: number; y: number; width: number; height: number };
+	const height = Math.min(box.height, MAX_HEIGHT);
+	const scale = Math.min(1, OPTION_BOX.width / box.width, OPTION_BOX.height / height);
+	return new Uint8Array(await tab.screenshot({ type: "png", clip: { ...box, height, scale } }));
 }

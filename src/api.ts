@@ -7,19 +7,74 @@ function json(body: unknown, status = 200): Response {
 	return Response.json(body, { status });
 }
 
+function tooLarge(): PageError {
+	return new PageError(413, "Request body is too large");
+}
+
+/**
+ * The request body, cut off with a 413 once more than `MAX_BODY` bytes have
+ * arrived: a chunked body has no content-length to check up front.
+ */
+function limitedBody(request: Request): ReadableStream<Uint8Array> {
+	if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) throw tooLarge();
+	let received = 0;
+	return (request.body ?? new Response("").body!).pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				received += chunk.byteLength;
+				if (received > MAX_BODY) throw tooLarge();
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+}
+
+/** A JSON body read through `limitedBody`, or null if it isn't JSON. */
+async function limitedJson(request: Request): Promise<unknown> {
+	try {
+		return await new Response(limitedBody(request)).json();
+	} catch (error) {
+		if (error instanceof PageError) throw error;
+		return null;
+	}
+}
+
+/** A whole body read through `limitedBody`, into one buffer when its length is declared. */
+async function limitedBytes(request: Request): Promise<Uint8Array> {
+	const declared = Number(request.headers.get("content-length") ?? 0);
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	let into = declared > 0 ? new Uint8Array(declared) : null;
+	for await (const chunk of limitedBody(request)) {
+		if (into && length + chunk.byteLength <= into.byteLength) into.set(chunk, length);
+		else {
+			// Longer than declared, or undeclared: gather the chunks and join them at the end.
+			if (into) chunks.push(into.subarray(0, length));
+			into = null;
+			chunks.push(chunk);
+		}
+		length += chunk.byteLength;
+	}
+	if (into) return into.subarray(0, length);
+	if (chunks.length === 1) return chunks[0]!;
+	const bytes = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) bytes.set(chunk, offset), (offset += chunk.byteLength);
+	return bytes;
+}
+
 function isZip(request: Request): boolean {
 	return /zip|octet-stream/.test(request.headers.get("content-type") ?? "");
 }
 
 /** Reads a page from either a JSON body (`files`, `html` or `markdown` inline) or a raw zip body (options in the query string). */
 async function readBundle(request: Request, url: URL): Promise<PublishInput> {
-	if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) throw new PageError(413, "Request body is too large");
 	if (isZip(request)) {
 		// No password here: query strings end up in logs. Set one with /visibility afterwards.
 		const query = (name: string) => url.searchParams.get(name) ?? undefined;
-		return { content: { zip: new Uint8Array(await request.arrayBuffer()) }, ttl: query("ttl"), label: query("label"), agent: query("agent"), slug: query("slug"), visibility: query("visibility") };
+		return { content: { zip: await limitedBytes(request) }, ttl: query("ttl"), label: query("label"), agent: query("agent"), slug: query("slug"), visibility: query("visibility") };
 	}
-	const body = (await request.json().catch(() => null)) as { files?: unknown; html?: unknown; markdown?: unknown; ttl?: unknown; label?: unknown; agent?: unknown; slug?: unknown; visibility?: unknown; password?: unknown } | null;
+	const body = (await limitedJson(request)) as { files?: unknown; html?: unknown; markdown?: unknown; ttl?: unknown; label?: unknown; agent?: unknown; slug?: unknown; visibility?: unknown; password?: unknown } | null;
 	if (typeof body !== "object" || body === null) throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent, slug }) or a zip file");
 	const { files, html, markdown, ttl, label, agent, slug, visibility, password } = body;
 	return { content: { files, html, markdown }, ttl, label, agent, slug, visibility, password };
@@ -37,7 +92,7 @@ async function readMockup(request: Request, url: URL) {
 
 /** A JSON object body; anything else reads as an empty object, so its fields come out missing. */
 async function readJson<T>(request: Request): Promise<Partial<T>> {
-	const body: unknown = await request.json().catch(() => null);
+	const body: unknown = await limitedJson(request);
 	return (typeof body === "object" && body !== null ? body : {}) as Partial<T>;
 }
 
