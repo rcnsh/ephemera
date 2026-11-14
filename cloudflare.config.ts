@@ -28,12 +28,19 @@ export default defineConfig({
 		workersDev: false,
 		domains: [pagesHost, adminHost],
 		triggers: [triggers.scheduled({ schedule: "*/10 * * * *" })],
-		observability: { enabled: true },
+		// Invocation logs record each request's full URL, and passes and upload
+		// tokens are in the path, so they're off; the Worker logs each request
+		// itself, with those redacted (src/logging.ts).
+		observability: { enabled: true, logs: { enabled: true, invocationLogs: false } },
 		env: {
 			DB: bindings.d1({ name: "ephemera" }),
 			BUCKET: bindings.r2({ name: "ephemera" }),
 			// Browser Rendering, for the dashboard's thumbnails.
 			BROWSER: bindings.browser(),
+			// Password guesses at a private page, per client address and per page (see unlock in src/privacy.ts).
+			// Namespace IDs are this account's choice; vitest.config.ts uses the same limits.
+			PASSWORD_GUESSES: bindings.rateLimit({ namespace: "4831", simple: { limit: 5, period: 60 } }),
+			PAGE_PASSWORD_GUESSES: bindings.rateLimit({ namespace: "4832", simple: { limit: 30, period: 60 } }),
 			EPHEMERA_TOKEN: bindings.secret(),
 			PAGES_HOST: bindings.text(pagesHost),
 			ADMIN_HOST: bindings.text(adminHost),
