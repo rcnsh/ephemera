@@ -2,7 +2,6 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { bytesText, durationText, LIMITS, PageError } from "./domain.ts";
-import { bundleFrom, decodeInlineFiles } from "./files.ts";
 import type { Operations } from "./operations.ts";
 
 const fileList = z.array(
@@ -81,7 +80,7 @@ function server(ops: Operations, host: string): McpServer {
 			description: publishGuide(host),
 			inputSchema: z.object({ ...content, ttl, label, agent, visibility, password }),
 		},
-		(input) => run(async () => ops.publish({ ...input, files: bundleFrom(input, input.label) })),
+		({ files, html, markdown, ...rest }) => run(() => ops.publish({ ...rest, content: { files, html, markdown } })),
 	);
 
 	mcp.registerTool(
@@ -98,7 +97,7 @@ function server(ops: Operations, host: string): McpServer {
 				password,
 			}),
 		},
-		(input) => run(async () => ops.publishMockup({ ...input, files: decodeInlineFiles(input.files) })),
+		({ files, ...rest }) => run(() => ops.publishMockup({ ...rest, content: { files } })),
 	);
 
 	mcp.registerTool(
@@ -121,7 +120,7 @@ function server(ops: Operations, host: string): McpServer {
 			description: `Replace all the files of a live page. The URL and expiry stay the same, so an open tab just needs a refresh. The previous files are kept as a version (the last ${LIMITS.keptVersions}) that rollback_page can bring back.`,
 			inputSchema: z.object({ id, ...content }),
 		},
-		(input) => run(async () => ops.update(input.id, bundleFrom(input))),
+		({ id, ...content }) => run(() => ops.update(id, content)),
 	);
 
 	mcp.registerTool(
@@ -135,7 +134,7 @@ function server(ops: Operations, host: string): McpServer {
 				remove: z.array(z.string()).optional().describe('Paths to delete, e.g. ["old.css"]; a path ending in "/" deletes that folder, e.g. ["b/"]'),
 			}),
 		},
-		(input) => run(async () => ops.patch(input.id, decodeInlineFiles(input.files ?? []), input.remove ?? [])),
+		({ id, ...changes }) => run(() => ops.patch(id, changes)),
 	);
 
 	mcp.registerTool(

@@ -1,5 +1,4 @@
 import { PageError, parseTtl, ttlOmitted } from "./domain.ts";
-import { type BundleInput, bundleFrom, type InlineFile, unzipFiles } from "./files.ts";
 import type { Operations, PublishInput, TtlInput } from "./operations.ts";
 
 const MAX_BODY = 80 * 1024 * 1024;
@@ -8,45 +7,44 @@ function json(body: unknown, status = 200): Response {
 	return Response.json(body, { status });
 }
 
-/** Reads a bundle from either a JSON body (`files` inline) or a raw zip body (options in the query string). */
+function isZip(request: Request): boolean {
+	return /zip|octet-stream/.test(request.headers.get("content-type") ?? "");
+}
+
+/** Reads a page from either a JSON body (`files`, `html` or `markdown` inline) or a raw zip body (options in the query string). */
 async function readBundle(request: Request, url: URL): Promise<PublishInput> {
 	if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) throw new PageError(413, "Request body is too large");
-	const type = request.headers.get("content-type") ?? "";
-	if (/zip|octet-stream/.test(type)) {
-		const files = unzipFiles(new Uint8Array(await request.arrayBuffer()));
-		const ttl = url.searchParams.get("ttl");
+	if (isZip(request)) {
 		// No password here: query strings end up in logs. Set one with /visibility afterwards.
 		const query = (name: string) => url.searchParams.get(name) ?? undefined;
-		return { files, ttl: ttl && /^\d+$/.test(ttl) ? Number(ttl) : ttl, label: query("label"), agent: query("agent"), visibility: query("visibility") };
+		return { content: { zip: new Uint8Array(await request.arrayBuffer()) }, ttl: query("ttl"), label: query("label"), agent: query("agent"), visibility: query("visibility") };
 	}
-	let body: BundleInput & { ttl?: string | number; label?: string; agent?: string; visibility?: unknown; password?: unknown };
-	try {
-		body = await request.json();
-	} catch {
-		throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent }) or a zip file");
-	}
-	return { files: bundleFrom(body, body.label), ttl: body.ttl, label: body.label, agent: body.agent, visibility: body.visibility, password: body.password };
+	const body = (await request.json().catch(() => null)) as { files?: unknown; html?: unknown; markdown?: unknown; ttl?: TtlInput; label?: string; agent?: string; visibility?: unknown; password?: unknown } | null;
+	if (typeof body !== "object" || body === null) throw new PageError(400, "Body must be JSON ({ files | html | markdown, ttl, label, agent }) or a zip file");
+	const { files, html, markdown, ttl, label, agent, visibility, password } = body;
+	return { content: { files, html, markdown }, ttl, label, agent, visibility, password };
 }
 
 /** Reads a mockup set from a JSON body, or a zip body with `project` and `name` in the query string. */
 async function readMockup(request: Request, url: URL) {
-	if (/zip|octet-stream/.test(request.headers.get("content-type") ?? "")) {
-		const { files, visibility } = await readBundle(request, url);
-		return { files, visibility, project: url.searchParams.get("project"), name: url.searchParams.get("name") };
+	if (isZip(request)) {
+		const { content, visibility } = await readBundle(request, url);
+		return { content, visibility, project: url.searchParams.get("project"), name: url.searchParams.get("name") };
 	}
-	const body = await readJson<{ project: unknown; name: unknown; files: InlineFile[]; visibility: unknown; password: unknown }>(request);
-	if (!Array.isArray(body.files)) throw new PageError(400, "Body must be JSON ({ project, name, files, visibility }) or a zip file");
-	return { ...body, files: bundleFrom({ files: body.files }) };
+	const body = await readJson<{ project: unknown; name: unknown; files: unknown; visibility: unknown; password: unknown }>(request);
+	return { project: body.project, name: body.name, content: { files: body.files }, visibility: body.visibility, password: body.password };
 }
 
+/** A JSON object body; anything else reads as an empty object, so its fields come out missing. */
 async function readJson<T>(request: Request): Promise<Partial<T>> {
-	return (await request.json().catch(() => ({}))) as Partial<T>;
+	const body: unknown = await request.json().catch(() => null);
+	return (typeof body === "object" && body !== null ? body : {}) as Partial<T>;
 }
 
 /** PUT /upload/<token>: replaces the files of the page the token is for. The caller has checked the token. */
 export async function handleUpload(request: Request, ops: Operations, id: string): Promise<Response> {
 	if (request.method !== "PUT" && request.method !== "POST") return json({ error: "Method not allowed; PUT a zip" }, 405);
-	return json(await ops.update(id, (await readBundle(request, new URL(request.url))).files));
+	return json(await ops.update(id, (await readBundle(request, new URL(request.url))).content));
 }
 
 /**
@@ -91,13 +89,7 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 			return json(await ops.setVerdict(id, body.option, body.verdict, body.note));
 		}
 		if (sub === "share" && request.method === "POST") return json(await ops.shareLink(id, (await readJson<{ ttl: TtlInput }>(request)).ttl));
-		if (sub === "files" && request.method === "POST") {
-			const body = await readJson<{ files: InlineFile[]; remove: string[] }>(request);
-			if (body.remove !== undefined && !(Array.isArray(body.remove) && body.remove.every((path) => typeof path === "string"))) {
-				throw new PageError(400, "remove must be an array of paths");
-			}
-			return json(await ops.patch(id, body.files ? bundleFrom({ files: body.files }) : [], body.remove ?? []));
-		}
+		if (sub === "files" && request.method === "POST") return json(await ops.patch(id, await readJson<{ files: unknown; remove: unknown }>(request)));
 	} else if (!id) {
 		if (request.method === "GET") return json(await ops.list());
 		if (request.method === "POST") return json(await ops.publish(await readBundle(request, url)), 201);
@@ -106,7 +98,7 @@ export async function handleApi(request: Request, ops: Operations): Promise<Resp
 			case "GET":
 				return json(await ops.get(id));
 			case "PUT":
-				return json(await ops.update(id, (await readBundle(request, url)).files));
+				return json(await ops.update(id, (await readBundle(request, url)).content));
 			case "PATCH": {
 				const body = await readJson<{ ttl: TtlInput; label: unknown }>(request);
 				// A null or empty ttl next to a label means "just rename"; on its own it's an error from extend.
