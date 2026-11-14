@@ -276,10 +276,19 @@ export class VersionFiles {
 			await cached.body?.cancel();
 			return !cached.headers.has(MISSING);
 		}
-		const found = (await this.bucket.head(versionPrefix(ref.id, ref.version) + path)) !== null;
-		// Only absence: caching a file takes its body, which a head doesn't have.
-		if (!found) this.defer(this.cache(ref, path, null));
-		return found;
+		const key = versionPrefix(ref.id, ref.version) + path;
+		// Nothing to fill: a head is enough.
+		if (!this.cacheOrigin) return (await this.bucket.head(key)) !== null;
+		// Either answer is cached, so asking again costs nothing, and one R2
+		// read answers and fills it: absence as it is, a file with the body it
+		// read, under this version and path.
+		const object = await this.bucket.get(key);
+		if (!object) {
+			this.defer(this.cache(ref, path, null));
+			return false;
+		}
+		this.defer(this.cache(ref, path, { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", body: object.body }));
+		return true;
 	}
 
 	/** The paths and sizes of a version's files. */

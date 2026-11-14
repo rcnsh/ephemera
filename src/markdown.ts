@@ -1,4 +1,5 @@
-import { marked } from "marked";
+import { Marked, Renderer } from "marked";
+import { FAVICON } from "./logo.ts";
 
 const CSS = `
 body { font: 16px/1.6 system-ui, -apple-system, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; color: #222; background: #fff; }
@@ -6,7 +7,9 @@ h1, h2, h3 { line-height: 1.25; }
 pre, code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, monospace; }
 pre { background: #f5f5f5; padding: 0.8rem 1rem; overflow-x: auto; border-radius: 4px; }
 :not(pre) > code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; }
+.table { max-width: 100%; overflow-x: auto; margin: 1em 0; }
 table { border-collapse: collapse; }
+.table > table { margin: 0; }
 th, td { border: 1px solid #ddd; padding: 0.3rem 0.6rem; text-align: left; }
 blockquote { margin: 0; padding-left: 1rem; border-left: 3px solid #ddd; color: #555; }
 img { max-width: 100%; }
@@ -24,6 +27,25 @@ function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
+/**
+ * The favicon inline: the page is served under /<id>/, where a root-relative
+ * /favicon.svg would be rewritten to a path inside the page.
+ */
+const FAVICON_LINK = `<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(FAVICON)}" type="image/svg+xml">`;
+
+/**
+ * GFM, with each table the renderer emits in a box that scrolls sideways,
+ * so a wide one doesn't widen the page. Raw HTML passes through untouched.
+ */
+const gfm = new Marked({
+	gfm: true,
+	renderer: {
+		table(token) {
+			return `<div class="table">${Renderer.prototype.table.call(this, token)}</div>\n`;
+		},
+	},
+});
+
 /** A whole HTML page for a Markdown document, titled by `title` or else its first heading. */
 export function markdownPage(markdown: string, title?: string | null): string {
 	const heading = /^#{1,6}\s+(.+)$/m.exec(markdown)?.[1]?.trim();
@@ -32,8 +54,9 @@ export function markdownPage(markdown: string, title?: string | null): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escape(title || heading || "Page")}</title>
+${FAVICON_LINK}
 <style>${CSS}</style>
-${marked.parse(markdown, { async: false, gfm: true })}
+${gfm.parse(markdown, { async: false })}
 </html>
 `;
 }

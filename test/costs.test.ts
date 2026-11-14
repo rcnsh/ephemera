@@ -183,3 +183,51 @@ describe("the lookup memo", () => {
 		expect(queries.n).toBe(1);
 	});
 });
+
+describe("what the Mockups tab costs", () => {
+	it("checks a set's own index.html in R2 once after its cached copy lapses, and caches exactly that file", async () => {
+		const { calls } = counted();
+		const files = [{ path: "a/index.html", content: "<p>a</p>" }, { path: "index.html", content: "<p>own index</p>" }];
+		const set = await publishFiles(files, { project: "costs", name: "own-index", visibility: "private" }, "/mockups");
+		const page = await new Pages(env, { defer: () => {} }).lookup(set.id, { fresh: true });
+		if (page.state !== "live") throw new Error("not live");
+		const key = `${PAGES}/_files/${set.id}/${page.page.version}/index.html`;
+		await caches.default.delete(key);
+		const DB = env.DB;
+		const BUCKET = new Proxy(env.BUCKET, {
+			get(target, name) {
+				const value = Reflect.get(target, name);
+				if (name === "get" || name === "head" || name === "list") return (...args: unknown[]) => (calls.r2++, (value as (...a: unknown[]) => unknown).apply(target, args));
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		async function mockups(): Promise<string> {
+			const request = new Request(`https://admin.example.com/mockups`, { redirect: "manual" });
+			request.headers.set("host", "admin.example.com");
+			const ctx = createExecutionContext();
+			Object.defineProperty(ctx, "access", { value: { aud: env.ACCESS_AUD, getIdentity: async () => ({ email: "owner@example.com" }) } });
+			const response = await worker.fetch(request as Parameters<typeof worker.fetch>[0], { ...env, DB, BUCKET }, ctx);
+			const html = await response.text();
+			await waitOnExecutionContext(ctx);
+			return html;
+		}
+		const perLoad: number[] = [];
+		for (let load = 0; load < 3; load++) {
+			calls.r2 = 0;
+			expect(await mockups()).toContain(`/open/${set.id}/a/"`);
+			perLoad.push(calls.r2);
+		}
+		expect(perLoad).toEqual([1, 0, 0]);
+		// The entry is that file, for that page, version and path.
+		const cached = await caches.default.match(key);
+		expect(await cached!.text()).toBe("<p>own index</p>");
+		// And a private set's file still sits behind its gate.
+		const gated = new Request(`${PAGES}/${set.id}/`, { redirect: "manual" });
+		gated.headers.set("host", new URL(PAGES).host);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(gated as Parameters<typeof worker.fetch>[0], env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(401);
+		expect(await response.text()).not.toContain("own index");
+	});
+});

@@ -24,7 +24,19 @@ describe("single-page shortcuts", () => {
 		const html = await (await call(page.url)).text();
 		expect(html).toContain("<title>Report</title>");
 		expect(html).toContain("<h1>Report</h1>");
-		expect(html).toContain("<table>");
+		expect(html).toContain('<div class="table"><table>');
+		expect(html).toMatch(/<\/table>\s*<\/div>/);
+		// Root-relative links get rewritten into the page, so the favicon is inline.
+		expect(html).toContain('<link rel="icon" href="data:image/svg+xml,');
+	});
+
+	it("boxes only the tables it renders, leaving raw HTML that mentions <table> alone", async () => {
+		const markdown = '| a |\n|---|\n| 1 |\n\n<script>const s = "<table>"; window.ok = 1;</script>\n\n<img alt="<table>" src="x.png">\n';
+		const page = (await (await post("/pages", { markdown })).json()) as { url: string };
+		const html = await (await call(page.url)).text();
+		expect(html.match(/<div class="table">/g)).toHaveLength(1);
+		expect(html).toContain('<script>const s = "<table>"; window.ok = 1;</script>');
+		expect(html).toContain('<img alt="<table>" src="x.png">');
 	});
 
 	it("titles a markdown page by its label when there is one", async () => {

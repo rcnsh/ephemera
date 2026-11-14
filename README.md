@@ -138,9 +138,11 @@ curl -fsS "https://$PAGES_HOST/api/pages/$ID/zip" -H "Authorization: Bearer $EPH
 
 ## Dashboard
 
-`ADMIN_HOST` shows a card per page with a thumbnail, and lets you search and filter by agent. From there you can rename, extend, make permanent or temporary, make private or public, set a password, make share links, roll back versions and delete.
+`ADMIN_HOST` shows a card per page with a thumbnail, newest-updated first (or sorted by expiry or size), and lets you search and filter by agent. Search, filter and sort live in the URL (`?q=`, `?agent=`, `?sort=`), so a reload or a link keeps them. From a card you can rename, extend, make permanent or temporary, make private or public (making a page public asks first, since it revokes its share links), set a password, make share links, roll back versions and delete. Ticking cards brings up a bar that makes them all temporary or deletes them, up to 100 at a time; only a press of its buttons acts, never Enter in a field.
 
-The Mockups tab shows mockup sets grouped by project, newest first, with a row of option thumbnails per set and buttons to pick or reject each option. It filters by verdict.
+Actions post in the background and swap in the card's new HTML, so the page keeps its place; without script they're plain form posts that redirect back to the card. Expiry counts down in place.
+
+The Mockups tab shows mockup sets grouped by project, newest first, with a row of option thumbnails per set and buttons to pick or reject each option. A thumbnail opens the set's gallery on that option, or the option itself when the set has its own root `index.html`. Sets can be renamed and have the same lifetime controls as pages. It filters by verdict.
 
 Thumbnails come from Browser Rendering (the `BROWSER` binding). One is made the first time the dashboard asks for a page's current version, then kept in R2 next to the page's files. Thumbnails asked for together (a dashboard load's worth, up to 10) are shot in one browser launch, since Browser Rendering allows only a few launches a second. A page that never stops loading is shot after 10 seconds as it is. If a page can't be shot, the dashboard shows a blank tile and tries again after 10 minutes. If no browser could be had, it tries again on the next load. Mockup options get one each, cropped to their content (so a phone-sized mockup isn't lost in a desktop viewport). Only options without a thumbnail of the current version are shot, and an option's thumbnail goes when the option does.
 
