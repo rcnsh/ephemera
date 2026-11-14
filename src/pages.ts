@@ -310,13 +310,15 @@ export class Pages {
 	/**
 	 * Clears up a reservation made at `reservedAt` whose publish failed. The
 	 * row is first marked unpurged, so if deleting the files fails the sweep
-	 * purges them, then forgets the row after the grace period.
+	 * purges them, then forgets the row after the grace period. Its
+	 * deleted_at moves on, as when the sweep takes a reservation, so it's an
+	 * ordinary gone page from here and not a reservation to take again.
 	 */
 	private async abandon(id: string, reservedAt: number): Promise<void> {
 		const ours = "id = ? AND deleted_at = ? AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)";
-		await this.db.prepare(`UPDATE pages SET purged = 0 WHERE ${ours}`).bind(id, reservedAt).run();
+		await this.db.prepare(`UPDATE pages SET purged = 0, deleted_at = deleted_at + 1 WHERE ${ours}`).bind(id, reservedAt).run();
 		await this.store.deletePage(id);
-		await this.db.prepare(`DELETE FROM pages WHERE ${ours}`).bind(id, reservedAt).run();
+		await this.db.prepare(`DELETE FROM pages WHERE ${ours}`).bind(id, reservedAt + 1).run();
 	}
 
 	/**
@@ -706,9 +708,12 @@ export class Pages {
 		const now = this.now();
 		// A reservation that never became a page (it has no version) and is
 		// long past any publish still running was abandoned: purge its files.
+		// Moving deleted_at on takes it once only, and makes a publish that
+		// was somehow still running fail its commit rather than go live
+		// without its files.
 		await this.db
 			.prepare(
-				`UPDATE pages SET purged = 0 WHERE purged = 1 AND deleted_at = created_at AND created_at <= ?
+				`UPDATE pages SET purged = 0, deleted_at = deleted_at + 1 WHERE purged = 1 AND deleted_at = created_at AND created_at <= ?
 				AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)`,
 			)
 			.bind(now - ABANDONED_AFTER)

@@ -103,7 +103,8 @@ const JUNK = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/;
  * set, a folder that is itself an option is kept: one with its own
  * index.html and no option folders inside it (`site/a/index.html` makes it a
  * wrapper). An option can have sub-pages, so when a zip replaces an existing
- * set, a folder named after one of its `options` is always kept.
+ * set, a folder named after one of its `options` (the ones that have a
+ * folder) is kept, unless one of the folders inside it is an option too.
  */
 export function unzipFiles(zip: Uint8Array, kind: PageKind = "page", options: string[] = []): PageFile[] {
 	let declaredBytes = 0;
@@ -128,10 +129,12 @@ export function unzipFiles(zip: Uint8Array, kind: PageKind = "page", options: st
 	let names = Object.keys(entries);
 	const roots = new Set(names.map((name) => name.split("/")[0]));
 	const prefix = `${[...roots][0]}/`;
+	// The folders inside it that would be options if it were a wrapper.
+	const inner = names.flatMap((name) => /^([^/]+)\/index\.html$/.exec(name.slice(prefix.length))?.[1] ?? []);
 	const isOption =
 		kind === "mockup" &&
 		names.includes(`${prefix}index.html`) &&
-		(options.includes(prefix.slice(0, -1)) || !names.some((name) => name.startsWith(prefix) && /^[^/]+\/index\.html$/.test(name.slice(prefix.length))));
+		(inner.length === 0 || (options.includes(prefix.slice(0, -1)) && !inner.some((name) => options.includes(name))));
 	if (!names.includes("index.html") && roots.size === 1 && names.every((name) => name.includes("/")) && !isOption) {
 		entries = Object.fromEntries(names.map((name) => [name.slice(prefix.length), entries[name]!]));
 		names = Object.keys(entries);

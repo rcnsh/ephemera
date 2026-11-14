@@ -49,7 +49,7 @@ Give the content as exactly one of: files, html (one HTML document) or markdown 
 
 Pages are sandboxed: scripts, forms, popups, fetch and CDN imports work, but localStorage, sessionStorage, IndexedDB and cookies don't. External resources (CDNs, images, APIs) load normally.`;
 
-const mockupGuide = (host: string) => `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://${host}/<project>-<name>-<6 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
+const mockupGuide = (host: string) => `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://${host}/<project>-<name>-<10 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
 
 Put each option in its own top-level folder with its own index.html: a/index.html, b/index.html, or descriptive names like compact/ and roomy/. The folder name is the option's name. Without a root index.html, the set's URL shows every option side by side; add a root index.html only for a custom comparison page. A single root index.html with no option folders is one option, "main".
 

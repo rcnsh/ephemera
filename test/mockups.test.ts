@@ -160,6 +160,21 @@ describe("zipped mockup sets", () => {
 		});
 	}
 
+	it("read a folder named after an option as a wrapper when the options are inside it", async () => {
+		const set = await publishMockup({ files: [{ path: "a/index.html", content: "a1" }, { path: "b/index.html", content: "b1" }] });
+		await verdict(set.id, { option: "b", verdict: "picked", note: "keep" });
+		const put = await api(`/pages/${set.id}`, { method: "PUT", headers: { "content-type": "application/zip" }, body: zip({ "a/index.html": "root", "a/a/index.html": "a2", "a/b/index.html": "b2" }) });
+		expect(put.status).toBe(200);
+		expect(await options(set.id)).toMatchObject([{ name: "a" }, { name: "b", verdict: "picked", note: "keep" }]);
+	});
+
+	it("read a folder called main as a wrapper when the set's main option is its root page", async () => {
+		const set = await publishMockup({ files: [{ path: "index.html", content: "root" }] });
+		const put = await api(`/pages/${set.id}`, { method: "PUT", headers: { "content-type": "application/zip" }, body: zip({ "main/index.html": "root", "main/a/index.html": "a", "main/b/index.html": "b" }) });
+		expect(put.status).toBe(200);
+		expect((await options(set.id)).map((option: { name: string }) => option.name)).toEqual(["a", "b"]);
+	});
+
 	it("keep a lone option, its verdict and note when a zip replaces the set's files", async () => {
 		const set = await publishMockup({ files: [{ path: "compact/index.html", content: "v1" }] });
 		await verdict(set.id, { option: "compact", verdict: "picked", note: "this one" });

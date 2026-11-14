@@ -213,7 +213,7 @@ export class Operations {
 	private async unzipFor(id: string, content: Content) {
 		const page = await this.pages.get(id);
 		if (page.kind !== "mockup") return decodeContent(content);
-		return decodeContent(content, null, "mockup", (await this.pages.options(id)).map((option) => option.name));
+		return decodeContent(content, null, "mockup", (await this.pages.options(id)).filter((option) => option.path).map((option) => option.name));
 	}
 
 	/**

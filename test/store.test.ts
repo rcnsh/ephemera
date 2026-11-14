@@ -229,7 +229,7 @@ describe("storage failures", () => {
 		healthy.clock.now = clock.now;
 		expect((await healthy.pages.sweep()).purged).toBe(1);
 		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
-		healthy.clock.now = START + LIMITS.goneGrace;
+		healthy.clock.now = START + LIMITS.goneGrace + 1;
 		expect((await healthy.pages.sweep()).forgotten).toBe(1);
 		expect(await pageRows()).toBe(0);
 	});
@@ -265,7 +265,10 @@ describe("storage failures", () => {
 		clock.now = START + 2 * HOUR;
 		expect((await pages.sweep()).purged).toBe(1);
 		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
-		clock.now = START + LIMITS.goneGrace;
+		// Once is enough: later sweeps leave it alone until it's forgotten.
+		clock.now += 10 * 60_000;
+		expect((await pages.sweep()).purged).toBe(0);
+		clock.now = START + LIMITS.goneGrace + 1;
 		expect((await pages.sweep()).forgotten).toBe(1);
 		expect(await pageRows()).toBe(0);
 	});
