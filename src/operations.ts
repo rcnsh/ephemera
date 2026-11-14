@@ -47,17 +47,24 @@ async function privacy(visibility: unknown, password: unknown): Promise<{ visibi
 	return { visibility: chosen, passwordHash: password ? await hashPassword(password) : null };
 }
 
-/** A TTL as an agent gives it, before `parseTtl`. */
-export type TtlInput = string | number | null | undefined;
+/** A TTL as an agent gives it, unchecked until `parseTtl`. */
+export type TtlInput = unknown;
 
+/** A page as callers send it: every field is checked here, whatever its type. */
 export interface PublishInput {
 	content: Content;
 	ttl?: TtlInput;
-	label?: string | null;
-	agent?: string | null;
+	label?: unknown;
+	agent?: unknown;
 	/** Checked by `privacy`. */
 	visibility?: unknown;
 	password?: unknown;
+}
+
+/** A short text field as callers send it: a string, or null or missing for none. */
+function optionalText(value: unknown, name: string): string | null | undefined {
+	if (value !== undefined && value !== null && typeof value !== "string") throw new PageError(400, `${name} must be a string`);
+	return value;
 }
 
 const UPLOAD_WINDOW = 60 * 60 * 1000;
@@ -123,12 +130,15 @@ export class Operations {
 
 	/** Publishes a page. A `label` titles a Markdown page. */
 	async publish(input: PublishInput) {
-		const files = decodeContent(input.content, typeof input.label === "string" ? input.label : null);
+		const label = optionalText(input.label, "label");
+		const agent = optionalText(input.agent, "agent");
+		const ttl = parseTtl(input.ttl);
+		const files = decodeContent(input.content, label);
 		const page = await this.pages.publish({
 			files,
-			ttl: parseTtl(input.ttl),
-			label: input.label,
-			agent: input.agent,
+			ttl,
+			label,
+			agent,
 			...(await privacy(input.visibility, input.password)),
 		});
 		return { ...pageView(page, this.host), warnings: rootRelativeWarnings(files) };
@@ -164,6 +174,7 @@ export class Operations {
 		const remove = input.remove ?? [];
 		if (!(Array.isArray(remove) && remove.every((path) => typeof path === "string"))) throw new PageError(400, "remove must be an array of paths");
 		const files = input.files === undefined || input.files === null ? [] : decodeFiles(input.files);
+		if (!files.length && !remove.length) throw new PageError(400, "Nothing to change: give files to add or replace, or paths to remove");
 		const page = await this.pages.patch(id, { files, remove });
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
@@ -171,19 +182,24 @@ export class Operations {
 	/**
 	 * An upload URL that replaces the files of page `id` with a zip, once,
 	 * within an hour. Without `id`, publishes a placeholder page first, so the agent
-	 * gets the final URL before uploading.
+	 * gets the final URL before uploading. The placeholder expires with the
+	 * URL; its first new version, however it arrives, gives the page the
+	 * `ttl` asked for (see `Pages.publish`).
 	 */
-	async uploadUrl(input: { id?: string | null; ttl?: TtlInput; label?: string | null; agent?: string | null; visibility?: unknown; password?: unknown }) {
-		const page = input.id
-			? await this.pages.get(input.id)
+	async uploadUrl(input: { id?: unknown; ttl?: TtlInput; label?: unknown; agent?: unknown; visibility?: unknown; password?: unknown }) {
+		const id = optionalText(input.id, "id");
+		const page = id
+			? await this.pages.get(id)
 			: await this.pages.publish({
 					files: [{ path: "index.html", body: new TextEncoder().encode(WAITING) }],
-					ttl: parseTtl(input.ttl),
-					label: input.label,
-					agent: input.agent,
+					ttl: UPLOAD_WINDOW,
+					pendingTtl: parseTtl(input.ttl),
+					label: optionalText(input.label, "label"),
+					agent: optionalText(input.agent, "agent"),
 					...(await privacy(input.visibility, input.password)),
 				});
-		const expiresAt = this.now() + UPLOAD_WINDOW;
+		// A placeholder and its upload URL expire together.
+		const expiresAt = id ? this.now() + UPLOAD_WINDOW : page.expiresAt!;
 		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, page.latestVersion, expiresAt)}`;
 		return {
 			...pageView(page, this.host),
@@ -200,10 +216,15 @@ export class Operations {
 		return decodeContent(content, null, "mockup", (await this.pages.options(id)).map((option) => option.name));
 	}
 
-	/** Makes a page public or private (optionally with a password), revoking every link handed out so far. */
+	/**
+	 * Makes a page public or private, revoking every link handed out so far. A
+	 * private page keeps its password when `password` is undefined; null or ""
+	 * clears it, and a string replaces it. A public page has none.
+	 */
 	async setVisibility(id: string, visibility: unknown, password: unknown) {
 		const chosen = await privacy(visibility, password);
-		return pageView(await this.pages.setVisibility(id, chosen.visibility, chosen.passwordHash), this.host);
+		const hash = password === undefined && chosen.visibility === "private" ? undefined : chosen.passwordHash;
+		return pageView(await this.pages.setVisibility(id, chosen.visibility, hash), this.host);
 	}
 
 	/** A link that opens a private page without signing in, until it expires (`LIMITS.temporaryTtl` by default). A public page's link is just its URL. */

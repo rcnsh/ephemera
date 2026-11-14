@@ -39,6 +39,9 @@ export function decodeFiles(files: unknown): PageFile[] {
 	return files.map((file: Partial<InlineFile> | null) => {
 		if (typeof file?.path !== "string" || typeof file.content !== "string") throw new PageError(400, "Every file needs a path and a content, both strings");
 		const path = normalizePath(file.path);
+		if (file.encoding !== undefined && file.encoding !== null && file.encoding !== "utf8" && file.encoding !== "base64") {
+			throw new PageError(400, `File "${path}" has encoding ${JSON.stringify(file.encoding)}; use "utf8" (the default) or "base64"`);
+		}
 		if (file.encoding === "base64") {
 			try {
 				return { path, body: Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0)) };

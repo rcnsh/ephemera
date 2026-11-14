@@ -5,6 +5,7 @@ import { handleDashboard } from "./dashboard.ts";
 import { PageError } from "./domain.ts";
 import { contentType, normalizePath } from "./files.ts";
 import { rewriteLinks } from "./links.ts";
+import { logRequest, redact } from "./logging.ts";
 import { favicon } from "./logo.ts";
 import { handleMcp } from "./mcp.ts";
 import { mockupIndex } from "./mockups.ts";
@@ -189,20 +190,27 @@ async function handlePagesHost(request: Request, env: Env, ctx: ExecutionContext
 	}
 }
 
+async function respond(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const { hostname } = new URL(request.url);
+	const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work), cacheOrigin: `https://${env.PAGES_HOST}` });
+	try {
+		if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
+		if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);
+		return text("Not found\n", 404);
+	} catch (error) {
+		// Each host's handler answers PageErrors in its own format; anything left is a bug.
+		console.error(redact(error instanceof Error ? (error.stack ?? String(error)) : String(error)));
+		const response = text("Something went wrong\n", 500);
+		return hostname === env.PAGES_HOST ? withPageHeaders(response) : response;
+	}
+}
+
 export default {
 	async fetch(request, env, ctx) {
-		const { hostname } = new URL(request.url);
-		const pages = new Pages(env, { defer: (work) => ctx.waitUntil(work), cacheOrigin: `https://${env.PAGES_HOST}` });
-		try {
-			if (hostname === env.PAGES_HOST) return withPageHeaders(await handlePagesHost(request, env, ctx, pages));
-			if (hostname === env.ADMIN_HOST) return await handleDashboard(request, env, ctx, pages);
-			return text("Not found\n", 404);
-		} catch (error) {
-			// Each host's handler answers PageErrors in its own format; anything left is a bug.
-			console.error(error);
-			const response = text("Something went wrong\n", 500);
-			return hostname === env.PAGES_HOST ? withPageHeaders(response) : response;
-		}
+		const started = performance.now();
+		const response = await respond(request, env, ctx);
+		logRequest(request, response, performance.now() - started);
+		return response;
 	},
 
 	async scheduled(_controller, env, ctx) {

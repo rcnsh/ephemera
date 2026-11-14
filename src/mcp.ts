@@ -140,7 +140,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"upload_url",
 		{
-			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; with id, the upload replaces that page's files. The URL works for one upload, within an hour (an upload that fails can be retried with it); ask again for the next one. Each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
+			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; the placeholder expires with the upload URL, and its first new files (from the upload, update_page or patch_page) give the page its ttl (permanent if none), unless extend_page changed its expiry first. With id, the upload replaces that page's files and leaves its expiry alone. The URL works for one upload, within an hour (an upload that fails can be retried with it); ask again for the next one. Each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
 			inputSchema: z.object({
 				id: id.optional().describe("An existing page to upload new files for; omit to start a new page"),
 				ttl,
@@ -176,8 +176,12 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"set_visibility",
 		{
-			description: "Make a page public or private, and set or clear its password. Either way, every share link handed out so far stops working.",
-			inputSchema: z.object({ id, visibility: z.enum(["public", "private"]), password: password.describe("A password for a private page (8+ characters); omit for none") }),
+			description: "Make a page public or private, and set or clear its password. Either way, every share link handed out so far stops working, so calling it with the page's current visibility revokes them.",
+			inputSchema: z.object({
+				id,
+				visibility: z.enum(["public", "private"]),
+				password: password.describe("A password for a private page (8+ characters). Omit to keep a private page's current password; an empty string clears it. Making a page public always drops it."),
+			}),
 		},
 		(input) => run(() => ops.setVisibility(input.id, input.visibility, input.password)),
 	);

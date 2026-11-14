@@ -37,6 +37,8 @@ interface PageRow {
 	share_epoch: number;
 	kind: PageKind;
 	project: string | null;
+	/** See `publish`'s `pendingTtl`: milliseconds, 0 for permanent, NULL for none. */
+	pending_ttl: number | null;
 }
 
 interface VerdictRow {
@@ -251,7 +253,9 @@ export class Pages {
 	 * deleted again, so nothing is left behind; if that fails too, the row is
 	 * left for the sweep to purge, as it does for a publish that died before
 	 * committing. With `mockup`, publishes a mockup set: its id comes from the
-	 * project and name.
+	 * project and name. With `pendingTtl`, the page's first new version (from
+	 * `update`, `patch` or an upload) gives it that ttl, counted from then,
+	 * unless the owner has set its expiry first.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -261,6 +265,7 @@ export class Pages {
 		visibility?: Visibility;
 		passwordHash?: string | null;
 		mockup?: { project: string; name: string };
+		pendingTtl?: Ttl;
 	}): Promise<Page> {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
 		const { files, size } = validateBundle(input.files, kind);
@@ -281,6 +286,7 @@ export class Pages {
 			share_epoch: 0,
 			kind,
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
+			pending_ttl: input.pendingTtl === undefined ? null : input.pendingTtl === "permanent" ? 0 : input.pendingTtl,
 		};
 		const row = await this.reserve(fields, () => (input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12)));
 		let warm: () => void;
@@ -325,8 +331,8 @@ export class Pages {
 			const row: PageRow = { id: drawId(), ...fields };
 			const inserted = await this.db
 				.prepare(
-					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, deleted_at, purged, version, latest_version, size, file_count, visibility, password_hash, kind, project)
-					VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, deleted_at, purged, version, latest_version, size, file_count, visibility, password_hash, kind, project, pending_ttl)
+					VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 					ON CONFLICT (id) DO NOTHING`,
 				)
 				.bind(
@@ -345,6 +351,7 @@ export class Pages {
 					row.password_hash,
 					row.kind,
 					row.project,
+					row.pending_ttl,
 				)
 				.run();
 			if (inserted.meta.changes === 1) return row;
@@ -388,7 +395,8 @@ export class Pages {
 	/**
 	 * Adds a version and serves it, in one step: its files are written
 	 * alongside the old ones, then the row is pointed at it. Versions beyond
-	 * the last `LIMITS.keptVersions` are deleted in the background.
+	 * the last `LIMITS.keptVersions` are deleted in the background. A pending
+	 * ttl (see `publish`) is applied and cleared in the same write.
 	 */
 	async update(id: string, input: PageFile[], { ifLatest }: { ifLatest?: number } = {}): Promise<Page> {
 		const page = await this.get(id);
@@ -458,19 +466,20 @@ export class Pages {
 			throw error;
 		}
 		const now = this.now();
-		let committed: boolean;
+		let committed: { expires_at: number | null } | undefined;
 		try {
 			const [result] = await this.db.batch([
 				this.db
 					.prepare(
-						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
-						WHERE id = ? AND latest_version = ? AND ${LIVE}`,
+						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?,
+							expires_at = CASE WHEN pending_ttl IS NULL THEN expires_at WHEN pending_ttl = 0 THEN NULL ELSE ? + pending_ttl END, pending_ttl = NULL
+						WHERE id = ? AND latest_version = ? AND ${LIVE} RETURNING expires_at`,
 					)
-					.bind(version, size, fileCount, now, id, version, now),
+					.bind(version, size, fileCount, now, now, id, version, now),
 				this.addVersion(id, version, now, size, fileCount),
 				...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
 			]);
-			committed = result!.meta.changes === 1;
+			committed = (result!.results as { expires_at: number | null }[])[0];
 		} catch (error) {
 			await this.release(page, version);
 			throw error;
@@ -481,7 +490,8 @@ export class Pages {
 		}
 		warm();
 		this.defer(this.prune(id));
-		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
+		const expiresAt = committed.expires_at;
+		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now, expiresAt, permanent: expiresAt === null };
 	}
 
 	/**
@@ -602,7 +612,8 @@ export class Pages {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
 		const result = await this.db
-			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			// The owner's choice wins over a ttl still waiting on a first upload.
+			.prepare(`UPDATE pages SET expires_at = ?, pending_ttl = NULL, updated_at = ? WHERE id = ? AND ${LIVE}`)
 			.bind(expiresAt, now, id, now)
 			.run();
 		if (result.meta.changes !== 1) {
@@ -614,19 +625,22 @@ export class Pages {
 
 	/**
 	 * Makes a page public or private, and sets or clears its password (only
-	 * private pages have one). Either way, every pass handed out so far stops
-	 * working.
+	 * private pages have one; undefined keeps a private page's current one).
+	 * Either way, every pass handed out so far stops working.
 	 */
-	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null): Promise<Page> {
-		const page = await this.get(id);
-		const hash = visibility === "private" ? passwordHash : null;
+	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null | undefined): Promise<Page> {
+		await this.get(id);
+		const keep = visibility === "private" && passwordHash === undefined;
 		const now = this.now();
-		const result = await this.db
-			.prepare(`UPDATE pages SET visibility = ?, password_hash = ?, share_epoch = share_epoch + 1, updated_at = ? WHERE id = ? AND ${LIVE}`)
-			.bind(visibility, hash, now, id, now)
-			.run();
-		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
-		return { ...page, visibility, passwordHash: hash, shareEpoch: page.shareEpoch + 1, updatedAt: now };
+		const row = await this.db
+			.prepare(
+				`UPDATE pages SET visibility = ?, password_hash = CASE WHEN ? THEN password_hash ELSE ? END, share_epoch = share_epoch + 1, updated_at = ?
+				WHERE id = ? AND ${LIVE} RETURNING *`,
+			)
+			.bind(visibility, keep ? 1 : 0, visibility === "private" ? (passwordHash ?? null) : null, now, id, now)
+			.first<PageRow>();
+		if (!row) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		return toPage(row);
 	}
 
 	async setLabel(id: string, label: string | null): Promise<Page> {

@@ -31,7 +31,7 @@ export async function access(secret: string, page: Page, subpath: string, search
 	if (PASS_PATTERN.test(first)) {
 		const rest = after.join("/");
 		// A pass on a page that has since been made public: drop it.
-		if (page.visibility === "public") return { kind: "redirect", location: `/${page.id}/${safeRest(rest)}${search}` };
+		if (page.visibility === "public") return { kind: "redirect", location: `/${page.id}/${safeRest(page.id, rest)}${search}` };
 		if (!(await checkViewPass(secret, page.id, page.shareEpoch, first, now))) return { kind: "gate", rest, message: "This link has expired or been revoked." };
 		// Without the slash after the pass, relative links would drop it.
 		if (after.length === 0) return { kind: "redirect", location: `/${page.id}/${first}/${search}` };
@@ -48,23 +48,35 @@ export async function access(secret: string, page: Page, subpath: string, search
  * is dropped. Without a `rest` it ends in "/", so a relative path can follow.
  */
 export async function viewerUrl(secret: string, host: string, page: Page, now: number, { rest = "", ttl = LIMITS.passTtl }: { rest?: string; ttl?: number } = {}): Promise<string> {
-	if (page.visibility === "public") return `${pageUrl(host, page.id)}${safeRest(rest)}`;
+	if (page.visibility === "public") return `${pageUrl(host, page.id)}${safeRest(page.id, rest)}`;
 	const pass = await viewPass(secret, page.id, page.shareEpoch, now + ttl);
-	return `${pageUrl(host, page.id)}${pass}/${safeRest(rest)}`;
+	return `${pageUrl(host, page.id)}${pass}/${safeRest(page.id, rest)}`;
 }
 
 function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-/** Keeps a path that gets passed along inside the page. */
-function safeRest(rest: string): string {
+/**
+ * Keeps a path that gets passed along inside page `id`, or "" if it could
+ * leave. Rather than look for bad strings, it resolves the path the way a URL
+ * parser will (which reads "%2e%2e" as ".." and drops tabs and newlines) under
+ * a folder of the page, and keeps it only if it stays in that folder.
+ * Whitespace, control characters, backslashes and "." or ".." segments, plain
+ * or percent-encoded, are refused outright: callers append the path under
+ * different folders (`/<id>/`, `/<id>/~pass/`, `/open/<id>/`), so one that
+ * climbs out and back in ("%2e%2e/_/x") must not pass.
+ */
+function safeRest(id: string, rest: string): string {
 	const clean = rest.replace(/^\/+/, "");
-	return clean.split("/").some((segment) => segment === ".." || segment === ".") || clean.includes("\\") ? "" : clean;
+	if (/[\s\u0000-\u001f\u007f\\]/.test(clean) || clean.split(/[/?#]/).some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment))) return "";
+	const folder = `/${id}/_/`;
+	const resolved = new URL(`https://page.invalid${folder}${clean}`);
+	return resolved.origin === "https://page.invalid" && resolved.pathname.startsWith(folder) ? clean : "";
 }
 
 export function gate(env: Env, page: Page, rest: string, message = "", status = 401): Response {
-	const next = escape(safeRest(rest));
+	const next = escape(safeRest(page.id, rest));
 	const signIn = `https://${env.ADMIN_HOST}/open/${page.id}/${next}`;
 	const password = page.passwordHash
 		? `<form method="post" action="/${page.id}/_unlock">
@@ -110,8 +122,36 @@ export async function unlock(request: Request, env: Env, pages: Pages, id: strin
 	const open = () => viewerUrl(env.EPHEMERA_TOKEN, env.PAGES_HOST, page, Date.now(), { rest: next });
 	if (page.visibility !== "private") return Response.redirect(await open(), 303);
 	const password = String(form.get("password") ?? "");
-	if (!page.passwordHash || !password || !(await checkPassword(password, page.passwordHash))) {
-		return gate(env, page, next, "Wrong password");
+	if (!page.passwordHash || !password) return gate(env, page, next, "Wrong password");
+	// Checked before the hash, which is the expensive part of a guess.
+	if (!(await mayGuess(request, env, page.id))) {
+		const limited = gate(env, page, next, "Too many password attempts. Try again in a minute, or sign in instead.", 429);
+		limited.headers.set("retry-after", String(GUESS_PERIOD));
+		return limited;
 	}
+	if (!(await checkPassword(password, page.passwordHash))) return gate(env, page, next, "Wrong password");
 	return Response.redirect(await open(), 303);
+}
+
+/** The window, in seconds, of both guess limits in cloudflare.config.ts. */
+const GUESS_PERIOD = 60;
+
+/**
+ * Whether another password guess at page `id` may be checked: each client
+ * address gets 5 a minute (PASSWORD_GUESSES), and the page 30 a minute from
+ * everyone (PAGE_PASSWORD_GUESSES), so many addresses can't guess freely
+ * either. Both are per Cloudflare location and lift a minute after the
+ * guessing stops; signing in and share links aren't limited.
+ */
+async function mayGuess(request: Request, env: Env, id: string): Promise<boolean> {
+	// Set by Cloudflare on every request; a client can't choose it.
+	const client = request.headers.get("cf-connecting-ip") ?? "unknown";
+	try {
+		if (!(await env.PASSWORD_GUESSES.limit({ key: `${id}:${client}` })).success) return false;
+		return (await env.PAGE_PASSWORD_GUESSES.limit({ key: id })).success;
+	} catch (error) {
+		// A limiter that's missing or failing refuses the guess, and the gate still offers signing in.
+		console.error("Password guess limiter failed", error);
+		return false;
+	}
 }

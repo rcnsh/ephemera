@@ -446,7 +446,8 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 				break;
 			case "private":
 			case "public":
-				await ops.setVisibility(id, name, null);
+				// No password given: a private page keeps the one it has.
+				await ops.setVisibility(id, name, undefined);
 				break;
 			case "password":
 				// Without a password, this removes it; the page stays private.
