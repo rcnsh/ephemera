@@ -3,3 +3,9 @@ allowBuilds:
   esbuild: true
   workerd: true
   core-js-pure: false
+
+overrides:
+  # @cloudflare/puppeteer 2 depends on @types/node 18 for its declarations. tsc
+  # then loads it beside the toolchain's @types/node and its older Process
+  # (no loadEnvFile) breaks cloudflare.config.ts, so give puppeteer the same one.
+  "@cloudflare/puppeteer>@types/node": "26.6.5"
