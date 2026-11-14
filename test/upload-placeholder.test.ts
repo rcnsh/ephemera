@@ -52,9 +52,10 @@ describe("upload_url's placeholder page", () => {
 		const first = (await (await upload(created.uploadUrl, { "index.html": "one" })).json()) as Upload;
 		expect(first).toMatchObject({ permanent: false, expiresAt: start + 30 * 60_000 + 48 * HOUR });
 
-		// Later uploads leave the expiry alone.
+		// Later uploads, each with a URL of its own, leave the expiry alone.
 		vi.spyOn(Date, "now").mockReturnValue(start + 40 * 60_000);
-		const second = (await (await upload(created.uploadUrl, { "index.html": "two" })).json()) as Upload;
+		const again = await startUpload({ id: created.id });
+		const second = (await (await upload(again.uploadUrl, { "index.html": "two" })).json()) as Upload;
 		expect(second.expiresAt).toBe(first.expiresAt);
 	});
 
@@ -104,7 +105,8 @@ describe("upload_url's placeholder page", () => {
 		const rollback = await api(`/pages/${created.id}/rollback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: 1 }) });
 		expect(rollback.status).toBe(200);
 		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 50 * 60_000);
-		const second = (await (await upload(created.uploadUrl, { "index.html": "two" })).json()) as Upload;
+		const again = await startUpload({ id: created.id });
+		const second = (await (await upload(again.uploadUrl, { "index.html": "two" })).json()) as Upload;
 		expect(second.expiresAt).toBe(first.expiresAt);
 	});
 

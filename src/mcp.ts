@@ -49,7 +49,7 @@ Give the content as exactly one of: files, html (one HTML document) or markdown 
 
 Pages are sandboxed: scripts, forms, popups, fetch and CDN imports work, but localStorage, sessionStorage, IndexedDB and cookies don't. External resources (CDNs, images, APIs) load normally.`;
 
-const mockupGuide = (host: string) => `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://${host}/<project>-<name>-<6 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
+const mockupGuide = (host: string) => `Publish a set of mockups to compare, kept permanently in the mockup gallery, and get its URL back: https://${host}/<project>-<name>-<10 characters>/. Use this instead of publish_page whenever the user asks for mockups or design options.
 
 Put each option in its own top-level folder with its own index.html: a/index.html, b/index.html, or descriptive names like compact/ and roomy/. The folder name is the option's name. Without a root index.html, the set's URL shows every option side by side; add a root index.html only for a custom comparison page. A single root index.html with no option folders is one option, "main".
 
@@ -140,7 +140,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"upload_url",
 		{
-			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; the placeholder expires with the upload URL, and its first new files (from the upload, update_page or patch_page) give the page its ttl (permanent if none), unless extend_page changed its expiry first. With id, the upload replaces that page's files and leaves its expiry alone. The URL works for an hour, and each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
+			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; the placeholder expires with the upload URL, and its first new files (from the upload, update_page or patch_page) give the page its ttl (permanent if none), unless extend_page changed its expiry first. With id, the upload replaces that page's files and leaves its expiry alone. The URL works for one upload, within an hour (an upload that fails can be retried with it); ask again for the next one. Each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
 			inputSchema: z.object({
 				id: id.optional().describe("An existing page to upload new files for; omit to start a new page"),
 				ttl,
@@ -189,7 +189,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"share_link",
 		{
-			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility revokes these.",
+			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility and rollback_page revoke these.",
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe(`How long the link works: "2h", "7d" (up to ${durationText(LIMITS.maxTtl)}); defaults to ${durationText(LIMITS.temporaryTtl)}`) }),
 		},
 		(input) => run(() => ops.shareLink(input.id, input.ttl)),
@@ -208,7 +208,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"rollback_page",
 		{
-			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top.",
+			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top. On a private page it revokes every pass and share link handed out so far.",
 			inputSchema: z.object({ id, version: z.number().int().describe("A version number from list_versions") }),
 		},
 		(input) => run(() => ops.rollback(input.id, input.version)),

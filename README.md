@@ -46,7 +46,7 @@ Password guesses are limited in the Worker, before the password is hashed: 5 a m
 
 A pass in the URL isn't sent to other sites in `Referer`. Pages go out with `Referrer-Policy: no-referrer`, and the sandbox gives the document an opaque origin, for which browsers send no referrer whatever policy its markup or script asks for. A page's script can still read its own URL and send it somewhere, so a private page that runs untrusted script can leak its pass that way.
 
-`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out; a private page keeps its password through that unless you give a new one or clear it.
+`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again, or rolling it back, revokes every pass already handed out; a private page keeps its password through that unless you give a new one or clear it.
 
 ### Versions and expiry
 
@@ -56,7 +56,7 @@ Pages given a ttl expire. Every request checks the expiry, so a page stops worki
 
 ### Mockup sets
 
-A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2/`.
+A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2abcd/`.
 
 - **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`. Each option in a set's `options` carries its `path` relative to the set's URL (`a/`, or empty for that root `main`).
 - **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
@@ -81,7 +81,7 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call. A new page waits as a placeholder that expires with the upload URL; its first new files, however they arrive, give it its `ttl` (permanent if none), unless its expiry was changed first |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it once, so a folder on disk never passes through the tool call. A new page waits as a placeholder that expires with the upload URL; its first new files, however they arrive, give it its `ttl` (permanent if none), unless its expiry was changed first |
 | `set_visibility` | make a page private or public, and revoke its share links; `password` sets one, `""` clears it, and leaving it out keeps the current one |
 | `share_link` | a link that opens a private page without signing in |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
@@ -118,7 +118,7 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
 | `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
-| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token. Without an `id`, the placeholder page expires with the URL, and its first new files apply `ttl` |
+| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it once within an hour, without the token; it stops working as soon as the page gets any new version. Without an `id`, the placeholder page expires with the URL, and its first new files apply `ttl` |
 
 ## Dashboard
 

@@ -183,7 +183,15 @@ ${versionList(page, versions, csrf, now)}
 </article>`;
 }
 
+/**
+ * An option's thumbnail and verdict form. The form's first button saves the
+ * note and sends no verdict, so Enter in the note box (which presses the
+ * first button) leaves the verdict as it is now, even if it changed since
+ * the page loaded. `note_was` is the note as the page loaded it: an
+ * unchanged box doesn't overwrite a note set since.
+ */
 function optionFigure(page: Page, option: MockupOption, open: string, csrf: string): string {
+	const save = "<button>save</button>";
 	const buttons = (["picked", "rejected", "pending"] as const)
 		.filter((verdict) => verdict !== option.verdict)
 		.map((verdict) => `<button name="verdict" value="${verdict}">${{ picked: "pick", rejected: "reject", pending: "undecide" }[verdict]}</button>`)
@@ -192,7 +200,7 @@ function optionFigure(page: Page, option: MockupOption, open: string, csrf: stri
 	return `<figure class="option ${option.verdict}">
 <a class="shot" href="${open}${option.path}" target="_blank" rel="noopener noreferrer"><img src="/thumbnails/${page.id}/${encodeURIComponent(option.name)}.png?v=${page.version}" loading="lazy" alt=""></a>
 <figcaption>${escape(option.name)}${badge}</figcaption>
-<form class="verdict" method="post" action="/pages/${page.id}/verdict">${hidden(page, csrf)}<input type="hidden" name="option" value="${escape(option.name)}"><input name="note" value="${escape(option.note ?? "")}" placeholder="note" maxlength="200" aria-label="Note">${buttons}</form>
+<form class="verdict" method="post" action="/pages/${page.id}/verdict">${hidden(page, csrf)}<input type="hidden" name="option" value="${escape(option.name)}"><input type="hidden" name="note_was" value="${escape(option.note ?? "")}"><input name="note" value="${escape(option.note ?? "")}" placeholder="note" maxlength="200" aria-label="Note">${save}${buttons}</form>
 </figure>`;
 }
 
@@ -458,8 +466,13 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 				await ops.delete(id);
 				break;
 			case "verdict": {
-				const verdict = String(form.get("verdict") ?? "");
-				await ops.setVerdict(id, String(form.get("option") ?? ""), verdict, String(form.get("note") ?? ""));
+				// No verdict (the save button) keeps the verdict there is now.
+				const verdict = form.get("verdict") === null ? undefined : String(form.get("verdict"));
+				const typed = String(form.get("note") ?? "");
+				const was = form.get("note_was");
+				// A note left as it loaded keeps whatever the note is now.
+				const note = was !== null && typed === String(was) ? undefined : typed;
+				if (verdict !== undefined || note !== undefined) await ops.setVerdict(id, String(form.get("option") ?? ""), verdict, note);
 				break;
 			}
 		}

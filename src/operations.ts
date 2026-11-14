@@ -106,7 +106,7 @@ export class Operations {
 	async publishMockup(input: { project?: unknown; name?: unknown; content: Content; visibility?: unknown; password?: unknown }) {
 		if (typeof input.project !== "string" || typeof input.name !== "string") throw new PageError(400, "A mockup set needs a project and a name");
 		if (!hasFiles(input.content)) throw new PageError(400, "A mockup set needs files: one top-level folder per option (a/index.html, b/index.html, ...), or a zip of them");
-		const files = decodeContent(input.content);
+		const files = decodeContent(input.content, null, "mockup");
 		const page = await this.pages.publish({
 			files,
 			ttl: "permanent",
@@ -117,12 +117,14 @@ export class Operations {
 		return { ...setView(page, this.host, await this.pages.options(page.id)), warnings: rootRelativeWarnings(files) };
 	}
 
-	/** Picks, rejects or resets an option of a mockup set. */
+	/** Picks, rejects or resets an option of a mockup set. Without a verdict, changes just the note. */
 	async setVerdict(id: string, option: unknown, verdict: unknown, note: unknown) {
 		if (typeof option !== "string") throw new PageError(400, "option must be the name of one of the set's top-level folders");
-		if (!VERDICTS.includes(verdict as Verdict)) throw new PageError(400, `verdict must be one of ${VERDICTS.map((v) => `"${v}"`).join(", ")}`);
+		if (verdict === undefined || verdict === null) {
+			if (note === undefined) throw new PageError(400, `Give a verdict (${VERDICTS.map((v) => `"${v}"`).join(", ")}), a note, or both`);
+		} else if (!VERDICTS.includes(verdict as Verdict)) throw new PageError(400, `verdict must be one of ${VERDICTS.map((v) => `"${v}"`).join(", ")}`);
 		if (note !== undefined && note !== null && typeof note !== "string") throw new PageError(400, "note must be a string, or null to clear it");
-		const options = await this.pages.setVerdict(id, option, verdict as Verdict, note as string | null | undefined);
+		const options = await this.pages.setVerdict(id, option, (verdict ?? undefined) as Verdict | undefined, note as string | null | undefined);
 		return { id, url: pageUrl(this.host, id), options };
 	}
 
@@ -144,8 +146,26 @@ export class Operations {
 
 	/** Replaces a page's files; the URL and expiry stay the same. Markdown is titled by its first heading. */
 	async update(id: string, content: Content) {
-		const files = decodeContent(content);
-		const page = await this.pages.update(id, files);
+		return this.replace(id, content);
+	}
+
+	/**
+	 * `update`, through an upload URL minted when the page's latest version was
+	 * `latestVersion`. Refused once any update has happened since, the first
+	 * upload through the URL included, so each URL works once.
+	 */
+	async upload(id: string, latestVersion: number, content: Content) {
+		try {
+			return await this.replace(id, content, latestVersion);
+		} catch (error) {
+			if (error instanceof PageError && error.status === 409) throw new PageError(403, "This upload URL has already been used, or the page has changed since; ask for a new one");
+			throw error;
+		}
+	}
+
+	private async replace(id: string, content: Content, ifLatest?: number) {
+		const files = content.zip ? await this.unzipFor(id, content) : decodeContent(content);
+		const page = await this.pages.update(id, files, { ifLatest });
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
 
@@ -160,8 +180,8 @@ export class Operations {
 	}
 
 	/**
-	 * An upload URL that replaces the files of page `id` with a zip, for an
-	 * hour. Without `id`, publishes a placeholder page first, so the agent
+	 * An upload URL that replaces the files of page `id` with a zip, once,
+	 * within an hour. Without `id`, publishes a placeholder page first, so the agent
 	 * gets the final URL before uploading. The placeholder expires with the
 	 * URL; its first new version, however it arrives, gives the page the
 	 * `ttl` asked for (see `Pages.publish`).
@@ -180,13 +200,20 @@ export class Operations {
 				});
 		// A placeholder and its upload URL expire together.
 		const expiresAt = id ? this.now() + UPLOAD_WINDOW : page.expiresAt!;
-		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, expiresAt)}`;
+		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, page.latestVersion, expiresAt)}`;
 		return {
 			...pageView(page, this.host),
 			uploadUrl,
 			uploadExpiresAt: expiresAt,
 			command: `(cd <folder> && zip -qr - .) | curl -fsS -X PUT -H "content-type: application/zip" --data-binary @- "${uploadUrl}"`,
 		};
+	}
+
+	/** Decodes a zip that replaces page `id`'s files, as a mockup set's when it is one, knowing its options. */
+	private async unzipFor(id: string, content: Content) {
+		const page = await this.pages.get(id);
+		if (page.kind !== "mockup") return decodeContent(content);
+		return decodeContent(content, null, "mockup", (await this.pages.options(id)).filter((option) => option.path).map((option) => option.name));
 	}
 
 	/**
