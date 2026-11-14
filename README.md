@@ -74,16 +74,23 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 
 | Tool | Does |
 | --- | --- |
-| `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `visibility`, `password` |
+| `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `slug`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call; the command leaves dotfiles (`.env`, `.git`) out |
 | `set_visibility` | make a page private (optionally with a password) or public |
 | `share_link` | a link that opens a private page without signing in |
+| `list_pages` | find pages, newest-updated first: compact rows filtered by `query` (label or id), `agent`, `kind`, `project`; 20 at a time (`limit` up to 100), with `cursor` for the next ones |
+| `get_page` | one page's details and its files' paths and sizes; a mockup set's options with verdicts and notes |
+| `read_file` | one file's content, from the current or a kept `version`: text as text, binary as base64, up to 256 KB |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
-| `extend_page`, `delete_page`, `list_pages` | manage pages |
-| `publish_mockup` | publish a mockup set from `project`, `name` and `files`; takes `visibility`, `password` |
+| `diff_versions` | the paths added, removed and changed between two kept versions (default: the current one and the one before) |
+| `rename_page` | change a page's or mockup set's label |
+| `extend_page`, `delete_page` | manage pages |
+| `publish_mockup` | publish a mockup set from `project`, `name` and `files`; takes `agent`, `visibility`, `password` |
 | `set_verdict` | pick, reject or reset an option of a mockup set, with an optional `note` |
+
+Every tool states its read-only, destructive, idempotent and open-world hints, and the server sends instructions on how the tools fit together. Results are compact JSON, and times are ISO 8601 strings in UTC (`"expiresAt": "2026-11-15T09:30:00.000Z"`, or null for a permanent page).
 
 ### HTTP API
 
@@ -98,21 +105,28 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 # a folder, as a zip
 (cd site && zip -qr - .) | curl -X POST "https://$PAGES_HOST/api/pages?ttl=7d&label=site" \
   -H "Authorization: Bearer $EPHEMERA_TOKEN" -H "Content-Type: application/zip" --data-binary @-
+
+# pull a page back to disk
+curl -fsS "https://$PAGES_HOST/api/pages/$ID/zip" -H "Authorization: Bearer $EPHEMERA_TOKEN" -o page.zip
 ```
 
 | Request | Does |
 | --- | --- |
-| `POST /api/pages` | publish; also takes `visibility` and `password` |
-| `GET /api/pages` | list live pages and usage |
+| `POST /api/pages` | publish; also takes `slug` (the id becomes `<slug>-<random>`), `visibility` and `password` |
+| `GET /api/pages` | `?query=&agent=&kind=&project=&limit=&cursor=`: live pages, newest-updated first, as `list_pages` returns them, and usage |
+| `GET /api/pages/:id` | one page, with its files, as `get_page` returns it |
 | `PUT /api/pages/:id` | replace the files; the URL and expiry stay the same |
 | `PATCH /api/pages/:id` | `{"ttl":"1d"}` sets or extends the expiry, `{"ttl":"permanent"}` stops it, `{"label":"…"}` renames |
 | `DELETE /api/pages/:id` | delete |
 | `POST /api/pages/:id/files` | `{"files":[…],"remove":["old.css","b/"]}` changes single files (or whole folders) and keeps the rest |
 | `GET /api/pages/:id/versions` | list kept versions |
+| `GET /api/pages/:id/files` | `?path=index.html&version=2`: one file's content, as `read_file` returns it |
+| `GET /api/pages/:id/diff` | `?from=1&to=2`: files added, removed and changed, as `diff_versions` returns them |
+| `GET /api/pages/:id/zip` | `?version=2`: the version's files as a zip (the current one by default) |
 | `POST /api/pages/:id/rollback` | `{"version":2}` serves that version again |
 | `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}` |
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
-| `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
+| `POST /api/mockups` | `{"project":…,"name":…,"files":[…],"agent":…}`, or a zip with `?project=&name=&agent=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
 | `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token |
 

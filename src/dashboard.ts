@@ -280,7 +280,7 @@ ${body}
 `;
 }
 
-function shareRender(link: { url: string; expiresAt: number | null }, nonce: string, now: number): string {
+function shareRender(link: { url: string; expiresAt: string | null }, nonce: string, now: number): string {
 	return `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -288,7 +288,7 @@ function shareRender(link: { url: string; expiresAt: number | null }, nonce: str
 ${FAVICON_LINK}
 <style nonce="${nonce}">${CSS} .share { display: flex; gap: .5rem; } .share input { flex: 1; }</style>
 <h1>Share link</h1>
-<p class="usage">Opens the page without signing in${link.expiresAt ? ` for ${duration(link.expiresAt - now)}` : ""}. Making the page public or private again revokes it.</p>
+<p class="usage">Opens the page without signing in${link.expiresAt ? ` for ${duration(Date.parse(link.expiresAt) - now)}` : ""}. Making the page public or private again revokes it.</p>
 <p class="share"><input readonly value="${escape(link.url)}" aria-label="Link"> <button type="button" data-copy="${escape(link.url)}">copy</button></p>
 <p><a href="/">back</a></p>
 <script nonce="${nonce}">${SCRIPT}</script>

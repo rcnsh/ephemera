@@ -68,7 +68,7 @@ function thumbnailKey(id: string, option?: string): string {
 }
 
 /** What request handlers may do with a page's files: read them, and keep thumbnails. Writing and deleting versions is `Pages`' job. */
-export type PageFiles = Pick<VersionFiles, "serve" | "exists" | "thumbnail" | "saveThumbnail">;
+export type PageFiles = Pick<VersionFiles, "serve" | "exists" | "read" | "manifest" | "thumbnail" | "saveThumbnail">;
 
 export class VersionFiles {
 	private readonly defer: (work: Promise<unknown>) => void;
@@ -138,6 +138,24 @@ export class VersionFiles {
 			cursor = listing.truncated ? listing.cursor : undefined;
 		} while (cursor);
 		return files;
+	}
+
+	/** Each file of a version by path, with its size and its R2 ETag (an MD5 of the content, so equal files have equal ETags). */
+	async manifest(ref: VersionRef): Promise<Map<string, { size: number; etag: string }>> {
+		const prefix = versionPrefix(ref.id, ref.version);
+		const files = new Map<string, { size: number; etag: string }>();
+		let cursor: string | undefined;
+		do {
+			const listing = await this.bucket.list({ prefix, cursor, limit: 1000 });
+			for (const object of listing.objects) files.set(object.key.slice(prefix.length), { size: object.size, etag: object.etag });
+			cursor = listing.truncated ? listing.cursor : undefined;
+		} while (cursor);
+		return files;
+	}
+
+	/** A file of a version straight from R2, without touching the edge cache: for reading files back, not serving them. */
+	async read(ref: VersionRef, path: string): Promise<ReadableStream | null> {
+		return (await this.bucket.get(versionPrefix(ref.id, ref.version) + path))?.body ?? null;
 	}
 
 	/**

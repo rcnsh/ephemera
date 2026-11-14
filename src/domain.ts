@@ -86,3 +86,10 @@ export function durationText(ms: number): string {
 	}
 	return `${Math.round(ms / 1000)} seconds`;
 }
+
+/** A time as agents see it: ISO 8601 in UTC, which models read reliably where epoch milliseconds get misread. Null stays null. */
+export function isoTime(ms: number): string;
+export function isoTime(ms: number | null): string | null;
+export function isoTime(ms: number | null): string | null {
+	return ms === null ? null : new Date(ms).toISOString();
+}

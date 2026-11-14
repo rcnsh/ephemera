@@ -19,7 +19,8 @@ function post(path: string, body: unknown): Promise<Response> {
 }
 
 async function shareLink(id: string, ttl?: string): Promise<{ url: string; expiresAt: number }> {
-	return (await post(`/pages/${id}/share`, ttl ? { ttl } : {})).json();
+	const link = (await (await post(`/pages/${id}/share`, ttl ? { ttl } : {})).json()) as { url: string; expiresAt: string };
+	return { ...link, expiresAt: Date.parse(link.expiresAt) };
 }
 
 function unlock(id: string, password: string, next = ""): Promise<Response> {
