@@ -107,6 +107,24 @@ describe("MCP endpoint", () => {
 		expect(both.isError).toBe(true);
 		expect(both.data).toMatch(/exactly one/);
 	});
+
+	// The MCP SDK caps request bodies at 4 MiB by default; pages may be far bigger.
+	it("publishes a page larger than the SDK's default request body limit", async () => {
+		const big = "x".repeat(6 * 1024 * 1024);
+		const published = await tool("publish_page", { files: [{ path: "index.html", content: "<p>big</p>" }, { path: "big.txt", content: big }] });
+		expect(published.isError).toBeFalsy();
+		expect((await (await call(`${published.data.url}big.txt`)).text()).length).toBe(big.length);
+	});
+
+	it("answers malformed JSON with a parse error", async () => {
+		const response = await call(`${PAGES}/mcp`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" },
+			body: "{not json",
+		});
+		expect(response.status).toBe(400);
+		expect((await response.json<any>()).error.code).toBe(-32700);
+	});
 });
 
 const TWO_OPTIONS = [
