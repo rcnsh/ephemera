@@ -744,8 +744,10 @@ export class Pages {
 	 * expiry (never past 30 days from now); on a permanent page it makes the
 	 * page temporary again, expiring that long from now.
 	 */
-	async extend(id: string, by: Ttl): Promise<Page> {
+	/** With `onlyIfPermanent`, a page that already expires is left as it is. */
+	async extend(id: string, by: Ttl, { onlyIfPermanent = false }: { onlyIfPermanent?: boolean } = {}): Promise<Page> {
 		const page = await this.get(id);
+		if (onlyIfPermanent && !page.permanent) return page;
 		const now = this.now();
 		let expiresAt: number | null;
 		if (by === "permanent") {
