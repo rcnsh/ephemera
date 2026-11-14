@@ -140,7 +140,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"upload_url",
 		{
-			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; the placeholder expires with the upload URL, and the first upload gives the page its ttl (permanent if none). With id, the upload replaces that page's files and leaves its expiry alone. The URL works for an hour, and each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
+			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; the placeholder expires with the upload URL, and its first new files (from the upload, update_page or patch_page) give the page its ttl (permanent if none), unless extend_page changed its expiry first. With id, the upload replaces that page's files and leaves its expiry alone. The URL works for an hour, and each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
 			inputSchema: z.object({
 				id: id.optional().describe("An existing page to upload new files for; omit to start a new page"),
 				ttl,

@@ -1,5 +1,5 @@
 import { hashPassword, uploadToken } from "./auth.ts";
-import { LIMITS, PageError, pageUrl, parseTtl, type Ttl, ttlOmitted } from "./domain.ts";
+import { LIMITS, PageError, pageUrl, parseTtl, ttlOmitted } from "./domain.ts";
 import { type Content, decodeContent, decodeFiles, hasFiles } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
@@ -69,22 +69,13 @@ function optionalText(value: unknown, name: string): string | null | undefined {
 
 const UPLOAD_WINDOW = 60 * 60 * 1000;
 
-/**
- * What a page shows until its first upload arrives. It expires with the
- * upload URL; the meta tag keeps the ttl asked for, which the first upload
- * applies (see `upload`).
- */
-function waitingPage(ttl: Ttl): string {
-	return `<!doctype html>
+/** What a page shows until its first upload arrives. */
+const WAITING = `<!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="3">
-<meta name="ephemera-upload-ttl" content="${ttl}">
 <title>Waiting for upload</title>
 <p style="font: 16px system-ui, sans-serif; margin: 2rem; color: #888">Waiting for the files to be uploaded…</p>
 `;
-}
-
-const WAITING_TTL = /<meta name="ephemera-upload-ttl" content="(permanent|\d+)">/;
 
 /** Everything live, as the owner sees it on the dashboard: whole `Page`s, password hashes included, so never for agents. */
 export interface Overview {
@@ -172,15 +163,17 @@ export class Operations {
 	 * An upload URL that replaces the files of page `id` with a zip, for an
 	 * hour. Without `id`, publishes a placeholder page first, so the agent
 	 * gets the final URL before uploading. The placeholder expires with the
-	 * URL; the first upload gives the page the `ttl` asked for.
+	 * URL; its first new version, however it arrives, gives the page the
+	 * `ttl` asked for (see `Pages.publish`).
 	 */
 	async uploadUrl(input: { id?: unknown; ttl?: TtlInput; label?: unknown; agent?: unknown; visibility?: unknown; password?: unknown }) {
 		const id = optionalText(input.id, "id");
 		const page = id
 			? await this.pages.get(id)
 			: await this.pages.publish({
-					files: [{ path: "index.html", body: new TextEncoder().encode(waitingPage(parseTtl(input.ttl))) }],
+					files: [{ path: "index.html", body: new TextEncoder().encode(WAITING) }],
 					ttl: UPLOAD_WINDOW,
+					pendingTtl: parseTtl(input.ttl),
 					label: optionalText(input.label, "label"),
 					agent: optionalText(input.agent, "agent"),
 					...(await privacy(input.visibility, input.password)),
@@ -194,28 +187,6 @@ export class Operations {
 			uploadExpiresAt: expiresAt,
 			command: `(cd <folder> && zip -qr - .) | curl -fsS -X PUT -H "content-type: application/zip" --data-binary @- "${uploadUrl}"`,
 		};
-	}
-
-	/**
-	 * Replaces a page's files from an upload URL. The first upload to a
-	 * placeholder from `uploadUrl` also gives it the ttl asked for then.
-	 */
-	async upload(id: string, content: Content) {
-		const files = decodeContent(content);
-		const ttl = await this.placeholderTtl(await this.pages.get(id));
-		let page = await this.pages.update(id, files);
-		if (ttl !== null) page = await this.pages.expireIn(id, ttl);
-		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
-	}
-
-	/** The ttl a placeholder page from `uploadUrl` is waiting to get, or null if `page` isn't one. */
-	private async placeholderTtl(page: Page): Promise<Ttl | null> {
-		if (page.version !== 1 || page.fileCount !== 1 || page.permanent || page.kind !== "page") return null;
-		const file = await this.pages.files.serve(page, "index.html");
-		if (!file?.body) return null;
-		const match = WAITING_TTL.exec(await new Response(file.body).text());
-		if (!match) return null;
-		return match[1] === "permanent" ? "permanent" : Number(match[1]);
 	}
 
 	/**

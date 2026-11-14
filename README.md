@@ -77,7 +77,7 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call. A new page waits as a placeholder that expires with the upload URL; the first upload gives it its `ttl` (permanent if none) |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call. A new page waits as a placeholder that expires with the upload URL; its first new files, however they arrive, give it its `ttl` (permanent if none), unless its expiry was changed first |
 | `set_visibility` | make a page private or public, and revoke its share links; `password` sets one, `""` clears it, and leaving it out keeps the current one |
 | `share_link` | a link that opens a private page without signing in |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
@@ -114,7 +114,7 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
 | `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
-| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token. Without an `id`, the placeholder page expires with the URL, and the first upload applies `ttl` |
+| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token. Without an `id`, the placeholder page expires with the URL, and its first new files apply `ttl` |
 
 ## Dashboard
 

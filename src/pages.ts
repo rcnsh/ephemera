@@ -37,6 +37,8 @@ interface PageRow {
 	share_epoch: number;
 	kind: PageKind;
 	project: string | null;
+	/** See `publish`'s `pendingTtl`: milliseconds, 0 for permanent, NULL for none. */
+	pending_ttl: number | null;
 }
 
 interface VerdictRow {
@@ -234,7 +236,9 @@ export class Pages {
 	/**
 	 * Files are written before the row goes to D1, and are deleted again if either
 	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
-	 * set: its id comes from the project and name.
+	 * set: its id comes from the project and name. With `pendingTtl`, the
+	 * page's first new version (from `update`, `patch` or an upload) gives it
+	 * that ttl, counted from then, unless the owner has set its expiry first.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -244,6 +248,7 @@ export class Pages {
 		visibility?: Visibility;
 		passwordHash?: string | null;
 		mockup?: { project: string; name: string };
+		pendingTtl?: Ttl;
 	}): Promise<Page> {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
 		const { files, size } = validateBundle(input.files, kind);
@@ -265,6 +270,7 @@ export class Pages {
 			share_epoch: 0,
 			kind,
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
+			pending_ttl: input.pendingTtl === undefined ? null : input.pendingTtl === "permanent" ? 0 : input.pendingTtl,
 		};
 		let warm: () => void;
 		try {
@@ -272,8 +278,8 @@ export class Pages {
 			await this.db.batch([
 				this.db
 					.prepare(
-						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project, pending_ttl)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					)
 					.bind(
 						row.id,
@@ -290,6 +296,7 @@ export class Pages {
 						row.password_hash,
 						row.kind,
 						row.project,
+						row.pending_ttl,
 					),
 				this.addVersion(row.id, row.version, now, size, files.length),
 				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
@@ -338,7 +345,8 @@ export class Pages {
 	/**
 	 * Adds a version and serves it, in one step: its files are written
 	 * alongside the old ones, then the row is pointed at it. Versions beyond
-	 * the last `LIMITS.keptVersions` are deleted in the background.
+	 * the last `LIMITS.keptVersions` are deleted in the background. A pending
+	 * ttl (see `publish`) is applied and cleared in the same write.
 	 */
 	async update(id: string, input: PageFile[]): Promise<Page> {
 		const page = await this.get(id);
@@ -405,19 +413,20 @@ export class Pages {
 			throw error;
 		}
 		const now = this.now();
-		let committed: boolean;
+		let committed: { expires_at: number | null } | undefined;
 		try {
 			const [result] = await this.db.batch([
 				this.db
 					.prepare(
-						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
-						WHERE id = ? AND latest_version = ? AND ${LIVE}`,
+						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?,
+							expires_at = CASE WHEN pending_ttl IS NULL THEN expires_at WHEN pending_ttl = 0 THEN NULL ELSE ? + pending_ttl END, pending_ttl = NULL
+						WHERE id = ? AND latest_version = ? AND ${LIVE} RETURNING expires_at`,
 					)
-					.bind(version, size, fileCount, now, id, version, now),
+					.bind(version, size, fileCount, now, now, id, version, now),
 				this.addVersion(id, version, now, size, fileCount),
 				...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
 			]);
-			committed = result!.meta.changes === 1;
+			committed = (result!.results as { expires_at: number | null }[])[0];
 		} catch (error) {
 			// The number is never used again, so nothing else would clear its files.
 			await this.store.deleteVersion({ id, version });
@@ -429,7 +438,8 @@ export class Pages {
 		}
 		warm();
 		this.defer(this.prune(id));
-		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
+		const expiresAt = committed.expires_at;
+		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now, expiresAt, permanent: expiresAt === null };
 	}
 
 	/** The versions every live page keeps, newest first, by page id. */
@@ -531,7 +541,8 @@ export class Pages {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
 		const result = await this.db
-			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			// The owner's choice wins over a ttl still waiting on a first upload.
+			.prepare(`UPDATE pages SET expires_at = ?, pending_ttl = NULL, updated_at = ? WHERE id = ? AND ${LIVE}`)
 			.bind(expiresAt, now, id, now)
 			.run();
 		if (result.meta.changes !== 1) {
@@ -559,16 +570,6 @@ export class Pages {
 			.first<PageRow>();
 		if (!row) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return toPage(row);
-	}
-
-	/** Sets a page to expire `ttl` from now, or never. Unlike `extend`, the current expiry doesn't count. */
-	async expireIn(id: string, ttl: Ttl): Promise<Page> {
-		const page = await this.get(id);
-		const now = this.now();
-		const expiresAt = ttl === "permanent" ? null : now + ttl;
-		const result = await this.db.prepare(`UPDATE pages SET expires_at = ? WHERE id = ? AND ${LIVE}`).bind(expiresAt, id, now).run();
-		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
-		return { ...page, expiresAt, permanent: expiresAt === null };
 	}
 
 	async setLabel(id: string, label: string | null): Promise<Page> {
