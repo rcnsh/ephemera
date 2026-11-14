@@ -46,7 +46,7 @@ Password guesses are limited in the Worker, before the password is hashed: 5 a m
 
 A pass in the URL isn't sent to other sites in `Referer`. Pages go out with `Referrer-Policy: no-referrer`, and the sandbox gives the document an opaque origin, for which browsers send no referrer whatever policy its markup or script asks for. A page's script can still read its own URL and send it somewhere, so a private page that runs untrusted script can leak its pass that way.
 
-`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out.
+`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out; a private page keeps its password through that unless you give a new one or clear it.
 
 ### Versions and expiry
 
@@ -81,8 +81,8 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call |
-| `set_visibility` | make a page private (optionally with a password) or public |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call. A new page waits as a placeholder that expires with the upload URL; its first new files, however they arrive, give it its `ttl` (permanent if none), unless its expiry was changed first |
+| `set_visibility` | make a page private or public, and revoke its share links; `password` sets one, `""` clears it, and leaving it out keeps the current one |
 | `share_link` | a link that opens a private page without signing in |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
 | `extend_page`, `delete_page`, `list_pages` | manage pages |
@@ -114,11 +114,11 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 | `POST /api/pages/:id/files` | `{"files":[…],"remove":["old.css","b/"]}` changes single files (or whole folders) and keeps the rest |
 | `GET /api/pages/:id/versions` | list kept versions |
 | `POST /api/pages/:id/rollback` | `{"version":2}` serves that version again |
-| `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}` |
+| `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}`; leave `password` out to keep the current one, or send `null` or `""` to clear it |
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
 | `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
-| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token |
+| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token. Without an `id`, the placeholder page expires with the URL, and its first new files apply `ttl` |
 
 ## Dashboard
 
@@ -160,7 +160,7 @@ pnpm deploy      # migrate, then cf deploy
 
 Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). The D1 schema lives in `migrations/`; add a change with `cf d1 migrations create <message>`. Tests apply the migrations to a fresh database before each test.
 
-`cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them.
+`cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them. `pnpm typecheck` is the exception: it sets `EPHEMERA_TYPES_ONLY=1` so `cf workers types` gets placeholders, and works on a clean checkout. CI (`.github/workflows/ci.yml`) runs `pnpm typecheck` and `pnpm test` on pull requests and pushes to `main`.
 
 Passes and upload tokens are in URL paths, so Workers Logs' invocation logs, which record each request's full URL, are off. The Worker logs one JSON line per request itself (method, host, path with passes and upload tokens replaced, status, milliseconds), and the messages that can carry a URL (uncaught errors, thumbnail failures) go through `redact` in `src/logging.ts`. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
 

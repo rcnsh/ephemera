@@ -5,10 +5,16 @@ import * as entrypoint from "./src/index.ts" with { type: "cf-worker" };
 // Deployment settings live in .env (see .env.example), which cf also reads for credentials.
 if (existsSync(".env")) process.loadEnvFile(".env");
 
+// `pnpm typecheck` sets EPHEMERA_TYPES_ONLY=1: generating types only needs the
+// bindings' shapes, so a clean checkout (and CI) gets placeholders. Everything
+// else, deploying included, needs the real values.
+const typesOnly = process.env.EPHEMERA_TYPES_ONLY === "1";
+
 function setting(name: string): string {
 	const value = process.env[name];
-	if (!value) throw new Error(`Set ${name} in .env (see .env.example)`);
-	return value;
+	if (value) return value;
+	if (typesOnly) return `${name.toLowerCase().replaceAll("_", "-")}.example.invalid`;
+	throw new Error(`Set ${name} in .env (see .env.example)`);
 }
 
 const pagesHost = setting("PAGES_HOST");

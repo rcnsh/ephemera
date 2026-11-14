@@ -8,7 +8,7 @@
 		"build": "cf build",
 		"migrate": "sh -c '. ./.env && cf d1 migrations apply \"$D1_DATABASE_ID\"'",
 		"deploy": "pnpm migrate && cf deploy",
-		"typecheck": "cf workers types && tsc && tsc -p test",
+		"typecheck": "EPHEMERA_TYPES_ONLY=1 cf workers types && tsc && tsc -p test",
 		"test": "vitest run"
 	},
 	"devDependencies": {
