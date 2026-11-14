@@ -40,6 +40,54 @@ export interface ServedFile {
 	body: ReadableStream | null;
 	/** Whether it came from the edge cache rather than R2. */
 	cached: boolean;
+	/**
+	 * Set when a requested range applies: `body` holds bytes `start` to `end`
+	 * (inclusive) of `size`, or, when the range can't be satisfied, is null.
+	 */
+	range?: { satisfiable: true; start: number; end: number; size: number } | { satisfiable: false; size: number };
+}
+
+/** A request's Range header, and its If-Range, which says to ignore the range unless the file still has that ETag. */
+export interface RangeRequest {
+	range: string;
+	ifRange: string | null;
+}
+
+/** A single byte range as R2 takes it. */
+type ByteRange = { offset: number; length?: number } | { suffix: number };
+
+/**
+ * One `bytes=` range, or null for anything else (several ranges, other
+ * units, nonsense), which is served as the whole file, as RFC 9110 allows.
+ */
+function parseRange(header: string): ByteRange | null {
+	const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+	if (!match) return null;
+	const [, first, last] = match as unknown as [string, string, string];
+	if (first === "") return last === "" || Number(last) === 0 ? null : { suffix: Number(last) };
+	const offset = Number(first);
+	if (last === "") return { offset };
+	return Number(last) < offset ? null : { offset, length: Number(last) - offset + 1 };
+}
+
+/** The bytes of a file of `size` that `range` asks for, or null if it asks for none of them. */
+function resolveRange(range: ByteRange, size: number): { start: number; end: number } | null {
+	if ("suffix" in range) return size === 0 ? null : { start: Math.max(0, size - range.suffix), end: size - 1 };
+	if (range.offset >= size) return null;
+	return { start: range.offset, end: range.length === undefined ? size - 1 : Math.min(size - 1, range.offset + range.length - 1) };
+}
+
+/** `bytes 0-3/100` or `bytes *\/100`, as a cached partial or 416 response carries it. */
+function parseContentRange(header: string | null): { start: number; end: number; size: number } | { size: number } | null {
+	const match = /^bytes (?:(\d+)-(\d+)|\*)\/(\d+)$/.exec(header ?? "");
+	if (!match) return null;
+	const [, start, end, size] = match;
+	return start === undefined ? { size: Number(size) } : { start: Number(start), end: Number(end), size: Number(size) };
+}
+
+/** Whether an If-Range header still names `etag`. It compares strongly, so a weak tag or a date never does. */
+function ifRangeHolds(ifRange: string | null, etag: string): boolean {
+	return ifRange === null || (!ifRange.trim().startsWith("W/") && ifRange.trim() === etag);
 }
 
 /**
@@ -85,18 +133,24 @@ export class VersionFiles {
 	/**
 	 * A file of a version to send, or null if it has none at `path`. Answers
 	 * from the edge cache when it can, and fills it from R2 when it can't.
-	 * With an `ifNoneMatch` naming the file's ETag, the body is null.
+	 * With an `ifNoneMatch` naming the file's ETag, the body is null. With a
+	 * `range` that applies, it's the part asked for (see `ServedFile.range`).
 	 */
-	async serve(ref: VersionRef, path: string, ifNoneMatch: string | null = null): Promise<ServedFile | null> {
-		const cached = await this.cached(ref, path);
+	async serve(ref: VersionRef, path: string, ifNoneMatch: string | null = null, range: RangeRequest | null = null): Promise<ServedFile | null> {
+		const wanted = range ? parseRange(range.range) : null;
+		const ifRange = range?.ifRange ?? null;
+		const cached = await this.cached(ref, path, wanted ? range!.range : null);
 		if (cached) {
-			if (cached.headers.has(MISSING)) return null;
-			const etag = cached.headers.get("etag")!;
-			const fresh = matches(ifNoneMatch, etag);
-			if (fresh) await cached.body?.cancel();
-			return { etag, contentType: cached.headers.get("content-type")!, body: fresh ? null : cached.body, cached: true };
+			const served = await this.fromCache(ref, path, cached, ifNoneMatch, wanted ? ifRange : null);
+			if (served !== undefined) return served;
 		}
-		const object = await this.bucket.get(versionPrefix(ref.id, ref.version) + path);
+		const key = versionPrefix(ref.id, ref.version) + path;
+		if (wanted) {
+			const part = await this.rangeFromR2(ref, path, key, wanted, ifNoneMatch, ifRange);
+			// undefined: no range after all (If-Range named another version), so read the whole file.
+			if (part !== undefined) return part;
+		}
+		const object = await this.bucket.get(key);
 		if (!object) {
 			// Only a missing index is worth remembering: it's how a mockup set
 			// without one of its own is shown, on every view.
@@ -109,12 +163,87 @@ export class VersionFiles {
 			else await object.body.cancel();
 			return { ...file, body: null };
 		}
-		// The cache gets its own read rather than a tee: a tee would hold
-		// whatever a slow client hasn't taken yet in memory, up to a whole page.
-		if (this.cacheOrigin) {
-			this.defer(this.bucket.get(versionPrefix(ref.id, ref.version) + path).then((copy) => (copy ? this.cache(ref, path, { ...file, body: copy.body }) : undefined)));
-		}
+		this.fillFromR2(ref, path, file);
 		return { ...file, body: object.body };
+	}
+
+	/**
+	 * A cached answer as served, or undefined if the file left the cache
+	 * meanwhile. Asked for a range, the cache answers 206 or 416 itself; but
+	 * a matching If-None-Match comes first, and an If-Range that doesn't hold
+	 * means the whole file, so unless it's a plain 206 the whole file's ETag
+	 * decides. A cached 416 carries no ETag at all.
+	 */
+	private async fromCache(ref: VersionRef, path: string, cached: Response, ifNoneMatch: string | null, ifRange: string | null): Promise<ServedFile | null | undefined> {
+		if (cached.headers.has(MISSING)) return null;
+		if (cached.status === 206 || cached.status === 416) {
+			const etag = cached.headers.get("etag");
+			const contentRange = parseContentRange(cached.headers.get("content-range"));
+			if (cached.status === 206 && etag && contentRange && "start" in contentRange && !matches(ifNoneMatch, etag) && ifRangeHolds(ifRange, etag)) {
+				return { etag, contentType: cached.headers.get("content-type")!, body: cached.body, cached: true, range: { satisfiable: true, ...contentRange } };
+			}
+			await cached.body?.cancel();
+			const whole = await this.cached(ref, path);
+			if (!whole) return undefined;
+			const served = await this.fromCache(ref, path, whole, ifNoneMatch, null);
+			if (cached.status !== 416 || !served?.body || !contentRange || !ifRangeHolds(ifRange, served.etag)) return served;
+			await served.body.cancel();
+			return { ...served, body: null, range: { satisfiable: false, size: contentRange.size } };
+		}
+		const etag = cached.headers.get("etag")!;
+		const fresh = matches(ifNoneMatch, etag);
+		if (fresh) await cached.body?.cancel();
+		return { etag, contentType: cached.headers.get("content-type")!, body: fresh ? null : cached.body, cached: true };
+	}
+
+	/**
+	 * A range of a file read from R2, or undefined to read the whole file
+	 * instead: when there's no file, or If-Range says so. R2 refuses a range
+	 * past the end, so then it's asked for the file's size to say so.
+	 */
+	private async rangeFromR2(
+		ref: VersionRef,
+		path: string,
+		key: string,
+		wanted: ByteRange,
+		ifNoneMatch: string | null,
+		ifRange: string | null,
+	): Promise<ServedFile | undefined> {
+		let object: R2ObjectBody | null;
+		try {
+			object = await this.bucket.get(key, { range: wanted });
+		} catch (error) {
+			const head = await this.bucket.head(key);
+			if (!head) return undefined;
+			if (resolveRange(wanted, head.size)) throw error;
+			const file = { etag: head.httpEtag, contentType: head.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
+			if (matches(ifNoneMatch, file.etag)) return { ...file, body: null };
+			if (!ifRangeHolds(ifRange, file.etag)) return undefined;
+			this.fillFromR2(ref, path, file);
+			return { ...file, body: null, range: { satisfiable: false, size: head.size } };
+		}
+		if (!object) return undefined;
+		const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
+		const fresh = matches(ifNoneMatch, file.etag);
+		if (fresh || !ifRangeHolds(ifRange, file.etag)) {
+			await object.body.cancel();
+			if (!fresh) return undefined;
+			this.fillFromR2(ref, path, file);
+			return { ...file, body: null };
+		}
+		const resolved = resolveRange(wanted, object.size)!;
+		this.fillFromR2(ref, path, file);
+		return { ...file, body: object.body, range: { satisfiable: true, ...resolved, size: object.size } };
+	}
+
+	/**
+	 * Fills the cache with a file in the background. The cache gets its own
+	 * read rather than a tee: a tee would hold whatever a slow client hasn't
+	 * taken yet in memory, up to a whole page.
+	 */
+	private fillFromR2(ref: VersionRef, path: string, file: { etag: string; contentType: string }): void {
+		if (!this.cacheOrigin) return;
+		this.defer(this.bucket.get(versionPrefix(ref.id, ref.version) + path).then((copy) => (copy ? this.cache(ref, path, { ...file, body: copy.body }) : undefined)));
 	}
 
 	/** Whether a version has a file at `path`. */
@@ -209,9 +338,11 @@ export class VersionFiles {
 		return `${this.cacheOrigin}/_files/${ref.id}/${ref.version}/${path.split("/").map(encodeURIComponent).join("/")}`;
 	}
 
-	private async cached(ref: VersionRef, path: string): Promise<Response | undefined> {
+	/** A cached file, or with `range` the part of it that range asks for: the cache answers 206 or 416 itself. */
+	private async cached(ref: VersionRef, path: string, range: string | null = null): Promise<Response | undefined> {
 		const key = this.cacheKey(ref, path);
-		return key ? caches.default.match(key) : undefined;
+		if (!key) return undefined;
+		return caches.default.match(range ? new Request(key, { headers: { range } }) : key);
 	}
 
 	private cache(ref: VersionRef, path: string, file: { etag: string; contentType: string; body: BodyInit } | null): Promise<void> {

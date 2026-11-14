@@ -41,10 +41,10 @@ async function readJson<T>(request: Request): Promise<Partial<T>> {
 	return (typeof body === "object" && body !== null ? body : {}) as Partial<T>;
 }
 
-/** PUT /upload/<token>: replaces the files of the page the token is for. The caller has checked the token. */
-export async function handleUpload(request: Request, ops: Operations, id: string): Promise<Response> {
+/** PUT /upload/<token>: replaces the files of the page the token is for, once. The caller has checked the token. */
+export async function handleUpload(request: Request, ops: Operations, upload: { id: string; latestVersion: number }): Promise<Response> {
 	if (request.method !== "PUT" && request.method !== "POST") return json({ error: "Method not allowed; PUT a zip" }, 405);
-	return json(await ops.update(id, (await readBundle(request, new URL(request.url))).content));
+	return json(await ops.upload(upload.id, upload.latestVersion, (await readBundle(request, new URL(request.url))).content));
 }
 
 /**

@@ -23,21 +23,24 @@ async function hmac(key: string, message: string): Promise<string> {
 }
 
 /**
- * A capability to upload new files for one page until `expiresAt`, so an
- * agent can hand a zip to curl without the bearer token. Ends in an HMAC of
- * the rest, keyed by the Worker's token.
+ * A capability to upload new files for one page once, until `expiresAt`, so
+ * an agent can hand a zip to curl without the bearer token. It names the
+ * page's `latestVersion` when it was made, and the upload is refused unless
+ * the page is still there; the upload itself moves it on, so the URL works
+ * once. Ends in an HMAC of the rest, keyed by the Worker's token.
  */
-export async function uploadToken(secret: string, id: string, expiresAt: number): Promise<string> {
+export async function uploadToken(secret: string, id: string, latestVersion: number, expiresAt: number): Promise<string> {
 	const exp = expiresAt.toString(36);
-	return `${id}.${exp}.${await hmac(secret, `upload:${id}:${exp}`)}`;
+	const version = latestVersion.toString(36);
+	return `${id}.${version}.${exp}.${await hmac(secret, `upload:${id}:${version}:${exp}`)}`;
 }
 
-/** The page id an upload token is for, or null if it's forged or expired. */
-export async function checkUploadToken(secret: string, token: string, now = Date.now()): Promise<string | null> {
-	const [id, exp, signature, ...rest] = token.split(".");
-	if (!id || !exp || !signature || rest.length || !secret) return null;
-	if (!(await safeEqual(signature, await hmac(secret, `upload:${id}:${exp}`)))) return null;
-	return parseInt(exp, 36) > now ? id : null;
+/** The page id and latest version an upload token is for, or null if it's forged or expired. */
+export async function checkUploadToken(secret: string, token: string, now = Date.now()): Promise<{ id: string; latestVersion: number } | null> {
+	const [id, version, exp, signature, ...rest] = token.split(".");
+	if (!id || !version || !exp || !signature || rest.length || !secret) return null;
+	if (!(await safeEqual(signature, await hmac(secret, `upload:${id}:${version}:${exp}`)))) return null;
+	return parseInt(exp, 36) > now ? { id, latestVersion: parseInt(version, 36) } : null;
 }
 
 /**

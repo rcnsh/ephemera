@@ -99,7 +99,7 @@ export class Operations {
 	async publishMockup(input: { project?: unknown; name?: unknown; content: Content; visibility?: unknown; password?: unknown }) {
 		if (typeof input.project !== "string" || typeof input.name !== "string") throw new PageError(400, "A mockup set needs a project and a name");
 		if (!hasFiles(input.content)) throw new PageError(400, "A mockup set needs files: one top-level folder per option (a/index.html, b/index.html, ...), or a zip of them");
-		const files = decodeContent(input.content);
+		const files = decodeContent(input.content, null, "mockup");
 		const page = await this.pages.publish({
 			files,
 			ttl: "permanent",
@@ -134,8 +134,26 @@ export class Operations {
 
 	/** Replaces a page's files; the URL and expiry stay the same. Markdown is titled by its first heading. */
 	async update(id: string, content: Content) {
-		const files = decodeContent(content);
-		const page = await this.pages.update(id, files);
+		return this.replace(id, content);
+	}
+
+	/**
+	 * `update`, through an upload URL minted when the page's latest version was
+	 * `latestVersion`. Refused once any update has happened since, the first
+	 * upload through the URL included, so each URL works once.
+	 */
+	async upload(id: string, latestVersion: number, content: Content) {
+		try {
+			return await this.replace(id, content, latestVersion);
+		} catch (error) {
+			if (error instanceof PageError && error.status === 409) throw new PageError(403, "This upload URL has already been used, or the page has changed since; ask for a new one");
+			throw error;
+		}
+	}
+
+	private async replace(id: string, content: Content, ifLatest?: number) {
+		const files = decodeContent(content, null, content.zip ? (await this.pages.get(id)).kind : "page");
+		const page = await this.pages.update(id, files, { ifLatest });
 		return { ...(await this.view(page)), warnings: rootRelativeWarnings(files) };
 	}
 
@@ -149,8 +167,8 @@ export class Operations {
 	}
 
 	/**
-	 * An upload URL that replaces the files of page `id` with a zip, for an
-	 * hour. Without `id`, publishes a placeholder page first, so the agent
+	 * An upload URL that replaces the files of page `id` with a zip, once,
+	 * within an hour. Without `id`, publishes a placeholder page first, so the agent
 	 * gets the final URL before uploading.
 	 */
 	async uploadUrl(input: { id?: string | null; ttl?: TtlInput; label?: string | null; agent?: string | null; visibility?: unknown; password?: unknown }) {
@@ -164,7 +182,7 @@ export class Operations {
 					...(await privacy(input.visibility, input.password)),
 				});
 		const expiresAt = this.now() + UPLOAD_WINDOW;
-		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, expiresAt)}`;
+		const uploadUrl = `https://${this.host}/upload/${await uploadToken(this.secret, page.id, page.latestVersion, expiresAt)}`;
 		return {
 			...pageView(page, this.host),
 			uploadUrl,

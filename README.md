@@ -42,7 +42,7 @@ A private page shows a gate at `PAGES_HOST/<id>/`. The gate has a link to sign i
 
 The pass goes in the path rather than a cookie, because a sandboxed page's own requests don't send cookies. Relative links carry the pass along, so the page's files, `fetch` and imports all work.
 
-`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out.
+`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again, or rolling it back, revokes every pass already handed out.
 
 ### Versions and expiry
 
@@ -52,7 +52,7 @@ Pages given a ttl expire. Every request checks the expiry, so a page stops worki
 
 ### Mockup sets
 
-A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2/`.
+A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2abcd/`.
 
 - **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`. Each option in a set's `options` carries its `path` relative to the set's URL (`a/`, or empty for that root `main`).
 - **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
@@ -77,7 +77,7 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it once, so a folder on disk never passes through the tool call |
 | `set_visibility` | make a page private (optionally with a password) or public |
 | `share_link` | a link that opens a private page without signing in |
 | `list_versions`, `rollback_page` | see kept versions, and serve an older one again |
@@ -114,7 +114,7 @@ curl -X POST https://$PAGES_HOST/api/pages -H "Authorization: Bearer $EPHEMERA_T
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
 | `POST /api/mockups` | `{"project":…,"name":…,"files":[…]}`, or a zip with `?project=&name=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
-| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token |
+| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it once within an hour, without the token; it stops working as soon as the page gets any new version |
 
 ## Dashboard
 

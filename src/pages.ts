@@ -112,20 +112,29 @@ const GONE_AT = "COALESCE(deleted_at, expires_at)";
 const STORED_BYTES = `SELECT COALESCE(SUM(versions.size), 0) FROM versions JOIN pages ON pages.id = versions.page_id WHERE ${LIVE}`;
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
-/** A page id, for use inside other patterns: 12 random characters, or a mockup set's `<project>-<name>-<6 random>`. */
-export const ID_SOURCE = "[a-z2-7]{12}|[a-z0-9]+(?:-[a-z0-9]+)*-[a-z2-7]{6}";
-export const ID_PATTERN = new RegExp(`^(?=.{1,47}$)(?:${ID_SOURCE})$`);
+const SLUG_SOURCE = "[a-z0-9]+(?:-[a-z0-9]+)*";
+/**
+ * A page id, for use inside other patterns: 12 random characters, or a mockup
+ * set's `<project>-<name>-<10 random>`. Sets published before suffixes grew
+ * keep their `<project>-<name>-<6 random>`.
+ */
+export const ID_SOURCE = `[a-z2-7]{12}|${SLUG_SOURCE}-[a-z2-7]{10}|${SLUG_SOURCE}-[a-z2-7]{6}`;
+/** A whole page id. A mockup slug is at most 40 characters, so each id shape has its own length limit. */
+export const ID_PATTERN = new RegExp(`^(?:[a-z2-7]{12}|(?=.{1,51}$)${SLUG_SOURCE}-[a-z2-7]{10}|(?=.{1,47}$)${SLUG_SOURCE}-[a-z2-7]{6})$`);
+
+/** How many ids `publish` draws before giving up: one clash is already unlikely, several in a row means something's wrong. */
+const ID_ATTEMPTS = 5;
 
 function randomChars(length: number): string {
 	// 32 divides 256 evenly, so masking keeps every character equally likely.
 	return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) => ID_ALPHABET[byte & 31]).join("");
 }
 
-/** A mockup set's id: its project and name as one slug, then 6 random characters. */
+/** A mockup set's id: its project and name as one slug, then 10 random characters. */
 function mockupId(project: string, name: string): string {
 	const slug = slugify(`${project}-${name}`);
 	if (!slug) throw new PageError(400, "A mockup set's project and name need some letters or digits");
-	return `${slug}-${randomChars(6)}`;
+	return `${slug}-${randomChars(10)}`;
 }
 
 /** Options as a JSON array of `{ name, folder }`, to go through `json_each` in SQL. */
@@ -232,9 +241,13 @@ export class Pages {
 	}
 
 	/**
-	 * Files are written before the row goes to D1, and are deleted again if either
-	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
-	 * set: its id comes from the project and name.
+	 * Reserves an id first, so a publish only ever writes files under an id
+	 * it owns: the row goes into D1 already deleted and purged, so it's out of
+	 * every listing and out of the sweep's way, while the files are written.
+	 * Then one batch brings it to life with its version (and a mockup set's
+	 * options). If writing or committing fails, the files and the row are
+	 * deleted again, so nothing is left behind. With `mockup`, publishes a
+	 * mockup set: its id comes from the project and name.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -248,8 +261,7 @@ export class Pages {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
 		const { files, size } = validateBundle(input.files, kind);
 		const now = this.now();
-		const row: PageRow = {
-			id: input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12),
+		const fields: Omit<PageRow, "id"> = {
 			label: clean(input.label, 200),
 			agent: clean(input.agent, 100),
 			created_at: now,
@@ -266,40 +278,63 @@ export class Pages {
 			kind,
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
 		};
+		const row = await this.reserve(fields, () => (input.mockup ? mockupId(input.mockup.project, input.mockup.name) : randomChars(12)));
 		let warm: () => void;
 		try {
 			warm = await this.store.write(row, files);
-			await this.db.batch([
-				this.db
-					.prepare(
-						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					)
-					.bind(
-						row.id,
-						row.label,
-						row.agent,
-						row.created_at,
-						row.updated_at,
-						row.expires_at,
-						row.version,
-						row.latest_version,
-						row.size,
-						row.file_count,
-						row.visibility,
-						row.password_hash,
-						row.kind,
-						row.project,
-					),
+			const [result] = await this.db.batch([
+				this.db.prepare("UPDATE pages SET deleted_at = NULL, purged = 0 WHERE id = ? AND deleted_at = ? AND purged = 1").bind(row.id, now),
 				this.addVersion(row.id, row.version, now, size, files.length),
 				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
 			]);
+			// Only a reservation that's still ours comes to life; anything else is a bug worth failing loudly on.
+			if (result!.meta.changes !== 1) throw new Error(`The reservation for page ${row.id} vanished while publishing`);
 		} catch (error) {
 			await this.store.deletePage(row.id);
+			await this.db.prepare("DELETE FROM pages WHERE id = ? AND deleted_at = ? AND purged = 1").bind(row.id, now).run();
 			throw error;
 		}
 		warm();
 		return toPage(row);
+	}
+
+	/**
+	 * Inserts the row for a page about to be published, under the first id
+	 * from `drawId` that no page has, marked deleted (at its creation time)
+	 * and purged until `publish` commits it. Ids of pages that are gone stay
+	 * taken until the sweep forgets them, so a new page never inherits an old
+	 * one's files.
+	 */
+	private async reserve(fields: Omit<PageRow, "id">, drawId: () => string): Promise<PageRow> {
+		for (let attempt = 0; attempt < ID_ATTEMPTS; attempt++) {
+			const row: PageRow = { id: drawId(), ...fields };
+			const inserted = await this.db
+				.prepare(
+					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, deleted_at, purged, version, latest_version, size, file_count, visibility, password_hash, kind, project)
+					VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT (id) DO NOTHING`,
+				)
+				.bind(
+					row.id,
+					row.label,
+					row.agent,
+					row.created_at,
+					row.updated_at,
+					row.expires_at,
+					row.created_at,
+					row.version,
+					row.latest_version,
+					row.size,
+					row.file_count,
+					row.visibility,
+					row.password_hash,
+					row.kind,
+					row.project,
+				)
+				.run();
+			if (inserted.meta.changes === 1) return row;
+		}
+		throw new PageError(503, "Couldn't find a free page id; try again");
 	}
 
 	/** Records a version, if the page row it belongs to exists by then (it's batched after the write that creates or moves it). */
@@ -340,9 +375,11 @@ export class Pages {
 	 * alongside the old ones, then the row is pointed at it. Versions beyond
 	 * the last `LIMITS.keptVersions` are deleted in the background.
 	 */
-	async update(id: string, input: PageFile[]): Promise<Page> {
+	async update(id: string, input: PageFile[], { ifLatest }: { ifLatest?: number } = {}): Promise<Page> {
 		const page = await this.get(id);
 		const { files, size } = validateBundle(input, page.kind);
+		// The version reserved next is checked against this too, so of two updates expecting it, one wins.
+		if (ifLatest !== undefined && page.latestVersion !== ifLatest) throw new PageError(409, `Page ${id} has changed since; its latest version is ${page.latestVersion}`);
 		return this.addVersionOf(page, size, files.map((file) => file.path), (version) => this.store.write({ id, version }, files));
 	}
 
@@ -467,7 +504,11 @@ export class Pages {
 		}));
 	}
 
-	/** Serves an older (or newer) kept version again. Later updates still get new numbers. */
+	/**
+	 * Serves an older (or newer) kept version again. Later updates still get
+	 * new numbers. Every pass handed out so far stops working, since one may
+	 * have been shared while the version being rolled away from was live.
+	 */
 	async rollback(id: string, version: number): Promise<Page> {
 		const page = await this.get(id);
 		if (version === page.version) return page;
@@ -481,14 +522,14 @@ export class Pages {
 		const [result] = await this.db.batch([
 			this.db
 				.prepare(
-					`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
+					`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?, share_epoch = share_epoch + 1
 					WHERE id = ? AND version = ? AND ${LIVE} AND EXISTS (SELECT 1 FROM versions WHERE page_id = ? AND version = ?)`,
 				)
 				.bind(version, target.size, target.file_count, now, id, page.version, now, id, version),
 			...options,
 		]);
 		if (result!.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
-		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now };
+		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now, shareEpoch: page.shareEpoch + 1 };
 	}
 
 	/**

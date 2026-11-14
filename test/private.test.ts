@@ -139,6 +139,17 @@ describe("private pages", () => {
 		expect((await shareLink(page.id)).url).toBe(page.url);
 	});
 
+	it("revoke share links on a rollback, so a link handed out while unwanted content was live stops working", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "index.html", content: "oops" }] }) });
+		const link = await shareLink(page.id, "7d");
+		expect(await (await call(link.url)).text()).toBe("oops");
+		expect((await post(`/pages/${page.id}/rollback`, { version: 1 })).status).toBe(200);
+		expect((await call(link.url)).status).toBe(401);
+		const fresh = await shareLink(page.id);
+		expect((await call(`${fresh.url}docs/`)).status).toBe(200);
+	});
+
 	it("clear the password when made public, and keep it off public pages", async () => {
 		const page = await publish({ password: "correct horse" });
 		const made = (await (await post(`/pages/${page.id}/visibility`, { visibility: "public" })).json()) as { hasPassword: boolean };

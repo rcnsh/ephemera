@@ -140,7 +140,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"upload_url",
 		{
-			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; with id, the upload replaces that page's files. The URL works for an hour, and each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
+			description: `Get a URL that takes a zip of a page's files from curl, for folders on disk and files too big or binary to send inline. Without id, publishes a placeholder page and returns its final URL too; with id, the upload replaces that page's files. The URL works for one upload, within an hour; ask again for the next one. Each upload adds a version. Run the returned command with <folder> replaced; index.html must be at the folder's root.`,
 			inputSchema: z.object({
 				id: id.optional().describe("An existing page to upload new files for; omit to start a new page"),
 				ttl,
@@ -185,7 +185,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"share_link",
 		{
-			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility revokes these.",
+			description: "A link that opens a private page without signing in or a password, until it expires. For a public page it's just the URL. set_visibility and rollback_page revoke these.",
 			inputSchema: z.object({ id, ttl: z.union([z.string(), z.number()]).optional().describe(`How long the link works: "2h", "7d" (up to ${durationText(LIMITS.maxTtl)}); defaults to ${durationText(LIMITS.temporaryTtl)}`) }),
 		},
 		(input) => run(() => ops.shareLink(input.id, input.ttl)),
@@ -204,7 +204,7 @@ function server(ops: Operations, host: string): McpServer {
 	mcp.registerTool(
 		"rollback_page",
 		{
-			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top.",
+			description: "Serve one of a page's kept versions again, e.g. to undo an update. The URL and expiry stay the same; a later update_page still adds a new version on top. On a private page it revokes every pass and share link handed out so far.",
 			inputSchema: z.object({ id, version: z.number().int().describe("A version number from list_versions") }),
 		},
 		(input) => run(() => ops.rollback(input.id, input.version)),
