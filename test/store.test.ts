@@ -226,7 +226,7 @@ describe("storage failures", () => {
 		expect(await pages.list()).toEqual([]);
 
 		const healthy = store();
-		healthy.clock.now = clock.now;
+		healthy.clock.now = clock.now + 1000;
 		expect((await healthy.pages.sweep()).purged).toBe(1);
 		expect((await env.BUCKET.list({ prefix: "pages/" })).objects).toHaveLength(0);
 		healthy.clock.now = START + LIMITS.goneGrace + 1;
