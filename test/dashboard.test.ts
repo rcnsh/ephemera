@@ -1,10 +1,10 @@
-import { reset } from "cloudflare:test";
+import { env, reset } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { screenshot } from "../src/thumbnails.ts";
+import { screenshots } from "../src/thumbnails.ts";
 import { ADMIN, api, call, PAGES, publish } from "./helpers.ts";
 
 afterEach(async () => {
-	vi.mocked(screenshot).mockReset().mockResolvedValue(null);
+	vi.mocked(screenshots).mockReset().mockImplementation(async (_browser, shots) => shots.map(() => null));
 	await reset();
 });
 
@@ -144,33 +144,65 @@ describe("dashboard", () => {
 		expect((await post(`/pages/${page.id}/rollback?version=7`, csrf)).status).toBe(404);
 	});
 
-	it("makes a thumbnail once per version, and doesn't cache a failed one", async () => {
+	it("makes a thumbnail once per version", async () => {
 		const png = new Uint8Array([137, 80, 78, 71]);
-		vi.mocked(screenshot).mockResolvedValue(png);
+		vi.mocked(screenshots).mockResolvedValue([png]);
 		const page = await publish();
 
 		const first = await admin(`/thumbnails/${page.id}.png`);
 		expect(first.headers.get("content-type")).toBe("image/png");
 		expect(new Uint8Array(await first.arrayBuffer())).toEqual(png);
-		expect(vi.mocked(screenshot).mock.calls[0]![1]).toBe(page.url);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toEqual([{ url: page.url, kind: "page" }]);
 		await admin(`/thumbnails/${page.id}.png`);
-		expect(screenshot).toHaveBeenCalledTimes(1);
-
-		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ html: "v2" }) });
-		vi.mocked(screenshot).mockResolvedValue(null);
-		const failed = await admin(`/thumbnails/${page.id}.png`);
-		expect(failed.headers.get("content-type")).toBe("image/svg+xml");
-		expect(failed.headers.get("cache-control")).toBe("no-store");
-		await admin(`/thumbnails/${page.id}.png`);
-		expect(screenshot).toHaveBeenCalledTimes(3);
+		expect(screenshots).toHaveBeenCalledTimes(1);
 		expect((await admin(`/thumbnails/${page.id}.png`, {}, null)).status).toBe(403);
 	});
 
+	it("remembers a page that failed to shoot for a while, but retries when no browser could be had", async () => {
+		const page = await publish();
+		vi.mocked(screenshots).mockResolvedValue([null]);
+		const noBrowser = await admin(`/thumbnails/${page.id}.png`);
+		expect(noBrowser.headers.get("content-type")).toBe("image/svg+xml");
+		expect(noBrowser.headers.get("cache-control")).toBe("no-store");
+		await admin(`/thumbnails/${page.id}.png`);
+		expect(screenshots).toHaveBeenCalledTimes(2);
+
+		vi.mocked(screenshots).mockResolvedValue(["failed"]);
+		const failed = await admin(`/thumbnails/${page.id}.png`);
+		expect(failed.headers.get("cache-control")).toBe("private, max-age=600");
+		const again = await admin(`/thumbnails/${page.id}.png`);
+		expect(again.headers.get("content-type")).toBe("image/svg+xml");
+		expect(screenshots).toHaveBeenCalledTimes(3);
+
+		// A new version is shot afresh.
+		await api(`/pages/${page.id}`, { method: "PUT", body: JSON.stringify({ html: "v2" }) });
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1])]);
+		expect((await admin(`/thumbnails/${page.id}.png`)).headers.get("content-type")).toBe("image/png");
+		expect(screenshots).toHaveBeenCalledTimes(4);
+	});
+
+	it("tries a remembered failure again once it's old", async () => {
+		const page = await publish();
+		await env.BUCKET.put(`pages/${page.id}/thumbnail.png`, new Uint8Array(0), { customMetadata: { version: "1", failedAt: String(Date.now() - 11 * 60_000) } });
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1])]);
+		expect((await admin(`/thumbnails/${page.id}.png`)).headers.get("content-type")).toBe("image/png");
+		expect(screenshots).toHaveBeenCalledTimes(1);
+	});
+
+	it("shoots a dashboard's worth of thumbnails asked for at once in one browser", async () => {
+		const ids = (await Promise.all([1, 2, 3, 4, 5].map(() => publish()))).map((page) => page.id);
+		vi.mocked(screenshots).mockImplementation(async (_browser, shots) => shots.map(() => new Uint8Array([7])));
+		const responses = await Promise.all(ids.map((id) => admin(`/thumbnails/${id}.png`)));
+		expect(responses.map((response) => response.headers.get("content-type"))).toEqual(ids.map(() => "image/png"));
+		expect(screenshots).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toHaveLength(5);
+	});
+
 	it("shoots private pages through a short-lived pass", async () => {
-		vi.mocked(screenshot).mockResolvedValue(new Uint8Array([1]));
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1])]);
 		const page = await publish({ visibility: "private" });
 		await admin(`/thumbnails/${page.id}.png`);
-		const url = vi.mocked(screenshot).mock.calls[0]![1];
+		const url = vi.mocked(screenshots).mock.calls[0]![1][0]!.url;
 		expect(url).toMatch(new RegExp(`/${page.id}/~`));
 		expect((await call(url)).status).toBe(200);
 	});

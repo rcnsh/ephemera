@@ -71,12 +71,12 @@ describe("page lifecycle", () => {
 		const page = await pages.publish({ files: INDEX, ttl: HOUR });
 
 		clock.now = START + 2 * HOUR;
-		expect(await pages.sweep()).toEqual({ purged: 1, forgotten: 0 });
+		expect(await pages.sweep()).toEqual({ purged: 1, forgotten: 0, orphans: 0 });
 		expect(await objectCount(page.id)).toBe(0);
 		expect((await pages.lookup(page.id)).state).toBe("gone");
 
 		clock.now = START + HOUR + LIMITS.goneGrace;
-		expect(await pages.sweep()).toEqual({ purged: 0, forgotten: 1 });
+		expect(await pages.sweep()).toEqual({ purged: 0, forgotten: 1, orphans: 0 });
 		expect((await pages.lookup(page.id)).state).toBe("missing");
 	});
 
@@ -188,6 +188,25 @@ describe("versions", () => {
 		expect((await pages.get(page.id)).size).toBe(3);
 	});
 
+	it("sweeps away version folders no version row points at, once they're old enough not to be a write in progress", async () => {
+		const { pages, clock, settle } = store();
+		clock.now = Date.now();
+		const page = await pages.publish({ files: INDEX, ttl: "permanent" });
+		for (let i = 0; i < LIMITS.keptVersions + 1; i++) await pages.update(page.id, INDEX);
+		await settle();
+		// Version 1 was pruned; pretend deleting its files failed, and that a write of version 9 died.
+		await env.BUCKET.put(`pages/${page.id}/1/index.html`, "old");
+		await env.BUCKET.put(`pages/${page.id}/9/index.html`, "dead");
+		const stored = async () => (await env.BUCKET.list({ prefix: `pages/${page.id}/`, delimiter: "/" })).delimitedPrefixes.length;
+		expect(await stored()).toBe(LIMITS.keptVersions + 2);
+
+		expect((await pages.sweep()).orphans).toBe(0);
+		clock.now = Date.now() + 2 * HOUR;
+		expect((await pages.sweep()).orphans).toBe(2);
+		expect(await stored()).toBe(LIMITS.keptVersions);
+		expect(await (await env.BUCKET.get(`pages/${page.id}/${LIMITS.keptVersions + 2}/index.html`))!.text()).toBe("<h1>hi</h1>");
+	});
+
 	it("forgets a page's versions with the page", async () => {
 		const { pages, clock } = store();
 		const page = await pages.publish({ files: INDEX, ttl: HOUR });
@@ -271,6 +290,16 @@ describe("storage failures", () => {
 		clock.now = START + LIMITS.goneGrace + 1;
 		expect((await pages.sweep()).forgotten).toBe(1);
 		expect(await pageRows()).toBe(0);
+	});
+
+	it("drops a remembered row once it reads the page as deleted", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: INDEX, ttl: "permanent" });
+		expect((await pages.lookup(page.id)).state).toBe("live");
+		// Deleted through another isolate: this one still remembers the row.
+		await env.DB.prepare("UPDATE pages SET deleted_at = ? WHERE id = ?").bind(START, page.id).run();
+		await expect(pages.get(page.id)).rejects.toMatchObject({ status: 410 });
+		expect((await pages.lookup(page.id)).state).toBe("gone");
 	});
 
 	it("never takes a live page for an abandoned reservation", async () => {

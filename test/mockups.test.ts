@@ -3,13 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { LIMITS } from "../src/domain.ts";
 import { mockupIndex, mockupOptions, slugify } from "../src/mockups.ts";
 import { ID_PATTERN, Pages } from "../src/pages.ts";
-import { screenshotOptions } from "../src/thumbnails.ts";
+import { screenshots } from "../src/thumbnails.ts";
 import { ADMIN, api, call, PAGES, publish, zip } from "./helpers.ts";
 
 afterEach(async () => {
-	vi.mocked(screenshotOptions)
+	vi.mocked(screenshots)
 		.mockReset()
-		.mockImplementation(async (_browser, urls) => urls.map(() => null));
+		.mockImplementation(async (_browser, shots) => shots.map(() => null));
 	await reset();
 });
 
@@ -483,35 +483,69 @@ describe("the dashboard's Mockups tab", () => {
 
 	it("shoots every option of a set with one browser launch, and keeps the shots", async () => {
 		const shots = [new Uint8Array([1]), new Uint8Array([2])];
-		vi.mocked(screenshotOptions).mockResolvedValue(shots);
+		vi.mocked(screenshots).mockResolvedValue(shots);
 		const set = await publishMockup();
 
 		const [a, b] = await Promise.all([admin(`/thumbnails/${set.id}/a.png`), admin(`/thumbnails/${set.id}/b.png`)]);
 		expect(new Uint8Array(await a!.arrayBuffer())).toEqual(shots[0]);
 		expect(new Uint8Array(await b!.arrayBuffer())).toEqual(shots[1]);
-		expect(screenshotOptions).toHaveBeenCalledTimes(1);
-		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([`${set.url}a/`, `${set.url}b/`]);
+		expect(screenshots).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toEqual([
+			{ url: `${set.url}a/`, kind: "option" },
+			{ url: `${set.url}b/`, kind: "option" },
+		]);
 
 		await admin(`/thumbnails/${set.id}/a.png`);
-		expect(screenshotOptions).toHaveBeenCalledTimes(1);
+		expect(screenshots).toHaveBeenCalledTimes(1);
 		expect((await admin(`/thumbnails/${set.id}/zz.png`)).status).toBe(404);
 	});
 
+	it("shoots only the options whose thumbnail isn't current", async () => {
+		const set = await publishMockup();
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1]), new Uint8Array([2])]);
+		await Promise.all([admin(`/thumbnails/${set.id}/a.png`), admin(`/thumbnails/${set.id}/b.png`)]);
+		await api(`/pages/${set.id}/files`, { method: "POST", body: JSON.stringify({ files: [{ path: "c/index.html", content: "<p>c</p>" }] }) });
+		// v2 needs all three again: thumbnails are per version.
+		vi.mocked(screenshots).mockClear().mockResolvedValue([new Uint8Array([3])]);
+		await env.BUCKET.put(`pages/${set.id}/thumbnails/a.png`, new Uint8Array([9]), { customMetadata: { version: "2" } });
+		await env.BUCKET.put(`pages/${set.id}/thumbnails/b.png`, new Uint8Array([9]), { customMetadata: { version: "2" } });
+		const responses = await Promise.all(["a", "b", "c"].map((option) => admin(`/thumbnails/${set.id}/${option}.png`)));
+		expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
+		expect(screenshots).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toEqual([{ url: `${set.url}c/`, kind: "option" }]);
+	});
+
+	it("deletes the thumbnails of options an update, patch or rollback removes", async () => {
+		const set = await publishMockup();
+		const thumbnails = async () => (await env.BUCKET.list({ prefix: `pages/${set.id}/thumbnails/` })).objects.map((object) => object.key.split("/").pop());
+		const keep = (option: string, version: number) => env.BUCKET.put(`pages/${set.id}/thumbnails/${option}.png`, new Uint8Array([1]), { customMetadata: { version: String(version) } });
+		await keep("a", 1);
+		await keep("b", 1);
+		await api(`/pages/${set.id}/files`, { method: "POST", body: JSON.stringify({ remove: ["b/"] }) });
+		expect(await thumbnails()).toEqual(["a.png"]);
+		await keep("b", 1);
+		await api(`/pages/${set.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "b/index.html", content: "b" }] }) });
+		expect(await thumbnails()).toEqual(["b.png"]);
+		await keep("a", 3);
+		await api(`/pages/${set.id}/rollback`, { method: "POST", body: JSON.stringify({ version: 2 }) });
+		expect(await thumbnails()).toEqual(["a.png"]);
+	});
+
 	it("shoots a single-page set at its root", async () => {
-		vi.mocked(screenshotOptions).mockResolvedValue([new Uint8Array([1])]);
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1])]);
 		const set = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
 		await admin(`/thumbnails/${set.id}/main.png`);
-		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([set.url]);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toEqual([{ url: set.url, kind: "option" }]);
 	});
 
 	it("links, shoots and shows an option in its folder even when it's a lone main/", async () => {
-		vi.mocked(screenshotOptions).mockResolvedValue([new Uint8Array([1])]);
+		vi.mocked(screenshots).mockResolvedValue([new Uint8Array([1])]);
 		const set = await publishMockup({ files: [{ path: "main/index.html", content: "<p>one</p>" }] });
 		expect(set.options).toEqual([expect.objectContaining({ name: "main", path: "main/" })]);
 		const html = await (await admin("/mockups")).text();
 		expect(html).toContain(`<a class="shot" href="${set.url}main/"`);
 		await admin(`/thumbnails/${set.id}/main.png`);
-		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([`${set.url}main/`]);
+		expect(vi.mocked(screenshots).mock.calls[0]![1]).toEqual([{ url: `${set.url}main/`, kind: "option" }]);
 		expect(await (await call(set.url)).text()).toContain('data-src="main/"');
 	});
 

@@ -1,7 +1,7 @@
 import { env, reset } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PageFile } from "../src/files.ts";
-import { VersionFiles } from "../src/version-files.ts";
+import { type Thumbnail, VersionFiles } from "../src/version-files.ts";
 
 afterEach(() => reset());
 
@@ -76,17 +76,21 @@ describe("serving a version's files", () => {
 		expect((await store.serve({ id, version: 1 }, "index.html", '"other"'))?.body).not.toBeNull();
 	});
 
-	it("remembers a missing index.html, but not other missing files", async () => {
+	it("remembers that a version has no file at a path, from serve or exists", async () => {
 		const id = newId();
 		const { store, settle } = files();
 		await store.write({ id, version: 1 }, [file("a/index.html")]);
 		expect(await store.serve({ id, version: 1 }, "index.html")).toBeNull();
 		expect(await store.serve({ id, version: 1 }, "nope.css")).toBeNull();
+		expect(await store.exists({ id, version: 1 }, "docs/index.html")).toBe(false);
 		await settle();
 		const fromCache = files({ bucket: unreadable }).store;
 		expect(await fromCache.serve({ id, version: 1 }, "index.html")).toBeNull();
 		expect(await fromCache.exists({ id, version: 1 }, "index.html")).toBe(false);
-		await expect(fromCache.serve({ id, version: 1 }, "nope.css")).rejects.toThrow("R2 was read");
+		expect(await fromCache.serve({ id, version: 1 }, "nope.css")).toBeNull();
+		expect(await fromCache.exists({ id, version: 1 }, "docs/index.html")).toBe(false);
+		// Another version's absence isn't this one's.
+		await expect(fromCache.serve({ id, version: 2 }, "nope.css")).rejects.toThrow("R2 was read");
 	});
 
 	it("caches nothing without a cache origin", async () => {
@@ -109,6 +113,7 @@ describe("storing versions", () => {
 		expect(await store.exists({ id, version: 1 }, "other/index.html")).toBe(false);
 		expect(await store.exists({ id, version: 2 }, "index.html")).toBe(false);
 		expect(await files({ bucket: unreadable }).store.exists({ id, version: 1 }, "docs/index.html")).toBe(true);
+		await settle(); // the absences it cached
 	});
 
 	it("copies files over from another version, and lists them with their sizes", async () => {
@@ -142,13 +147,43 @@ describe("thumbnails", () => {
 	it("keeps one per page and per option, for the version it was made of", async () => {
 		const id = newId();
 		const { store } = files();
+		const png = async (thumbnail: Promise<Thumbnail | null>) => new Uint8Array(await ((await thumbnail) as { png: R2ObjectBody }).png.arrayBuffer());
 		await store.saveThumbnail({ id, version: 1 }, new Uint8Array([1]));
 		await store.saveThumbnail({ id, version: 1 }, new Uint8Array([2]), "a");
-		expect(new Uint8Array(await (await store.thumbnail({ id, version: 1 }))!.arrayBuffer())).toEqual(new Uint8Array([1]));
-		expect(new Uint8Array(await (await store.thumbnail({ id, version: 1 }, "a"))!.arrayBuffer())).toEqual(new Uint8Array([2]));
+		expect(await png(store.thumbnail({ id, version: 1 }))).toEqual(new Uint8Array([1]));
+		expect(await png(store.thumbnail({ id, version: 1 }, "a"))).toEqual(new Uint8Array([2]));
 		expect(await store.thumbnail({ id, version: 1 }, "b")).toBeNull();
 		expect(await store.thumbnail({ id, version: 2 })).toBeNull();
 		await store.saveThumbnail({ id, version: 2 }, new Uint8Array([3]));
 		expect(await store.thumbnail({ id, version: 1 })).toBeNull();
+	});
+
+	it("remembers a failed shot, for its version only", async () => {
+		const id = newId();
+		const { store } = files();
+		await store.saveThumbnailFailure({ id, version: 1 }, 1234, "a");
+		expect(await store.thumbnail({ id, version: 1 }, "a")).toEqual({ failedAt: 1234 });
+		expect(await store.thumbnail({ id, version: 2 }, "a")).toBeNull();
+		expect(await store.thumbnail({ id, version: 1 })).toBeNull();
+	});
+
+	it("deletes the thumbnails of options a set no longer has", async () => {
+		const id = newId();
+		const { store } = files();
+		for (const option of ["a", "b", "c d"]) await store.saveThumbnail({ id, version: 1 }, new Uint8Array([1]), option);
+		await store.saveThumbnail({ id, version: 1 }, new Uint8Array([1]));
+		await store.deleteOptionThumbnails(id, ["c d"]);
+		expect((await env.BUCKET.list({ prefix: `pages/${id}/` })).objects.map((object) => object.key).sort()).toEqual([`pages/${id}/thumbnail.png`, `pages/${id}/thumbnails/c d.png`]);
+	});
+
+	it("lists the versions a page has stored, and when one was written", async () => {
+		const id = newId();
+		const { store } = files();
+		await store.write({ id, version: 1 }, [file("index.html"), file("a/b.css")]);
+		await store.write({ id, version: 12 }, [file("index.html")]);
+		await store.saveThumbnail({ id, version: 1 }, new Uint8Array([1]), "a");
+		expect((await store.storedVersions(id)).sort((a, b) => a - b)).toEqual([1, 12]);
+		expect(Math.abs((await store.writtenAt({ id, version: 12 }))! - Date.now())).toBeLessThan(60_000);
+		expect(await store.writtenAt({ id, version: 2 })).toBeNull();
 	});
 });
