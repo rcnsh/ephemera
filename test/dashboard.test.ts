@@ -528,7 +528,7 @@ describe("bulk outcomes", () => {
 			expect(decodeURIComponent(response.headers.get("x-ephemera-notice")!)).toBe(`Deleted ${page.id}; its files will be cleaned up shortly.`);
 			const other = await publish();
 			const plain = await post(`/pages/${other.id}/delete`, csrf, ADMIN, {}, { referer: `${ADMIN}/?q=x` });
-			expect(plain.headers.get("location")).toBe(`/?q=x&cleanup=${other.id}`);
+			expect(plain.headers.get("location")).toMatch(new RegExp(`^/\\?q=x&cleanup=${other.id}&sig=[\\w-]+$`));
 		} finally {
 			spy.mockRestore();
 		}
@@ -549,9 +549,15 @@ describe("bulk outcomes", () => {
 		} finally {
 			busy.mockRestore();
 		}
-		expect(location).toBe(`/?q=x&did=temporary&failed=${b.id}`);
+		expect(location).toMatch(new RegExp(`^/\\?q=x&did=temporary&failed=${b.id}&sig=[\\w-]+$`));
 		const shown = await (await admin(location.replace("q=x&", ""))).text();
 		expect(shown).toContain("<p class=\"error\">Couldn't make temporary bravo. Try again.</p>");
+		// Only the dashboard's own redirect is believed: a link made by hand, or one whose outcome was edited, says nothing.
+		const unsigned = location.replace(/&sig=.*/, "");
+		expect(await (await admin(unsigned)).text()).not.toContain('<p class="error">Couldn');
+		expect(await (await admin(location.replace(b.id, a.id))).text()).not.toContain('<p class="error">Couldn');
+		expect(await (await admin(location.replace("did=temporary", "did=delete"))).text()).not.toContain('<p class="error">Couldn');
+		expect(await (await admin(`/?cleanup=${a.id},${b.id}`)).text()).not.toContain('<p class="notice">Deleted');
 
 		const spy = failCleanup();
 		try {
@@ -560,10 +566,10 @@ describe("bulk outcomes", () => {
 		} finally {
 			spy.mockRestore();
 		}
-		expect(location).toBe(`/?cleanup=${c.id}`);
+		expect(location).toMatch(new RegExp(`^/\\?cleanup=${c.id}&sig=[\\w-]+$`));
 		expect(await (await admin(location)).text()).toContain('<p class="notice">Deleted 1 page; its files will be cleaned up shortly.</p>');
 		// The next action's redirect drops the last one's outcome, so it isn't said twice.
-		const next = await post(`/pages/${a.id}/label`, csrf, ADMIN, { label: "alpha two" }, { referer: `${ADMIN}/?q=x&did=temporary&failed=${b.id}&cleanup=${c.id}` });
+		const next = await post(`/pages/${a.id}/label`, csrf, ADMIN, { label: "alpha two" }, { referer: `${ADMIN}/?q=x&did=temporary&failed=${b.id}&cleanup=${c.id}&sig=abc` });
 		expect(next.headers.get("location")).toBe(`/?q=x#p-${a.id}`);
 		// Ids that aren't page ids never reach the page.
 		expect(await (await admin("/?did=delete&failed=%3Cb%3E")).text()).not.toMatch(/<p class="error">Couldn't/);

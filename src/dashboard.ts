@@ -331,7 +331,7 @@ function swap(stale, html, key) {
 	const template = document.createElement("template");
 	template.innerHTML = html;
 	const next = template.content.firstElementChild;
-	if (item.isConnected && Number(next.dataset.updated) < Number(item.dataset.updated)) {
+	if (item !== stale && item.isConnected && Number(next.dataset.updated) < Number(item.dataset.updated)) {
 		if (key !== undefined) refocus(item, key);
 		return item;
 	}
@@ -399,6 +399,8 @@ document.addEventListener("submit", async (event) => {
 	const busy = item || form;
 	if (busy.classList.contains("busy")) return;
 	const key = controlOf(item, form, submitter);
+	// What an earlier action came to is no longer news.
+	$("#notices")?.replaceChildren();
 	for (const old of $$(".error", busy)) old.remove();
 	// Not disabled while it runs: that would drop focus. Busy guards against a second press.
 	busy.classList.add("busy");
@@ -632,6 +634,27 @@ function viewOf(url: URL): View {
 		failed: idList(url.searchParams.get("failed")),
 		cleanup: idList(url.searchParams.get("cleanup")),
 	};
+}
+
+/**
+ * Who an outcome in a URL is signed for: the user and the outcome itself, so
+ * `csrfToken` over it proves the dashboard wrote those parameters after an
+ * action, and a crafted link can't make the page report one that never ran.
+ */
+function outcomeSubject(user: string, params: URLSearchParams): string {
+	return [user, "outcome", params.get("did") ?? "", params.get("failed") ?? "", params.get("cleanup") ?? ""].join("\n");
+}
+
+/** Signs the outcome parameters of a redirect. */
+async function signOutcome(location: URL, secret: string, user: string): Promise<void> {
+	location.searchParams.set("sig", await csrfToken(secret, outcomeSubject(user, location.searchParams)));
+}
+
+/** `view` with its outcome dropped unless the URL's signature is the dashboard's own. */
+async function trustedOutcome(view: View, url: URL, secret: string, user: string): Promise<View> {
+	if (!view.did && !view.failed.length && !view.cleanup.length) return view;
+	if (await checkCsrf(secret, outcomeSubject(user, url.searchParams), url.searchParams.get("sig") ?? "")) return view;
+	return { ...view, did: null, failed: [], cleanup: [] };
 }
 
 const CLEANUP_NOTE = "its files will be cleaned up shortly";
@@ -1045,7 +1068,7 @@ function backTo(request: Request, form: FormData, adminHost: string): string {
 		try {
 			const url = new URL(candidate, origin);
 			if (url.origin === origin && (url.pathname === "/" || url.pathname === "/mockups")) {
-				for (const outcome of ["did", "failed", "cleanup"]) if (url.searchParams.has(outcome)) url.searchParams.delete(outcome);
+				for (const outcome of ["did", "failed", "cleanup", "sig"]) if (url.searchParams.has(outcome)) url.searchParams.delete(outcome);
 				return url.pathname + url.search;
 			}
 		} catch {
@@ -1081,6 +1104,7 @@ async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, f
 	const errors = new Map<string, string>();
 	const changed: string[] = [];
 	const cleanup: string[] = [];
+	const unshown = new Set<string>();
 	for (let i = 0; i < ids.length; i += BULK_BATCH) {
 		const batch = ids.slice(i, i + BULK_BATCH);
 		const results = await Promise.allSettled(batch.map((id) => (verb === "delete" ? deleteKeepingRecord(ops, pages, id) : ops.makeTemporary(id))));
@@ -1115,12 +1139,14 @@ async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, f
 			} catch (error) {
 				console.error(`rendering ${id} after bulk ${verb} failed`, error);
 				errors.set(id, "Done, but its card couldn't be shown; reload to see it");
+				unshown.add(id);
 			}
 		}
 	}
 	for (const [id, message] of errors) parts.push(`<p class="error" data-error-for="${id}">${escape(message)}</p>`);
 	for (const id of cleanup) parts.push(`<p class="notice" data-notice-for="${id}">Deleted ${id}; ${CLEANUP_NOTE}.</p>`);
-	return { html: parts.join("\n"), status: 200, verb, failed: [...errors.keys()], cleanup };
+	// The action went through for a page whose card couldn't be drawn, so it isn't among the failures.
+	return { html: parts.join("\n"), status: 200, verb, failed: [...errors.keys()].filter((id) => !unshown.has(id)), cleanup };
 }
 
 /**
@@ -1161,7 +1187,8 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		const [overview, csrf] = await Promise.all([ops.overview(), csrfToken(env.EPHEMERA_TOKEN, user)]);
 		const tab = url.pathname === "/" ? "pages" : "mockups";
 		const ownIndex = tab === "mockups" ? await setsWithOwnIndex(pages, overview.pages.filter((page) => page.kind === "mockup"), overview.options) : new Set<string>();
-		return respond(render(tab, overview, env.PAGES_HOST, csrf, nonce, Date.now(), viewOf(url), ownIndex), 200, nonce);
+		const view = await trustedOutcome(viewOf(url), url, env.EPHEMERA_TOKEN, user);
+		return respond(render(tab, overview, env.PAGES_HOST, csrf, nonce, Date.now(), view, ownIndex), 200, nonce);
 	}
 
 	const thumb = new RegExp(`^/thumbnails/(${ID_SOURCE})\\.png$`).exec(url.pathname);
@@ -1217,6 +1244,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 			location.searchParams.set("failed", done.failed.join(","));
 		}
 		if (done.cleanup?.length) location.searchParams.set("cleanup", done.cleanup.join(","));
+		if (done.failed?.length || done.cleanup?.length) await signOutcome(location, env.EPHEMERA_TOKEN, user);
 		return new Response(null, { status: 303, headers: { location: location.pathname + location.search } });
 	}
 
@@ -1264,6 +1292,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 					}
 					const location = new URL(back, `https://${env.ADMIN_HOST}`);
 					location.searchParams.set("cleanup", id);
+					await signOutcome(location, env.EPHEMERA_TOKEN, user);
 					return new Response(null, { status: 303, headers: { location: location.pathname + location.search } });
 				}
 				break;
