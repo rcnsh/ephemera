@@ -93,6 +93,8 @@ export function mockupIndex(title: string, options: MockupOption[]): string {
 	const pickedCount = options.filter((option) => option.verdict === "picked").length;
 	const count = `${options.length} option${options.length === 1 ? "" : "s"}${pickedCount ? ` · ${pickedCount} picked` : ""}`;
 	const jsTitle = JSON.stringify(title).replace(/</g, "\\u003c");
+	// With one option there is nothing to step to.
+	const single = options.length < 2 ? " hidden" : "";
 	return `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -140,6 +142,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-
 .icon { display: inline-grid; place-items: center; width: 32px; height: 32px; font: inherit; font-size: 15px; line-height: 1; color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 9px; cursor: pointer; text-decoration: none; box-shadow: var(--shadow); transition: color .15s, border-color .15s, transform .1s; }
 .icon:hover { color: var(--text); border-color: var(--hover); }
 .icon:active { transform: scale(.96); }
+.icon[hidden] { display: none; }
 
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--card, 460px)), 1fr)); gap: 2rem 1.5rem; padding: 1.5rem; }
 .option { margin: 0; min-width: 0; display: flex; flex-direction: column; gap: .6rem; }
@@ -148,7 +151,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-
 .option figcaption { display: flex; align-items: center; gap: .5rem; min-width: 0; padding: 0 .1rem; }
 .option .name { font-weight: 600; letter-spacing: -.005em; color: inherit; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .option .name:hover { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--faint); }
-.option .open { margin-left: auto; color: var(--faint); text-decoration: none; padding: 0 .25rem; transition: color .15s; }
+.option .open { margin-left: auto; color: var(--muted); text-decoration: none; padding: 0 .25rem; transition: color .15s; }
 .option .open:hover { color: var(--text); }
 .badge { display: inline-flex; align-items: center; gap: .25rem; font-size: 11px; font-weight: 600; letter-spacing: .01em; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 999px; padding: .1rem .55rem .1rem .45rem; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
@@ -172,14 +175,18 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-
 .morphing .chip { opacity: 0 !important; transition: none; }
 .option .screen:active { transform: scale(.995); }
 
-.focus { display: flex; flex-direction: column; height: calc(100vh - var(--header, 56px)); padding: .9rem 1.5rem 1.5rem; gap: .9rem; }
+.focus { display: flex; flex-direction: column; height: calc(100vh - var(--header, 56px)); height: calc(100dvh - var(--header, 56px)); padding: .9rem 1.5rem 1.5rem; gap: .9rem; }
 .focus[hidden], .grid[hidden] { display: none; }
+.empty { padding: 4rem 1.5rem; text-align: center; color: var(--muted); }
+.empty p { margin: 0 0 .25rem; }
+.empty strong { color: var(--text); }
 .tabs { display: flex; align-items: center; gap: .5rem; min-width: 0; }
 .tabs .list { position: relative; display: flex; gap: .15rem; overflow-x: auto; scrollbar-width: none; min-width: 0; padding: 2px; }
 .tabs .list a { position: relative; flex: none; color: var(--muted); text-decoration: none; padding: .35rem .75rem; border-radius: 8px; white-space: nowrap; transition: color .15s, background-color .15s; }
 .tabs .list a:hover { color: var(--text); background: color-mix(in srgb, var(--line) 50%, transparent); }
 .tabs .list a[aria-current="true"] { color: var(--text); background: var(--surface); box-shadow: 0 0 0 1px var(--line), var(--shadow); font-weight: 600; }
 .tabs .list a.picked::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: .45rem; vertical-align: middle; border-radius: 50%; background: var(--accent); }
+.tabs .icon { flex: none; }
 .tabs .open { margin-left: auto; }
 .stage { flex: 1; min-height: 0; display: flex; justify-content: center; }
 .stage .screen { aspect-ratio: auto; height: 100%; width: calc(var(--w) * var(--s, 1) * 1px); max-width: 100%; box-shadow: var(--shadow-hover); }
@@ -199,18 +206,18 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-
 <header>
 <div class="brand">${mark("hm", 7)}<h1>${escape(title)}</h1></div>
 <span class="count">${count}</span>
-<div class="controls">
+${options.length ? `<div class="controls">
 <div class="seg" role="group" aria-label="Viewport"><span class="pill" aria-hidden="true"></span><button type="button" data-width="desktop" aria-pressed="true">Desktop</button><button type="button" data-width="tablet" aria-pressed="false">Tablet</button><button type="button" data-width="phone" aria-pressed="false">Phone</button></div>
-</div>
+</div>` : ""}
 </header>
-<main class="grid">
+${options.length ? `<main class="grid">
 ${figures}
 </main>
 <section class="focus" hidden>
 <nav class="tabs" aria-label="Options">
-<button type="button" class="icon prev" aria-label="Previous option" title="Previous (←)">&#8592;</button>
+<button type="button" class="icon prev" aria-label="Previous option" title="Previous (←)"${single}>&#8592;</button>
 <div class="list"></div>
-<button type="button" class="icon next" aria-label="Next option" title="Next (→)">&#8594;</button>
+<button type="button" class="icon next" aria-label="Next option" title="Next (→)"${single}>&#8594;</button>
 <a class="icon open" target="_blank" title="Open in a new tab" aria-label="Open in a new tab">&#8599;</a>
 <a class="icon close" href="#" title="Back to all options (Esc)" aria-label="Back to all options">&#10005;</a>
 </nav>
@@ -240,14 +247,26 @@ ${figures}
 	});
 
 	// Each screen fades its iframe in once loaded, with a shimmer until then.
+	// A frame that never fires load is shown anyway 4s after it starts: lazy
+	// grid frames start near the viewport, the stage's when it gets a src.
+	const LOAD_WAIT = 4000;
 	const screens = [...document.querySelectorAll(".screen")];
 	for (const screen of screens) {
 		const f = screen.querySelector("iframe");
 		f.addEventListener("load", () => f.getAttribute("src") && screen.classList.add("loaded"));
 	}
-	setTimeout(() => screens.forEach((s) => s.querySelector("iframe").getAttribute("src") && s.classList.add("loaded")), 4000);
+	const starting = new IntersectionObserver((entries) => entries.forEach((e) => {
+		if (!e.isIntersecting) return;
+		starting.unobserve(e.target);
+		setTimeout(() => e.target.classList.add("loaded"), LOAD_WAIT);
+	}), { rootMargin: "1250px 0px" });
+	screens.forEach((s) => s !== stage && starting.observe(s));
+	let stageWait = 0;
 
-	let width = "desktop";
+	// Without a width in the hash, a narrow screen starts on the phone viewport.
+	const narrow = matchMedia("(max-width: 600px)");
+	const defaultWidth = () => (narrow.matches ? "phone" : "desktop");
+	let width = defaultWidth();
 	let current = null;
 	// The option being shown or about to be: a view transition renders a frame
 	// late, and a key pressed meanwhile must act on where the page is going.
@@ -281,14 +300,14 @@ ${figures}
 	const writeHash = (option, w) => {
 		const params = new URLSearchParams();
 		if (option != null) params.set("option", option);
-		if (w !== "desktop") params.set("width", w);
+		if (w !== defaultWidth()) params.set("width", w);
 		const next = params.toString();
 		if (next !== location.hash.slice(1)) history.replaceState(null, "", next ? "#" + next : location.pathname + location.search);
 	};
 
 	const render = () => {
 		const state = new URLSearchParams(location.hash.slice(1));
-		width = SIZES[state.get("width")] ? state.get("width") : "desktop";
+		width = SIZES[state.get("width")] ? state.get("width") : defaultWidth();
 		const index = options.findIndex((o) => o.name === state.get("option"));
 		const was = current;
 		current = index >= 0 ? index : null;
@@ -307,6 +326,8 @@ ${figures}
 			if (frame.getAttribute("src") !== o.src) {
 				stage.classList.remove("loaded");
 				frame.src = o.src;
+				clearTimeout(stageWait);
+				stageWait = setTimeout(() => stage.classList.add("loaded"), LOAD_WAIT);
 			}
 			frame.title = o.name;
 			open.href = o.src;
@@ -333,9 +354,18 @@ ${figures}
 		}).finished.finally(() => { to.style.viewTransitionName = ""; root.classList.remove("morphing"); });
 	};
 
+	// Opening moves focus into the full-size view, to the option's tab;
+	// closing returns it to the card the view was showing.
 	const go = (option) => {
 		const before = wanted;
-		const update = () => { writeHash(option, width); render(); };
+		const update = () => {
+			const shown = current;
+			const inTabs = list.contains(document.activeElement);
+			writeHash(option, width);
+			render();
+			if (current !== null && (shown === null || inTabs)) tabs[current].focus({ preventScroll: true });
+			else if (current === null && shown !== null) options[shown].el.querySelector(".hit").focus({ preventScroll: true });
+		};
 		const target = options.findIndex((o) => o.name === option);
 		wanted = target >= 0 ? target : null;
 		if (before === null && target >= 0) morph(options[target].el.querySelector(".screen"), stage, update);
@@ -367,7 +397,7 @@ ${figures}
 	render();
 	requestAnimationFrame(() => seg.classList.add("ready"));
 })();
-</script>
+</script>` : `<main class="empty"><p><strong>No options yet.</strong></p><p>Each top-level folder with an index.html becomes an option.</p></main>`}
 </html>
 `;
 }

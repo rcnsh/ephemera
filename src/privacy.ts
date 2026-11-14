@@ -82,13 +82,14 @@ export function gate(env: Env, page: Page, rest: string, message = "", status = 
 <title>Private page</title>
 ${FAVICON_LINK}
 <style>
-body { font: 16px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto; padding: 0 1rem; color: #222; }
+:root { color-scheme: light dark; }
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto; padding: 0 1rem; color: #222; background: #fff; }
 h1 { font-size: 1.2rem; }
 .message { color: #b00; }
-.or { color: #888; }
+.or { color: #6b6b6b; }
 input, button { font: inherit; }
 a { color: #0645ad; }
-@media (prefers-color-scheme: dark) { body { color: #ddd; background: #161616; } a { color: #8ab4f8; } }
+@media (prefers-color-scheme: dark) { body { color: #ddd; background: #161616; } a { color: #8ab4f8; } .message { color: #ff7b72; } .or { color: #a3a3a3; } }
 </style>
 <h1>This page is private</h1>
 ${message ? `<p class="message">${escape(message)}</p>` : ""}

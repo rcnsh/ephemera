@@ -319,7 +319,7 @@ describe("the dashboard's Mockups tab", () => {
 			body: new URLSearchParams({ csrf, back: "/mockups", option: "b", verdict: "rejected", note: "too busy" }),
 		});
 		expect(response.status).toBe(303);
-		expect(response.headers.get("location")).toBe("/mockups");
+		expect(response.headers.get("location")).toBe(`/mockups#p-${set.id}`);
 		expect((await options(set.id))[1]).toMatchObject({ verdict: "rejected", note: "too busy" });
 	});
 
@@ -351,7 +351,8 @@ describe("the dashboard's Mockups tab", () => {
 		const set = await publishMockup({ files: [{ path: "main/index.html", content: "<p>one</p>" }] });
 		expect(set.options).toEqual([expect.objectContaining({ name: "main", path: "main/" })]);
 		const html = await (await admin("/mockups")).text();
-		expect(html).toContain(`<a class="shot" href="${set.url}main/"`);
+		// The gallery's full-size view of it: a lone folder still gets the gallery.
+		expect(html).toContain(`<a class="shot" href="${set.url}#option=main"`);
 		await admin(`/thumbnails/${set.id}/main.png`);
 		expect(vi.mocked(screenshotOptions).mock.calls[0]![1]).toEqual([`${set.url}main/`]);
 		expect(await (await call(set.url)).text()).toContain('data-src="main/"');
@@ -368,12 +369,107 @@ describe("the dashboard's Mockups tab", () => {
 		expect(set.options.map((option) => option.path)).toEqual(["a%20b%231/", "c/"]);
 		expect(await (await call(set.url)).text()).toContain('<iframe src="a%20b%231/"');
 		const html = await (await admin("/mockups")).text();
-		expect(html).toContain(`<a class="shot" href="${set.url}a%20b%231/"`);
+		expect(html).toContain(`<a class="shot" href="${set.url}#option=a%20b%231"`);
 	});
 
 	it("moves an option between the root and its folder when an update does", async () => {
 		const set = await publishMockup({ files: [{ path: "index.html", content: "<p>one</p>" }] });
 		await api(`/pages/${set.id}`, { method: "PUT", body: JSON.stringify({ files: [{ path: "main/index.html", content: "<p>one</p>" }] }) });
 		expect(await options(set.id)).toEqual([expect.objectContaining({ name: "main", path: "main/" })]);
+	});
+});
+
+describe("the dashboard's mockup set controls", () => {
+	function admin(path = "/", init: RequestInit = {}): Promise<Response> {
+		return call(`${ADMIN}${path}`, init, { accessAud: "test-aud" });
+	}
+	async function csrf(): Promise<string> {
+		return /name="csrf" value="([^"]+)"/.exec(await (await admin("/mockups")).text())![1]!;
+	}
+	function fragment(path: string, token: string, fields: Record<string, string> = {}): Promise<Response> {
+		const body = new URLSearchParams(fields);
+		body.set("csrf", token);
+		return admin(path, { method: "POST", headers: { origin: ADMIN, "content-type": "application/x-www-form-urlencoded", "x-ephemera-fragment": "1" }, body });
+	}
+
+	it("links option thumbnails to the gallery's full-size view, through /open/ for private sets", async () => {
+		const set = await publishMockup();
+		const secret = await publishMockup({ name: "Secret", visibility: "private" });
+		const html = await (await admin("/mockups")).text();
+		expect(html).toContain(`<a class="shot" href="${set.url}#option=a"`);
+		expect(html).toContain(`<a class="shot" href="/open/${secret.id}/#option=b"`);
+	});
+
+	it("links option thumbnails to the option itself when the set's own index.html replaces the gallery", async () => {
+		const set = await publishMockup({ files: [...TWO_OPTIONS, { path: "index.html", content: "<p>custom</p>" }] });
+		const html = await (await admin("/mockups")).text();
+		expect(html).toContain(`<a class="shot" href="${set.url}a/"`);
+		expect(html).not.toContain(`${set.url}#option=`);
+	});
+
+	it("renames a set and changes its lifetime, answering the script with the set's new HTML", async () => {
+		const set = await publishMockup();
+		let html = await (await admin("/mockups")).text();
+		expect(html).toContain(`action="/pages/${set.id}/label"`);
+		expect(html).toContain(`action="/pages/${set.id}/temporary"`);
+		const token = await csrf();
+
+		const renamed = await fragment(`/pages/${set.id}/label`, token, { label: "Density, take two" });
+		expect(renamed.status).toBe(200);
+		html = await renamed.text();
+		expect(html).toMatch(new RegExp(`^<article class="set" id="p-${set.id}"`));
+		expect(html).toContain('value="Density, take two"');
+		expect(html).toContain(`<a class="shot" href="${set.url}#option=a"`);
+
+		html = await (await fragment(`/pages/${set.id}/temporary`, token)).text();
+		expect(html).toMatch(/<span class="badge"><span class="expiry" data-expires="\d+">expires in 24h 0m<\/span><\/span>/);
+		expect(html).toContain(`action="/pages/${set.id}/extend?by=7d"`);
+		expect(html).toContain(`action="/pages/${set.id}/permanent"`);
+
+		await fragment(`/pages/${set.id}/extend?by=1d`, token);
+		expect(((await (await api(`/pages/${set.id}`)).json()) as MockupView).permanent).toBe(false);
+		await fragment(`/pages/${set.id}/permanent`, token);
+		expect(((await (await api(`/pages/${set.id}`)).json()) as MockupView).permanent).toBe(true);
+	});
+
+	it("filters sets by ?q= and ?verdict= before the script runs", async () => {
+		const set = await publishMockup();
+		const other = await publishMockup({ name: "Other" });
+		await verdict(set.id, { option: "a", verdict: "picked" });
+		const html = await (await admin("/mockups?verdict=picked")).text();
+		expect(html).toMatch(new RegExp(`<article class="set" id="p-${set.id}"`));
+		expect(html).toMatch(new RegExp(`<article class="set hidden" id="p-${other.id}"`));
+		expect(html).toContain('<option value="picked" selected>');
+		expect(html).toContain("1 of 2 sets");
+	});
+
+	it("names each note box after its option", async () => {
+		await publishMockup();
+		expect(await (await admin("/mockups")).text()).toContain('aria-label="Note on a"');
+	});
+});
+
+describe("the gallery's edge cases", () => {
+	const option = (name: string) => ({ name, path: `${name}/`, verdict: "pending" as const, note: null, updatedAt: 0 });
+
+	it("hides previous and next with one option", () => {
+		expect(mockupIndex("t", [option("a")])).toMatch(/class="icon prev"[^>]* hidden>/);
+		expect(mockupIndex("t", [option("a"), option("b")])).not.toMatch(/class="icon prev"[^>]* hidden>/);
+	});
+
+	it("shows an empty state, and no viewport controls or script, with no options", () => {
+		const html = mockupIndex("t", []);
+		expect(html).toContain('<main class="empty">');
+		expect(html).not.toContain('<main class="grid">');
+		expect(html).not.toContain("data-width");
+		expect(html.match(/<\/script>/g)).toHaveLength(1);
+	});
+
+	it("sizes the full-size view to the dynamic viewport, and defaults narrow screens to the phone width", () => {
+		const html = mockupIndex("t", [option("a")]);
+		expect(html).toContain("height: calc(100dvh - var(--header, 56px))");
+		expect(html).toContain('matchMedia("(max-width: 600px)")');
+		// Only frames that have started get the timeout.
+		expect(html).toContain("new IntersectionObserver");
 	});
 });
