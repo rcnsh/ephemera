@@ -8,7 +8,8 @@ import { contentType, type PageFile } from "./files.ts";
  *
  * A version's files never change, so `serve` keeps them in the edge cache
  * under their version (see `VersionFilesOptions.cacheOrigin`): R2 is read once
- * per file per data centre rather than on every view. Each frame of a mockup
+ * per file per data centre rather than on every view. The same goes for the
+ * paths a version has no file at, which `serve` and `exists` remember too. Each frame of a mockup
  * set is a sandboxed opaque origin with a cache partition of its own, so
  * browsers can't share files between frames and every frame asks the Worker
  * again.
@@ -126,7 +127,10 @@ function thumbnailKey(id: string, option?: string): string {
 }
 
 /** What request handlers may do with a page's files: read them, and keep thumbnails. Writing and deleting versions is `Pages`' job. */
-export type PageFiles = Pick<VersionFiles, "serve" | "exists" | "read" | "manifest" | "thumbnail" | "saveThumbnail">;
+export type PageFiles = Pick<VersionFiles, "serve" | "exists" | "read" | "manifest" | "thumbnail" | "saveThumbnail" | "saveThumbnailFailure">;
+
+/** A thumbnail kept for a version: its PNG, or when shooting it last failed. */
+export type Thumbnail = { png: R2ObjectBody } | { failedAt: number };
 
 export class VersionFiles {
 	private readonly defer: (work: Promise<unknown>) => void;
@@ -162,9 +166,8 @@ export class VersionFiles {
 		}
 		const object = await this.bucket.get(key);
 		if (!object) {
-			// Only a missing index is worth remembering: it's how a mockup set
-			// without one of its own is shown, on every view.
-			if (path === "index.html") this.defer(this.cache(ref, path, null));
+			// A version never gains a file, so its absence is cached like a file.
+			this.defer(this.cache(ref, path, null));
 			return null;
 		}
 		const file = { etag: object.httpEtag, contentType: object.httpMetadata?.contentType ?? "application/octet-stream", cached: false };
@@ -273,7 +276,10 @@ export class VersionFiles {
 			await cached.body?.cancel();
 			return !cached.headers.has(MISSING);
 		}
-		return (await this.bucket.head(versionPrefix(ref.id, ref.version) + path)) !== null;
+		const found = (await this.bucket.head(versionPrefix(ref.id, ref.version) + path)) !== null;
+		// Only absence: caching a file takes its body, which a head doesn't have.
+		if (!found) this.defer(this.cache(ref, path, null));
+		return found;
 	}
 
 	/** The paths and sizes of a version's files. */
@@ -346,6 +352,40 @@ export class VersionFiles {
 		return this.deletePrefix(versionPrefix(ref.id, ref.version));
 	}
 
+	/**
+	 * The versions a page has files stored for, from one listing of its
+	 * folder that doesn't descend into them.
+	 */
+	async storedVersions(id: string): Promise<number[]> {
+		const prefix = `pages/${id}/`;
+		const versions: number[] = [];
+		let cursor: string | undefined;
+		do {
+			const listing = await this.bucket.list({ prefix, delimiter: "/", cursor, limit: 1000 });
+			for (const folder of listing.delimitedPrefixes) {
+				const name = folder.slice(prefix.length, -1);
+				if (/^\d+$/.test(name)) versions.push(Number(name));
+			}
+			cursor = listing.truncated ? listing.cursor : undefined;
+		} while (cursor);
+		return versions;
+	}
+
+	/** When one of a version's files was written (they're all written at once), or null if it has none. */
+	async writtenAt(ref: VersionRef): Promise<number | null> {
+		const listing = await this.bucket.list({ prefix: versionPrefix(ref.id, ref.version), limit: 1 });
+		return listing.objects[0]?.uploaded.getTime() ?? null;
+	}
+
+	/** Deletes the thumbnails of a mockup set's options other than `options`: the ones that went. */
+	async deleteOptionThumbnails(id: string, options: string[]): Promise<void> {
+		const prefix = thumbnailKey(id, "").slice(0, -".png".length);
+		const keep = new Set(options.map((option) => thumbnailKey(id, option)));
+		const listing = await this.bucket.list({ prefix, limit: 1000 });
+		const gone = listing.objects.map((object) => object.key).filter((key) => !keep.has(key));
+		if (gone.length) await this.bucket.delete(gone);
+	}
+
 	/** Deletes every file of a page, its thumbnails included. */
 	deletePage(id: string): Promise<void> {
 		return this.deletePrefix(`pages/${id}/`);
@@ -353,14 +393,26 @@ export class VersionFiles {
 
 	/**
 	 * A version's thumbnail, or one of its mockup options' with `option`, if
-	 * one was made for that version. A page keeps one of each, so a newer
-	 * version's replaces it, and it goes with the page.
+	 * one was made (or tried and failed) for that version. A page keeps one of
+	 * each, so a newer version's replaces it, and it goes with the page.
 	 */
-	async thumbnail(ref: VersionRef, option?: string): Promise<R2ObjectBody | null> {
+	async thumbnail(ref: VersionRef, option?: string): Promise<Thumbnail | null> {
 		const object = await this.bucket.get(thumbnailKey(ref.id, option));
-		if (object && object.customMetadata?.version === String(ref.version)) return object;
+		const metadata = object?.customMetadata;
+		if (object && metadata?.version === String(ref.version)) {
+			if (metadata.failedAt === undefined) return { png: object };
+			await object.body.cancel();
+			return { failedAt: Number(metadata.failedAt) };
+		}
 		await object?.body.cancel();
 		return null;
+	}
+
+	/** Records that shooting a version's thumbnail failed at `at`, in its place, so it isn't retried on every view. */
+	async saveThumbnailFailure(ref: VersionRef, at: number, option?: string): Promise<void> {
+		await this.bucket.put(thumbnailKey(ref.id, option), new Uint8Array(0), {
+			customMetadata: { version: String(ref.version), failedAt: String(at) },
+		});
 	}
 
 	async saveThumbnail(ref: VersionRef, png: Uint8Array, option?: string): Promise<void> {
