@@ -44,7 +44,7 @@ The pass goes in the path rather than a cookie, because a sandboxed page's own r
 
 Password guesses are limited in the Worker, before the password is hashed: 5 a minute from one client address, and 30 a minute at one page from all addresses together. Past either limit the gate answers 429 with `Retry-After: 60`, even for the right password, until the minute is up. The limits come from Cloudflare's rate-limiting binding, so they hold on any deployment without dashboard rules; they count per Cloudflare location and are approximate. Someone guessing can hold the password form shut only while they keep guessing, and signing in through Access and share links still open the page.
 
-A page served behind a pass goes out with `Referrer-Policy: no-referrer`, and the Worker removes what would loosen that from its HTML: `<meta name="referrer">`, `referrerpolicy` attributes, and the same inside an iframe's `srcdoc`. The page's script can still choose its own policy (`fetch(url, { referrerPolicy })`, or adding those elements itself), and no CSP directive can prevent it, so a page that runs untrusted script can still send its URL, pass included, to other sites. Public pages are served as published.
+A pass in the URL isn't sent to other sites in `Referer`. Pages go out with `Referrer-Policy: no-referrer`, and the sandbox gives the document an opaque origin, for which browsers send no referrer whatever policy its markup or script asks for. A page's script can still read its own URL and send it somewhere, so a private page that runs untrusted script can leak its pass that way.
 
 `share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out.
 
@@ -162,7 +162,7 @@ Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). The D
 
 `cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them.
 
-Passes and upload tokens are in URL paths, so Workers Logs' invocation logs, which record each request's full URL, are off. The Worker logs one JSON line per request itself (method, host, path with passes and upload tokens replaced, status, milliseconds), and every message it logs goes through `redact` in `src/logging.ts`. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
+Passes and upload tokens are in URL paths, so Workers Logs' invocation logs, which record each request's full URL, are off. The Worker logs one JSON line per request itself (method, host, path with passes and upload tokens replaced, status, milliseconds), and the messages that can carry a URL (uncaught errors, thumbnail failures) go through `redact` in `src/logging.ts`. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
 
 ## License
 

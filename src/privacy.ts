@@ -134,6 +134,12 @@ const GUESS_PERIOD = 60;
 async function mayGuess(request: Request, env: Env, id: string): Promise<boolean> {
 	// Set by Cloudflare on every request; a client can't choose it.
 	const client = request.headers.get("cf-connecting-ip") ?? "unknown";
-	if (!(await env.PASSWORD_GUESSES.limit({ key: `${id}:${client}` })).success) return false;
-	return (await env.PAGE_PASSWORD_GUESSES.limit({ key: id })).success;
+	try {
+		if (!(await env.PASSWORD_GUESSES.limit({ key: `${id}:${client}` })).success) return false;
+		return (await env.PAGE_PASSWORD_GUESSES.limit({ key: id })).success;
+	} catch (error) {
+		// A limiter that's missing or failing refuses the guess, and the gate still offers signing in.
+		console.error("Password guess limiter failed", error);
+		return false;
+	}
 }

@@ -203,6 +203,17 @@ describe("password guesses", () => {
 		expect((await guess(page.id, "correct horse", undefined, { env })).status).toBe(303);
 	});
 
+	it("are refused with the gate, not an error, when the limiter fails", async () => {
+		const page = await publish({ files: FILES, visibility: "private", password: "correct horse" });
+		const limit = vi.fn(async () => {
+			throw new Error("limiter down");
+		});
+		const env = { PASSWORD_GUESSES: { limit }, PAGE_PASSWORD_GUESSES: { limit } };
+		const response = await guess(page.id, "correct horse", undefined, { env });
+		expect(response.status).toBe(429);
+		expect(await response.text()).toContain("Sign in");
+	});
+
 	it("aren't counted on pages without a password", async () => {
 		const page = await publish({ files: FILES, visibility: "private" });
 		const limit = vi.fn(async () => ({ success: false }));
@@ -213,26 +224,13 @@ describe("password guesses", () => {
 });
 
 describe("referrer policy", () => {
-	const LOOSE = [
-		{ path: "index.html", content: '<meta name="referrer" content="unsafe-url"><META NAME="Referrer" CONTENT="origin"><a href="https://elsewhere.example/" referrerpolicy="unsafe-url">x</a><img src="https://elsewhere.example/i.png" REFERRERPOLICY="origin"><iframe srcdoc="<meta name=&quot;referrer&quot; content=&quot;unsafe-url&quot;><img src=x referrerpolicy=unsafe-url>"></iframe>' },
-	];
-
-	it("can't be loosened by a page served behind a pass", async () => {
-		const page = await publish({ files: LOOSE, visibility: "private" });
+	it("is no-referrer on a sandboxed document, so a pass in the URL isn't sent to other sites", async () => {
+		const page = await publish({ files: FILES, visibility: "private" });
 		const response = await call((await shareLink(page.id)).url);
 		expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-		const html = await response.text();
-		expect(html).not.toMatch(/<meta[^>]*referrer/i);
-		expect(html).not.toMatch(/referrerpolicy/i);
-		expect(html).toContain('href="https://elsewhere.example/"');
-		const srcdoc = /srcdoc="([^"]*)"/.exec(html)![1]!;
-		expect(srcdoc).not.toMatch(/referrer/i);
-		expect(srcdoc).toContain("<img src=x");
-	});
-
-	it("is left as published on public pages", async () => {
-		const page = await publish({ files: LOOSE });
-		const html = await (await call(page.url)).text();
-		expect(html).toBe(LOOSE[0]!.content);
+		// The opaque origin the sandbox gives the document is what stops markup or script loosening the policy.
+		const csp = response.headers.get("content-security-policy")!;
+		expect(csp).toMatch(/\bsandbox\b/);
+		expect(csp).not.toContain("allow-same-origin");
 	});
 });
