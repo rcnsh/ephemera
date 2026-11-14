@@ -119,7 +119,7 @@ describe("mockup MCP tools", () => {
 		const published = await tool("publish_mockup", { project: "app", name: "Inventory grid", files: TWO_OPTIONS });
 		expect(published.isError).toBeFalsy();
 		const id = published.data.id as string;
-		expect(id).toMatch(/^app-inventory-grid-[a-z2-7]{6}$/);
+		expect(id).toMatch(/^app-inventory-grid-[a-z2-7]{10}$/);
 		expect(published.data).toMatchObject({ url: `${PAGES}/${id}/`, kind: "mockup", project: "app", permanent: true, visibility: "public" });
 
 		const picked = await tool("set_verdict", { id, option: "b", verdict: "picked", note: "cleaner" });

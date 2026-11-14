@@ -319,16 +319,32 @@ describe("zip download", () => {
 });
 
 describe("slugs", () => {
+	it("never touches an existing page's files when a slug's id is already taken", async () => {
+		const first = await mcpTool("publish_page", { html: "<p>first</p>", slug: "report" });
+		// Every draw repeats the first page's suffix, so no free id can be found.
+		const suffix = first.data.id.slice(-10);
+		const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+		vi.spyOn(crypto, "getRandomValues").mockImplementation((array) => {
+			(array as Uint8Array).set([...suffix].map((character) => alphabet.indexOf(character)));
+			return array;
+		});
+		const second = await api("/pages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ html: "<p>second</p>", slug: "report" }) });
+		expect(second.status).toBe(503);
+		vi.restoreAllMocks();
+		expect(await (await call(first.data.url)).text()).toBe("<p>first</p>");
+		expect((await mcpTool("get_page", { id: first.data.id })).data.files).toEqual([{ path: "index.html", size: 12 }]);
+	});
+
 	it("gives the page an id that says what it is, over MCP and HTTP", async () => {
 		const published = await mcpTool("publish_page", { html: "<p>q3</p>", slug: "Q3 Report!" });
-		expect(published.data.id).toMatch(/^q3-report-[a-z2-7]{6}$/);
+		expect(published.data.id).toMatch(/^q3-report-[a-z2-7]{10}$/);
 		expect(await (await call(published.data.url)).text()).toBe("<p>q3</p>");
 
 		const http = await publish({ slug: "launch plan" } as never);
-		expect(http.id).toMatch(/^launch-plan-[a-z2-7]{6}$/);
+		expect(http.id).toMatch(/^launch-plan-[a-z2-7]{10}$/);
 
 		const zipped = await api("/pages?slug=from-zip", { method: "POST", headers: { "content-type": "application/zip" }, body: zip({ "index.html": "z" }) });
-		expect(((await zipped.json()) as { id: string }).id).toMatch(/^from-zip-[a-z2-7]{6}$/);
+		expect(((await zipped.json()) as { id: string }).id).toMatch(/^from-zip-[a-z2-7]{10}$/);
 
 		const bad = await mcpTool("publish_page", { html: "x", slug: "!!!" });
 		expect(bad.isError).toBe(true);
@@ -357,7 +373,8 @@ describe("ergonomics", () => {
 		expect(upload.data.command).toContain("zip -qr - . -x '.*' '*/.*'");
 		expect(upload.data.uploadExpiresAt).toMatch(ISO);
 		expect((await mcpTool("list_versions", { id: upload.data.id })).data.versions[0].createdAt).toMatch(ISO);
-		expect((await mcpTool("share_link", { id: upload.data.id })).data.expiresAt).toBeNull();
+		const open = await mcpTool("publish_page", { html: "o" });
+		expect((await mcpTool("share_link", { id: open.data.id })).data.expiresAt).toBeNull();
 		const secret = await mcpTool("publish_page", { html: "s", visibility: "private" });
 		expect((await mcpTool("share_link", { id: secret.data.id })).data.expiresAt).toMatch(ISO);
 	});

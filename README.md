@@ -42,7 +42,11 @@ A private page shows a gate at `PAGES_HOST/<id>/`. The gate has a link to sign i
 
 The pass goes in the path rather than a cookie, because a sandboxed page's own requests don't send cookies. Relative links carry the pass along, so the page's files, `fetch` and imports all work.
 
-`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again revokes every pass already handed out.
+Password guesses are limited in the Worker, before the password is hashed: 5 a minute from one client address, and 30 a minute at one page from all addresses together. Past either limit the gate answers 429 with `Retry-After: 60`, even for the right password, until the minute is up. The limits come from Cloudflare's rate-limiting binding, so they hold on any deployment without dashboard rules; they count per Cloudflare location and are approximate. Someone guessing can hold the password form shut only while they keep guessing, and signing in through Access and share links still open the page.
+
+A pass in the URL isn't sent to other sites in `Referer`. Pages go out with `Referrer-Policy: no-referrer`, and the sandbox gives the document an opaque origin, for which browsers send no referrer whatever policy its markup or script asks for. A page's script can still read its own URL and send it somewhere, so a private page that runs untrusted script can leak its pass that way.
+
+`share_link` makes passes for other people, lasting up to 30 days. Setting a page's visibility again, or rolling it back, revokes every pass already handed out; a private page keeps its password through that unless you give a new one or clear it.
 
 ### Versions and expiry
 
@@ -52,7 +56,7 @@ Pages given a ttl expire. Every request checks the expiry, so a page stops worki
 
 ### Mockup sets
 
-A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2/`.
+A mockup set is a permanent page that keeps a gallery of design options and which ones were picked. Its id comes from its project and name: `PAGES_HOST/myapp-onboarding-k3x7q2abcd/`.
 
 - **Options are top-level folders**, each with its own `index.html` (`a/`, `compact/`, …), named after the folder. A set that is just a root `index.html` has one option, `main`. Each option in a set's `options` carries its `path` relative to the set's URL (`a/`, or empty for that root `main`).
 - **Every option has a verdict:** pending, picked or rejected, with an optional one-line note. Adding a folder adds a pending option; removing one removes the option and its verdict.
@@ -77,8 +81,8 @@ A mockup set is a permanent page that keeps a gallery of design options and whic
 | `publish_page` | publish `files`, or a single `html` or `markdown` document; takes `ttl`, `label`, `agent`, `slug`, `visibility`, `password` |
 | `update_page` | replace a page's files; the URL and expiry stay the same |
 | `patch_page` | change or remove single files and keep the rest |
-| `upload_url` | a page URL and a `curl` command that uploads a zip to it, so a folder on disk never passes through the tool call; the command leaves dotfiles (`.env`, `.git`) out |
-| `set_visibility` | make a page private (optionally with a password) or public |
+| `upload_url` | a page URL and a `curl` command that uploads a zip to it once, so a folder on disk never passes through the tool call; the command leaves dotfiles (`.env`, `.git`) out. A new page waits as a placeholder that expires with the upload URL; its first new files, however they arrive, give it its `ttl` (permanent if none), unless its expiry was changed first |
+| `set_visibility` | make a page private or public, and revoke its share links; `password` sets one, `""` clears it, and leaving it out keeps the current one |
 | `share_link` | a link that opens a private page without signing in |
 | `list_pages` | find pages, newest-updated first: compact rows filtered by `query` (label or id), `agent`, `kind`, `project`; 20 at a time (`limit` up to 100), with `cursor` for the next ones |
 | `get_page` | one page's details and its files' paths and sizes; a mockup set's options with verdicts and notes |
@@ -124,11 +128,11 @@ curl -fsS "https://$PAGES_HOST/api/pages/$ID/zip" -H "Authorization: Bearer $EPH
 | `GET /api/pages/:id/diff` | `?from=1&to=2`: files added, removed and changed, as `diff_versions` returns them |
 | `GET /api/pages/:id/zip` | `?version=2`: the version's files as a zip (the current one by default) |
 | `POST /api/pages/:id/rollback` | `{"version":2}` serves that version again |
-| `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}` |
+| `POST /api/pages/:id/visibility` | `{"visibility":"private","password":"…"}`; leave `password` out to keep the current one, or send `null` or `""` to clear it |
 | `POST /api/pages/:id/share` | `{"ttl":"7d"}` makes a share link |
 | `POST /api/mockups` | `{"project":…,"name":…,"files":[…],"agent":…}`, or a zip with `?project=&name=&agent=`, publishes a mockup set |
 | `POST /api/pages/:id/verdict` | `{"option":"a","verdict":"picked","note":"…"}` |
-| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it within an hour, without the token |
+| `POST /api/uploads` | an upload URL (optionally for `{"id":…}`): `PUT` a zip to it once within an hour, without the token; it stops working as soon as the page gets any new version. Without an `id`, the placeholder page expires with the URL, and its first new files apply `ttl` |
 
 ## Dashboard
 
@@ -170,7 +174,9 @@ pnpm deploy      # migrate, then cf deploy
 
 Page metadata lives in D1 and files in R2 (`pages/<id>/<version>/<path>`). The D1 schema lives in `migrations/`; add a change with `cf d1 migrations create <message>`. Tests apply the migrations to a fresh database before each test.
 
-`cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
+`cloudflare.config.ts` reads the hostnames and `ACCESS_AUD` from `.env`, and won't load without them. `pnpm typecheck` is the exception: it sets `EPHEMERA_TYPES_ONLY=1` so `cf workers types` gets placeholders, and works on a clean checkout. CI (`.github/workflows/ci.yml`) runs `pnpm typecheck` and `pnpm test` on pull requests and pushes to `main`.
+
+Passes and upload tokens are in URL paths, so Workers Logs' invocation logs, which record each request's full URL, are off. The Worker logs one JSON line per request itself (method, host, path with passes and upload tokens replaced, status, milliseconds), and the messages that can carry a URL (uncaught errors, thumbnail failures) go through `redact` in `src/logging.ts`. The token is a Worker secret (`EPHEMERA_TOKEN`). The dashboard refuses any request that Access didn't authenticate for the application with audience `ACCESS_AUD`.
 
 ## License
 

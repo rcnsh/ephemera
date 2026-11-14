@@ -37,6 +37,8 @@ interface PageRow {
 	share_epoch: number;
 	kind: PageKind;
 	project: string | null;
+	/** See `publish`'s `pendingTtl`: milliseconds, 0 for permanent, NULL for none. */
+	pending_ttl: number | null;
 }
 
 interface VerdictRow {
@@ -127,18 +129,29 @@ const GONE_AT = "COALESCE(deleted_at, expires_at)";
 const STORED_BYTES = `SELECT COALESCE(SUM(versions.size), 0) FROM versions JOIN pages ON pages.id = versions.page_id WHERE ${LIVE}`;
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
-/** A page id, for use inside other patterns: 12 random characters, or a mockup set's `<project>-<name>-<6 random>`. */
-export const ID_SOURCE = "[a-z2-7]{12}|[a-z0-9]+(?:-[a-z0-9]+)*-[a-z2-7]{6}";
-export const ID_PATTERN = new RegExp(`^(?=.{1,47}$)(?:${ID_SOURCE})$`);
+const SLUG_SOURCE = "[a-z0-9]+(?:-[a-z0-9]+)*";
+/**
+ * A page id, for use inside other patterns: 12 random characters, or a mockup
+ * set's `<project>-<name>-<10 random>`. Sets published before suffixes grew
+ * keep their `<project>-<name>-<6 random>`.
+ */
+export const ID_SOURCE = `[a-z2-7]{12}|${SLUG_SOURCE}-[a-z2-7]{10}|${SLUG_SOURCE}-[a-z2-7]{6}`;
+/** A whole page id. A mockup slug is at most 40 characters, so each id shape has its own length limit. */
+export const ID_PATTERN = new RegExp(`^(?:[a-z2-7]{12}|(?=.{1,51}$)${SLUG_SOURCE}-[a-z2-7]{10}|(?=.{1,47}$)${SLUG_SOURCE}-[a-z2-7]{6})$`);
+
+/** How many ids `publish` draws before giving up: one clash is already unlikely, several in a row means something's wrong. */
+const ID_ATTEMPTS = 5;
+/** How old a reservation (see `Pages.reserve`) that never became a page must be before the sweep takes it for abandoned. A publish takes seconds. */
+const ABANDONED_AFTER = 60 * 60 * 1000;
 
 function randomChars(length: number): string {
 	// 32 divides 256 evenly, so masking keeps every character equally likely.
 	return Array.from(crypto.getRandomValues(new Uint8Array(length)), (byte) => ID_ALPHABET[byte & 31]).join("");
 }
 
-/** An id that says what it is: a slug, then 6 random characters. Mockup sets and pages published with a slug both get one. */
+/** An id that says what it is: a slug, then 10 random characters. Mockup sets and pages published with a slug both get one. */
 function slugId(slug: string): string {
-	return `${slug}-${randomChars(6)}`;
+	return `${slug}-${randomChars(10)}`;
 }
 
 /** A mockup set's id: its project and name as one slug, then the random suffix. */
@@ -293,9 +306,17 @@ export class Pages {
 	}
 
 	/**
-	 * Files are written before the row goes to D1, and are deleted again if either
-	 * step fails, so nothing is left behind. With `mockup`, publishes a mockup
-	 * set: its id comes from the project and name.
+	 * Reserves an id first, so a publish only ever writes files under an id
+	 * it owns: the row goes into D1 already deleted and purged, so it's out of
+	 * every listing and out of the sweep's way, while the files are written.
+	 * Then one batch brings it to life with its version (and a mockup set's
+	 * options). If writing or committing fails, the files and the row are
+	 * deleted again, so nothing is left behind; if that fails too, the row is
+	 * left for the sweep to purge, as it does for a publish that died before
+	 * committing. With `mockup`, publishes a mockup set: its id comes from the
+	 * project and name. With `pendingTtl`, the page's first new version (from
+	 * `update`, `patch` or an upload) gives it that ttl, counted from then,
+	 * unless the owner has set its expiry first.
 	 */
 	async publish(input: {
 		files: PageFile[];
@@ -307,12 +328,12 @@ export class Pages {
 		mockup?: { project: string; name: string };
 		/** Gives a plain page the id `<slug>-<random>`; already slugified (see `slugify`). */
 		slug?: string;
+		pendingTtl?: Ttl;
 	}): Promise<Page> {
 		const kind: PageKind = input.mockup ? "mockup" : "page";
 		const { files, size } = validateBundle(input.files, kind);
 		const now = this.now();
-		const row: PageRow = {
-			id: input.mockup ? mockupId(input.mockup.project, input.mockup.name) : input.slug ? slugId(input.slug) : randomChars(12),
+		const fields: Omit<PageRow, "id"> = {
 			label: clean(input.label, 200),
 			agent: clean(input.agent, 100),
 			created_at: now,
@@ -328,41 +349,79 @@ export class Pages {
 			share_epoch: 0,
 			kind,
 			project: input.mockup ? slugify(input.mockup.project) || null : null,
+			pending_ttl: input.pendingTtl === undefined ? null : input.pendingTtl === "permanent" ? 0 : input.pendingTtl,
 		};
+		const row = await this.reserve(fields, () => (input.mockup ? mockupId(input.mockup.project, input.mockup.name) : input.slug ? slugId(input.slug) : randomChars(12)));
 		let warm: () => void;
 		try {
 			warm = await this.store.write(row, files);
-			await this.db.batch([
-				this.db
-					.prepare(
-						`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, version, latest_version, size, file_count, visibility, password_hash, kind, project)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					)
-					.bind(
-						row.id,
-						row.label,
-						row.agent,
-						row.created_at,
-						row.updated_at,
-						row.expires_at,
-						row.version,
-						row.latest_version,
-						row.size,
-						row.file_count,
-						row.visibility,
-						row.password_hash,
-						row.kind,
-						row.project,
-					),
+			const [result] = await this.db.batch([
+				this.db.prepare("UPDATE pages SET deleted_at = NULL, purged = 0 WHERE id = ? AND deleted_at = ? AND purged = 1").bind(row.id, now),
 				this.addVersion(row.id, row.version, now, size, files.length),
 				...(kind === "mockup" ? this.syncOptions(row.id, row.version, now, files.map((file) => file.path)) : []),
 			]);
+			// Only a reservation that's still ours comes to life; anything else is a bug worth failing loudly on.
+			if (result!.meta.changes !== 1) throw new Error(`The reservation for page ${row.id} vanished while publishing`);
 		} catch (error) {
-			await this.store.deletePage(row.id);
+			await this.abandon(row.id, now).catch((cleanup) => console.warn(`cleaning up after publishing ${row.id} failed; the sweep will: ${cleanup}`));
 			throw error;
 		}
 		warm();
 		return toPage(row);
+	}
+
+	/**
+	 * Clears up a reservation made at `reservedAt` whose publish failed. The
+	 * row is first marked unpurged, so if deleting the files fails the sweep
+	 * purges them, then forgets the row after the grace period. Its
+	 * deleted_at moves on, as when the sweep takes a reservation, so it's an
+	 * ordinary gone page from here and not a reservation to take again.
+	 */
+	private async abandon(id: string, reservedAt: number): Promise<void> {
+		const ours = "id = ? AND deleted_at = ? AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)";
+		await this.db.prepare(`UPDATE pages SET purged = 0, deleted_at = deleted_at + 1 WHERE ${ours}`).bind(id, reservedAt).run();
+		await this.store.deletePage(id);
+		await this.db.prepare(`DELETE FROM pages WHERE ${ours}`).bind(id, reservedAt + 1).run();
+	}
+
+	/**
+	 * Inserts the row for a page about to be published, under the first id
+	 * from `drawId` that no page has, marked deleted (at its creation time)
+	 * and purged until `publish` commits it. Ids of pages that are gone stay
+	 * taken until the sweep forgets them, so a new page never inherits an old
+	 * one's files.
+	 */
+	private async reserve(fields: Omit<PageRow, "id">, drawId: () => string): Promise<PageRow> {
+		for (let attempt = 0; attempt < ID_ATTEMPTS; attempt++) {
+			const row: PageRow = { id: drawId(), ...fields };
+			const inserted = await this.db
+				.prepare(
+					`INSERT INTO pages (id, label, agent, created_at, updated_at, expires_at, deleted_at, purged, version, latest_version, size, file_count, visibility, password_hash, kind, project, pending_ttl)
+					VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT (id) DO NOTHING`,
+				)
+				.bind(
+					row.id,
+					row.label,
+					row.agent,
+					row.created_at,
+					row.updated_at,
+					row.expires_at,
+					row.created_at,
+					row.version,
+					row.latest_version,
+					row.size,
+					row.file_count,
+					row.visibility,
+					row.password_hash,
+					row.kind,
+					row.project,
+					row.pending_ttl,
+				)
+				.run();
+			if (inserted.meta.changes === 1) return row;
+		}
+		throw new PageError(503, "Couldn't find a free page id; try again");
 	}
 
 	/** Records a version, if the page row it belongs to exists by then (it's batched after the write that creates or moves it). */
@@ -401,11 +460,14 @@ export class Pages {
 	/**
 	 * Adds a version and serves it, in one step: its files are written
 	 * alongside the old ones, then the row is pointed at it. Versions beyond
-	 * the last `LIMITS.keptVersions` are deleted in the background.
+	 * the last `LIMITS.keptVersions` are deleted in the background. A pending
+	 * ttl (see `publish`) is applied and cleared in the same write.
 	 */
-	async update(id: string, input: PageFile[]): Promise<Page> {
+	async update(id: string, input: PageFile[], { ifLatest }: { ifLatest?: number } = {}): Promise<Page> {
 		const page = await this.get(id);
 		const { files, size } = validateBundle(input, page.kind);
+		// The version reserved next is checked against this too, so of two updates expecting it, one wins.
+		if (ifLatest !== undefined && page.latestVersion !== ifLatest) throw new PageError(409, `Page ${id} has changed since; its latest version is ${page.latestVersion}`);
 		return this.addVersionOf(page, size, files.map((file) => file.path), (version) => this.store.write({ id, version }, files));
 	}
 
@@ -454,7 +516,8 @@ export class Pages {
 		const id = page.id;
 		const version = page.latestVersion + 1;
 		// Reserve the version number before writing, so two updates at once
-		// can't write over each other's files. A number that fails is skipped.
+		// can't write over each other's files. A number that fails is given
+		// back once its files are gone (see `release`).
 		const reserved = await this.db
 			.prepare(`UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND ${LIVE}`)
 			.bind(version, id, page.latestVersion, this.now())
@@ -467,26 +530,26 @@ export class Pages {
 		try {
 			warm = await write(version);
 		} catch (error) {
-			await this.store.deleteVersion({ id, version });
+			await this.release(page, version);
 			throw error;
 		}
 		const now = this.now();
-		let committed: boolean;
+		let committed: { expires_at: number | null } | undefined;
 		try {
 			const [result] = await this.db.batch([
 				this.db
 					.prepare(
-						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
-						WHERE id = ? AND latest_version = ? AND ${LIVE}`,
+						`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?,
+							expires_at = CASE WHEN pending_ttl IS NULL THEN expires_at WHEN pending_ttl = 0 THEN NULL ELSE ? + pending_ttl END, pending_ttl = NULL
+						WHERE id = ? AND latest_version = ? AND ${LIVE} RETURNING expires_at`,
 					)
-					.bind(version, size, fileCount, now, id, version, now),
+					.bind(version, size, fileCount, now, now, id, version, now),
 				this.addVersion(id, version, now, size, fileCount),
 				...(page.kind === "mockup" ? this.syncOptions(id, version, now, paths) : []),
 			]);
-			committed = result!.meta.changes === 1;
+			committed = (result!.results as { expires_at: number | null }[])[0];
 		} catch (error) {
-			// The number is never used again, so nothing else would clear its files.
-			await this.store.deleteVersion({ id, version });
+			await this.release(page, version);
 			throw error;
 		}
 		if (!committed) {
@@ -495,7 +558,23 @@ export class Pages {
 		}
 		warm();
 		this.defer(this.prune(id));
-		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now };
+		const expiresAt = committed.expires_at;
+		return { ...page, version, latestVersion: version, size, fileCount, updatedAt: now, expiresAt, permanent: expiresAt === null };
+	}
+
+	/**
+	 * Deletes the files of a `version` of `page` that failed, then gives its
+	 * number back if nothing has reserved a later one, so an upload URL made
+	 * for the page's latest version still works. A number whose files couldn't
+	 * all be deleted is never used again, so a later version can't pick up
+	 * leftover files; they go when the page does.
+	 */
+	private async release(page: Page, version: number): Promise<void> {
+		await this.store.deleteVersion({ id: page.id, version });
+		await this.db
+			.prepare("UPDATE pages SET latest_version = ? WHERE id = ? AND latest_version = ? AND version < ?")
+			.bind(page.latestVersion, page.id, version, version)
+			.run();
 	}
 
 	/** The versions every live page keeps, newest first, by page id. */
@@ -533,7 +612,11 @@ export class Pages {
 		}));
 	}
 
-	/** Serves an older (or newer) kept version again. Later updates still get new numbers. */
+	/**
+	 * Serves an older (or newer) kept version again. Later updates still get
+	 * new numbers. Every pass handed out so far stops working, since one may
+	 * have been shared while the version being rolled away from was live.
+	 */
 	async rollback(id: string, version: number): Promise<Page> {
 		const page = await this.get(id);
 		if (version === page.version) return page;
@@ -547,14 +630,14 @@ export class Pages {
 		const [result] = await this.db.batch([
 			this.db
 				.prepare(
-					`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?
+					`UPDATE pages SET version = ?, size = ?, file_count = ?, updated_at = ?, share_epoch = share_epoch + 1
 					WHERE id = ? AND version = ? AND ${LIVE} AND EXISTS (SELECT 1 FROM versions WHERE page_id = ? AND version = ?)`,
 				)
 				.bind(version, target.size, target.file_count, now, id, page.version, now, id, version),
 			...options,
 		]);
 		if (result!.meta.changes !== 1) throw new PageError(409, `Page ${id} changed while it was being rolled back; try again`);
-		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now };
+		return { ...page, version, size: target.size, fileCount: target.file_count, updatedAt: now, shareEpoch: page.shareEpoch + 1 };
 	}
 
 	/**
@@ -597,7 +680,8 @@ export class Pages {
 			expiresAt = Math.min(page.expiresAt! + by, now + LIMITS.maxTtl);
 		}
 		const result = await this.db
-			.prepare(`UPDATE pages SET expires_at = ?, updated_at = ? WHERE id = ? AND ${LIVE}`)
+			// The owner's choice wins over a ttl still waiting on a first upload.
+			.prepare(`UPDATE pages SET expires_at = ?, pending_ttl = NULL, updated_at = ? WHERE id = ? AND ${LIVE}`)
 			.bind(expiresAt, now, id, now)
 			.run();
 		if (result.meta.changes !== 1) {
@@ -609,19 +693,22 @@ export class Pages {
 
 	/**
 	 * Makes a page public or private, and sets or clears its password (only
-	 * private pages have one). Either way, every pass handed out so far stops
-	 * working.
+	 * private pages have one; undefined keeps a private page's current one).
+	 * Either way, every pass handed out so far stops working.
 	 */
-	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null): Promise<Page> {
-		const page = await this.get(id);
-		const hash = visibility === "private" ? passwordHash : null;
+	async setVisibility(id: string, visibility: Visibility, passwordHash: string | null | undefined): Promise<Page> {
+		await this.get(id);
+		const keep = visibility === "private" && passwordHash === undefined;
 		const now = this.now();
-		const result = await this.db
-			.prepare(`UPDATE pages SET visibility = ?, password_hash = ?, share_epoch = share_epoch + 1, updated_at = ? WHERE id = ? AND ${LIVE}`)
-			.bind(visibility, hash, now, id, now)
-			.run();
-		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
-		return { ...page, visibility, passwordHash: hash, shareEpoch: page.shareEpoch + 1, updatedAt: now };
+		const row = await this.db
+			.prepare(
+				`UPDATE pages SET visibility = ?, password_hash = CASE WHEN ? THEN password_hash ELSE ? END, share_epoch = share_epoch + 1, updated_at = ?
+				WHERE id = ? AND ${LIVE} RETURNING *`,
+			)
+			.bind(visibility, keep ? 1 : 0, visibility === "private" ? (passwordHash ?? null) : null, now, id, now)
+			.first<PageRow>();
+		if (!row) throw new PageError(410, `Page ${id} has expired or been deleted`);
+		return toPage(row);
 	}
 
 	async setLabel(id: string, label: string | null): Promise<Page> {
@@ -652,15 +739,16 @@ export class Pages {
 
 	/**
 	 * Picks, rejects or resets one option of a mockup set. `note` replaces the
-	 * option's note (null or "" clears it); undefined keeps it.
+	 * option's note (null or "" clears it); undefined keeps it, as an undefined
+	 * `verdict` keeps the verdict.
 	 */
-	async setVerdict(id: string, option: string, verdict: Verdict, note?: string | null): Promise<MockupOption[]> {
+	async setVerdict(id: string, option: string, verdict: Verdict | undefined, note?: string | null): Promise<MockupOption[]> {
 		const page = await this.get(id);
 		if (page.kind !== "mockup") throw new PageError(400, `Page ${id} isn't a mockup set; only mockup sets have verdicts`);
 		const now = this.now();
 		const result = await this.db
-			.prepare(`UPDATE verdicts SET verdict = ?, note = CASE WHEN ? THEN ? ELSE note END, updated_at = ? WHERE page_id = ? AND option = ?`)
-			.bind(verdict, note !== undefined ? 1 : 0, clean(note, 200), now, id, option)
+			.prepare(`UPDATE verdicts SET verdict = COALESCE(?, verdict), note = CASE WHEN ? THEN ? ELSE note END, updated_at = ? WHERE page_id = ? AND option = ?`)
+			.bind(verdict ?? null, note !== undefined ? 1 : 0, clean(note, 200), now, id, option)
 			.run();
 		const options = await this.options(id);
 		if (result.meta.changes !== 1) {
@@ -684,6 +772,18 @@ export class Pages {
 	/** Purges the files of pages that have gone, and forgets pages gone longer than the grace period. */
 	async sweep(): Promise<{ purged: number; forgotten: number }> {
 		const now = this.now();
+		// A reservation that never became a page (it has no version) and is
+		// long past any publish still running was abandoned: purge its files.
+		// Moving deleted_at on takes it once only, and makes a publish that
+		// was somehow still running fail its commit rather than go live
+		// without its files.
+		await this.db
+			.prepare(
+				`UPDATE pages SET purged = 0, deleted_at = deleted_at + 1 WHERE purged = 1 AND deleted_at = created_at AND created_at <= ?
+				AND NOT EXISTS (SELECT 1 FROM versions WHERE page_id = pages.id)`,
+			)
+			.bind(now - ABANDONED_AFTER)
+			.run();
 		const { results } = await this.db
 			.prepare(`SELECT id FROM pages WHERE purged = 0 AND ${GONE_AT} <= ? LIMIT 200`)
 			.bind(now)

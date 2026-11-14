@@ -9,6 +9,8 @@ export const TOKEN = "test-token";
 interface CallOptions {
 	/** Simulate a request that Cloudflare Access let through, with this audience tag. */
 	accessAud?: string;
+	/** Bindings to use instead of the test ones. */
+	env?: Partial<typeof env>;
 }
 
 /** Sends a request straight to the Worker and waits for its background work. */
@@ -22,7 +24,7 @@ export async function call(input: string | Request, init?: RequestInit, options:
 			value: { aud: options.accessAud, getIdentity: async () => ({ email: "owner@example.com" }) },
 		});
 	}
-	const response = await worker.fetch(request as Parameters<typeof worker.fetch>[0], env, ctx);
+	const response = await worker.fetch(request as Parameters<typeof worker.fetch>[0], { ...env, ...options.env }, ctx);
 	await waitOnExecutionContext(ctx);
 	return response;
 }
