@@ -31,7 +31,7 @@ export async function access(secret: string, page: Page, subpath: string, search
 	if (PASS_PATTERN.test(first)) {
 		const rest = after.join("/");
 		// A pass on a page that has since been made public: drop it.
-		if (page.visibility === "public") return { kind: "redirect", location: `/${page.id}/${safeRest(rest)}${search}` };
+		if (page.visibility === "public") return { kind: "redirect", location: `/${page.id}/${safeRest(page.id, rest)}${search}` };
 		if (!(await checkViewPass(secret, page.id, page.shareEpoch, first, now))) return { kind: "gate", rest, message: "This link has expired or been revoked." };
 		// Without the slash after the pass, relative links would drop it.
 		if (after.length === 0) return { kind: "redirect", location: `/${page.id}/${first}/${search}` };
@@ -48,23 +48,35 @@ export async function access(secret: string, page: Page, subpath: string, search
  * is dropped. Without a `rest` it ends in "/", so a relative path can follow.
  */
 export async function viewerUrl(secret: string, host: string, page: Page, now: number, { rest = "", ttl = LIMITS.passTtl }: { rest?: string; ttl?: number } = {}): Promise<string> {
-	if (page.visibility === "public") return `${pageUrl(host, page.id)}${safeRest(rest)}`;
+	if (page.visibility === "public") return `${pageUrl(host, page.id)}${safeRest(page.id, rest)}`;
 	const pass = await viewPass(secret, page.id, page.shareEpoch, now + ttl);
-	return `${pageUrl(host, page.id)}${pass}/${safeRest(rest)}`;
+	return `${pageUrl(host, page.id)}${pass}/${safeRest(page.id, rest)}`;
 }
 
 function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-/** Keeps a path that gets passed along inside the page. */
-function safeRest(rest: string): string {
+/**
+ * Keeps a path that gets passed along inside page `id`, or "" if it could
+ * leave. Rather than look for bad strings, it resolves the path the way a URL
+ * parser will (which reads "%2e%2e" as ".." and drops tabs and newlines) under
+ * a folder of the page, and keeps it only if it stays in that folder.
+ * Whitespace, control characters, backslashes and "." or ".." segments, plain
+ * or percent-encoded, are refused outright: callers append the path under
+ * different folders (`/<id>/`, `/<id>/~pass/`, `/open/<id>/`), so one that
+ * climbs out and back in ("%2e%2e/_/x") must not pass.
+ */
+function safeRest(id: string, rest: string): string {
 	const clean = rest.replace(/^\/+/, "");
-	return clean.split("/").some((segment) => segment === ".." || segment === ".") || clean.includes("\\") ? "" : clean;
+	if (/[\s\u0000-\u001f\u007f\\]/.test(clean) || clean.split(/[/?#]/).some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment))) return "";
+	const folder = `/${id}/_/`;
+	const resolved = new URL(`https://page.invalid${folder}${clean}`);
+	return resolved.origin === "https://page.invalid" && resolved.pathname.startsWith(folder) ? clean : "";
 }
 
 export function gate(env: Env, page: Page, rest: string, message = "", status = 401): Response {
-	const next = escape(safeRest(rest));
+	const next = escape(safeRest(page.id, rest));
 	const signIn = `https://${env.ADMIN_HOST}/open/${page.id}/${next}`;
 	const password = page.passwordHash
 		? `<form method="post" action="/${page.id}/_unlock">
