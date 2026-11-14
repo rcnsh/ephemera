@@ -2,14 +2,13 @@ import { checkCsrf, csrfToken } from "./auth.ts";
 import { bytesText, PageError, pageUrl } from "./domain.ts";
 import { FAVICON_LINK, favicon, mark } from "./logo.ts";
 import { type MockupOption, VERDICTS } from "./mockups.ts";
-import { Operations } from "./operations.ts";
-import { ID_SOURCE, type Page, type Pages, type Usage, type Version } from "./pages.ts";
+import { Operations, type Overview } from "./operations.ts";
+import { ID_SOURCE, type Page, type Pages, type Version } from "./pages.ts";
 import { passFor, passUrl, safeRest } from "./privacy.ts";
 import { screenshot, screenshotOptions } from "./thumbnails.ts";
 
-const HOUR = 3_600_000;
-const DAY = 24 * HOUR;
-const EXTENSIONS: Record<string, number> = { "1h": HOUR, "1d": DAY, "7d": 7 * DAY };
+/** What the dashboard's extend buttons add, as ttls. */
+const EXTENSIONS = ["1h", "1d", "7d"];
 const SHARES = ["1d", "7d", "30d"];
 
 /** How long the pass the screenshot browser opens a private page with lasts. */
@@ -155,7 +154,7 @@ function passwordForm(page: Page, csrf: string): string {
 function card(page: Page, versions: Version[], host: string, csrf: string, now: number): string {
 	const url = pageUrl(host, page.id);
 	const open = page.visibility === "private" ? `/open/${page.id}/` : url;
-	const extend = Object.keys(EXTENSIONS)
+	const extend = EXTENSIONS
 		.map((by) => action(page, csrf, `extend?by=${by}`, `+${by}`))
 		.join("");
 	const lifetime = page.permanent ? action(page, csrf, "temporary", "make temporary") : `${extend}${action(page, csrf, "permanent", "make permanent")}`;
@@ -243,17 +242,7 @@ ${pages.map((page) => mockupSet(page, options.get(page.id) ?? [], versions.get(p
 
 type Tab = "pages" | "mockups";
 
-function render(
-	tab: Tab,
-	all: Page[],
-	versions: Map<string, Version[]>,
-	options: Map<string, MockupOption[]>,
-	usage: Usage,
-	host: string,
-	csrf: string,
-	nonce: string,
-	now: number,
-): string {
+function render(tab: Tab, { pages: all, versions, options, usage }: Overview, host: string, csrf: string, nonce: string, now: number): string {
 	let body: string;
 	if (tab === "pages") {
 		const pages = all.filter((page) => page.kind === "page");
@@ -385,14 +374,14 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 	const identity = await ctx.access.getIdentity().catch(() => undefined);
 	const user = String((identity as { email?: string } | undefined)?.email ?? "owner");
 	const url = new URL(request.url);
+	const ops = new Operations(pages, env.PAGES_HOST, env.EPHEMERA_TOKEN);
 
 	if (request.method === "GET" && url.pathname === "/favicon.svg") return favicon();
 	if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/mockups")) {
 		const nonce = crypto.randomUUID().replaceAll("-", "");
-		const [list, versions, options, usage] = await Promise.all([pages.list(), pages.allVersions(), pages.allOptions(), pages.usage()]);
-		const csrf = await csrfToken(env.EPHEMERA_TOKEN, user);
+		const [overview, csrf] = await Promise.all([ops.overview(), csrfToken(env.EPHEMERA_TOKEN, user)]);
 		const tab = url.pathname === "/" ? "pages" : "mockups";
-		return respond(render(tab, list, versions, options, usage, env.PAGES_HOST, csrf, nonce, Date.now()), 200, nonce);
+		return respond(render(tab, overview, env.PAGES_HOST, csrf, nonce, Date.now()), 200, nonce);
 	}
 
 	const thumb = new RegExp(`^/thumbnails/(${ID_SOURCE})\\.png$`).exec(url.pathname);
@@ -430,23 +419,22 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 	}
 
 	const [, id, name] = match as unknown as [string, string, string];
-	const ops = new Operations(pages, env.PAGES_HOST, env.EPHEMERA_TOKEN);
 	try {
 		switch (name) {
 			case "extend": {
-				const by = EXTENSIONS[url.searchParams.get("by") ?? ""];
-				if (!by) return respond("Unknown extension", 400);
-				await pages.extend(id, by);
+				const by = url.searchParams.get("by") ?? "";
+				if (!EXTENSIONS.includes(by)) return respond("Unknown extension", 400);
+				await ops.extend(id, by);
 				break;
 			}
 			case "permanent":
-				await pages.extend(id, "permanent");
+				await ops.extend(id, "permanent");
 				break;
 			case "temporary":
-				await pages.makeTemporary(id);
+				await ops.makeTemporary(id);
 				break;
 			case "label":
-				await pages.setLabel(id, String(form.get("label") ?? ""));
+				await ops.setLabel(id, String(form.get("label") ?? ""));
 				break;
 			case "private":
 			case "public":
@@ -466,7 +454,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 				await ops.rollback(id, Number(url.searchParams.get("version")));
 				break;
 			case "delete":
-				await pages.delete(id);
+				await ops.delete(id);
 				break;
 			case "verdict": {
 				const verdict = String(form.get("verdict") ?? "");

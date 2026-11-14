@@ -3,7 +3,7 @@ import { LIMITS, PageError, pageUrl, parseTtl, ttlOmitted } from "./domain.ts";
 import type { PageFile } from "./files.ts";
 import { rootRelativeWarnings } from "./links.ts";
 import { type MockupOption, VERDICTS, type Verdict } from "./mockups.ts";
-import type { Page, Pages, Visibility } from "./pages.ts";
+import type { Page, Pages, Usage, Version, Visibility } from "./pages.ts";
 import { passFor, passUrl } from "./privacy.ts";
 
 /** What agents see of a page. */
@@ -60,11 +60,6 @@ export interface PublishInput {
 	password?: unknown;
 }
 
-/**
- * What an agent can do with pages, whichever way it calls in (HTTP API or
- * MCP). Takes input as agents send it and returns what they should see back;
- * failures are thrown as `PageError`s.
- */
 const UPLOAD_WINDOW = 60 * 60 * 1000;
 
 /** What a page shows until its first upload arrives. */
@@ -75,6 +70,22 @@ const WAITING = `<!doctype html>
 <p style="font: 16px system-ui, sans-serif; margin: 2rem; color: #888">Waiting for the files to be uploaded…</p>
 `;
 
+/** Everything live, as the owner sees it on the dashboard: whole `Page`s, password hashes included, so never for agents. */
+export interface Overview {
+	pages: Page[];
+	usage: Usage;
+	/** Mockup sets' options, by page id. */
+	options: Map<string, MockupOption[]>;
+	/** Kept versions, by page id. */
+	versions: Map<string, Version[]>;
+}
+
+/**
+ * What can be done with pages, whichever way it's asked for: the HTTP API,
+ * MCP, or the dashboard. Each of those is transport only, so a rule added
+ * here holds for all three. Takes input as callers send it and returns what
+ * agents should see back; failures are thrown as `PageError`s.
+ */
 export class Operations {
 	constructor(
 		private readonly pages: Pages,
@@ -180,6 +191,12 @@ export class Operations {
 		return pageView(await this.pages.extend(id, parseTtl(ttl)), this.host);
 	}
 
+	/** Makes a permanent page temporary, expiring `LIMITS.temporaryTtl` from now. A temporary page stays as it is. */
+	async makeTemporary(id: string) {
+		const page = await this.pages.get(id);
+		return pageView(page.permanent ? await this.pages.extend(id, LIMITS.temporaryTtl) : page, this.host);
+	}
+
 	async delete(id: string) {
 		await this.pages.delete(id);
 		return { id, deleted: true };
@@ -199,8 +216,14 @@ export class Operations {
 	}
 
 	async list() {
-		const [list, usage, options] = await Promise.all([this.pages.list(), this.pages.usage(), this.pages.allOptions()]);
-		return { pages: list.map((page) => setView(page, this.host, options.get(page.id))), usage };
+		const { pages, usage, options } = await this.overview();
+		return { pages: pages.map((page) => setView(page, this.host, options.get(page.id))), usage };
+	}
+
+	/** Every live page with its options, versions and the usage, read at once. For the dashboard only (see `Overview`). */
+	async overview(): Promise<Overview> {
+		const [pages, usage, options, versions] = await Promise.all([this.pages.list(), this.pages.usage(), this.pages.allOptions(), this.pages.allVersions()]);
+		return { pages, usage, options, versions };
 	}
 
 	private async view(page: Page) {
