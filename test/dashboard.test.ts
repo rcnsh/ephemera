@@ -1,5 +1,7 @@
 import { reset } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PageError } from "../src/domain.ts";
+import { Operations } from "../src/operations.ts";
 import { screenshot } from "../src/thumbnails.ts";
 import { ADMIN, api, call, PAGES, publish } from "./helpers.ts";
 
@@ -376,12 +378,67 @@ describe("bulk actions", () => {
 	});
 
 	it("carries on past a page that fails, and says which", async () => {
+		const [a, b, c] = [await publish(), await publish(), await publish()];
+		const csrf = await csrfToken();
+		const real = Operations.prototype.makeTemporary;
+		const spy = vi.spyOn(Operations.prototype, "makeTemporary").mockImplementation(function (this: Operations, id: string) {
+			if (id === b.id) return Promise.reject(new PageError(409, "Page is busy"));
+			return real.call(this, id);
+		});
+		try {
+			const html = await (await fragment("/bulk", csrf, [["do", "temporary"], ["id", a.id], ["id", b.id], ["id", c.id]])).text();
+			expect(cards(html).map((card) => card.id)).toEqual([a.id, c.id]);
+			expect(html).toContain(`<p class="error" data-error-for="${b.id}">Page is busy</p>`);
+			expect(await pageInfo(c.id)).toMatchObject({ permanent: false });
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("treats a page already gone as done, so its card goes rather than showing an error", async () => {
+		const page = await publish();
+		const gone = await publish();
+		await api(`/pages/${gone.id}`, { method: "DELETE" });
+		const csrf = await csrfToken();
+		for (const verb of ["delete", "temporary"]) {
+			const html = await (await fragment("/bulk", csrf, [["do", verb], ["id", gone.id], ["id", "zzzzzzzzzzzz"]])).text();
+			expect(html).not.toContain("error");
+		}
+		await fragment("/bulk", csrf, [["do", "delete"], ["id", page.id]]);
+		expect((await call(page.url)).status).toBe(410);
+	});
+
+	it("takes at most 100 pages, and sends the totals back for the header", async () => {
 		const page = await publish();
 		const csrf = await csrfToken();
-		const response = await fragment("/bulk", csrf, [["do", "delete"], ["id", "zzzzzzzzzzzz"], ["id", page.id]]);
-		expect(response.status).toBe(200);
-		expect(await response.text()).toMatch(/<p class="error" data-error-for="zzzzzzzzzzzz">No page with id/);
-		expect((await call(page.url)).status).toBe(410);
+		const ids = Array.from({ length: 101 }, (_, i) => ["id", `zzzzzzzzzz${String.fromCharCode(97 + Math.floor(i / 26))}${String.fromCharCode(97 + (i % 26))}`] as [string, string]);
+		const tooMany = await fragment("/bulk", csrf, [["do", "delete"], ...ids]);
+		expect(tooMany.status).toBe(400);
+		expect(await tooMany.text()).toBe("Select at most 100 pages at once");
+		const response = await fragment("/bulk", csrf, [["do", "temporary"], ["id", page.id]]);
+		expect(decodeURIComponent(response.headers.get("x-ephemera-usage")!)).toBe("0 kept · 1 expiring · 0 mockup sets · 29 B");
+		const single = await fragment(`/pages/${page.id}/delete`, csrf);
+		expect(decodeURIComponent(single.headers.get("x-ephemera-usage")!)).toMatch(/^0 kept · 0 expiring/);
+	});
+
+	it("makes 24 pages temporary in batches, and renders their cards from one read", async () => {
+		const pages = await Promise.all(Array.from({ length: 24 }, () => publish()));
+		const csrf = await csrfToken();
+		const response = await fragment("/bulk", csrf, [["do", "temporary"], ...pages.map((page) => ["id", page.id] as [string, string])]);
+		expect(cards(await response.text())).toHaveLength(24);
+		for (const page of pages) expect(await pageInfo(page.id)).toMatchObject({ permanent: false });
+	});
+
+	it("does nothing when submitted by Enter, which presses its first button, a hidden one that asks for nothing", async () => {
+		const page = await publish();
+		const html = await (await admin()).text();
+		expect(html).toMatch(/<form id="bulk"[^>]*><button type="submit" class="default" name="do" value="" hidden/);
+		const csrf = await csrfToken();
+		expect((await fragment("/bulk", csrf, [["do", ""], ["id", page.id]])).status).toBe(204);
+		const plain = await post("/bulk", csrf, ADMIN, [["do", ""], ["id", page.id]]);
+		expect(plain.status).toBe(303);
+		expect(await pageInfo(page.id)).toMatchObject({ permanent: true });
+		expect((await call(page.url)).status).toBe(200);
 	});
 
 	it("refuses unknown actions, empty selections, and requests without the origin or CSRF token", async () => {

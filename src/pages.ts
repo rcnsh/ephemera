@@ -39,6 +39,8 @@ interface PageRow {
 	project: string | null;
 	/** See `publish`'s `pendingTtl`: milliseconds, 0 for permanent, NULL for none. */
 	pending_ttl: number | null;
+	/** Mockup sets: whether the served version has a root index.html (see `Page.rootIndex`). Absent until migration 0010. */
+	root_index?: number | null;
 }
 
 interface VerdictRow {
@@ -95,6 +97,13 @@ export interface Page {
 	kind: PageKind;
 	/** Groups mockup sets; a slug. Null for plain pages. */
 	project: string | null;
+	/**
+	 * Mockup sets: whether the version being served has a root index.html,
+	 * which replaces the gallery. Recorded whenever a set's options are
+	 * synced; null for plain pages and for sets not synced since migration
+	 * 0010 (see `hasRootIndex`).
+	 */
+	rootIndex: boolean | null;
 }
 
 export interface Usage {
@@ -184,6 +193,7 @@ function toPage(row: PageRow): Page {
 		shareEpoch: row.share_epoch,
 		kind: row.kind,
 		project: row.project,
+		rootIndex: row.root_index === undefined || row.root_index === null ? null : row.root_index === 1,
 	};
 }
 
@@ -444,6 +454,7 @@ export class Pages {
 		const options = optionsJson(paths);
 		const serving = "EXISTS (SELECT 1 FROM pages WHERE id = ? AND version = ?)";
 		return [
+			this.db.prepare("UPDATE pages SET root_index = ? WHERE id = ? AND version = ?").bind(paths.includes("index.html") ? 1 : 0, id, version),
 			this.db
 				.prepare(`DELETE FROM verdicts WHERE page_id = ? AND option NOT IN (SELECT value ->> 'name' FROM json_each(?)) AND ${serving}`)
 				.bind(id, options, id, version),
@@ -667,8 +678,10 @@ export class Pages {
 	 * expiry (never past 30 days from now); on a permanent page it makes the
 	 * page temporary again, expiring that long from now.
 	 */
-	async extend(id: string, by: Ttl): Promise<Page> {
+	/** With `onlyIfPermanent`, a page that already expires is left as it is. */
+	async extend(id: string, by: Ttl, { onlyIfPermanent = false }: { onlyIfPermanent?: boolean } = {}): Promise<Page> {
 		const page = await this.get(id);
+		if (onlyIfPermanent && !page.permanent) return page;
 		const now = this.now();
 		let expiresAt: number | null;
 		if (by === "permanent") {
@@ -718,6 +731,19 @@ export class Pages {
 		const result = await this.db.prepare(`UPDATE pages SET label = ?, updated_at = ? WHERE id = ? AND ${LIVE}`).bind(cleaned, now, id, now).run();
 		if (result.meta.changes !== 1) throw new PageError(410, `Page ${id} has expired or been deleted`);
 		return { ...page, label: cleaned, updatedAt: now };
+	}
+
+	/**
+	 * Whether a mockup set's served version has a root index.html of its own,
+	 * and so shows it rather than the gallery. Answered from D1; a set last
+	 * synced before migration 0010 is checked in its files once, and the
+	 * answer recorded.
+	 */
+	async hasRootIndex(page: Page): Promise<boolean> {
+		if (page.rootIndex !== null) return page.rootIndex;
+		const found = await this.store.exists(page, "index.html");
+		await this.db.prepare("UPDATE pages SET root_index = ? WHERE id = ? AND version = ? AND root_index IS NULL").bind(found ? 1 : 0, page.id, page.version).run();
+		return found;
 	}
 
 	/** The options of a mockup set, by name, with their verdicts. */

@@ -1,4 +1,4 @@
-import { marked } from "marked";
+import { Marked, Renderer } from "marked";
 import { FAVICON } from "./logo.ts";
 
 const CSS = `
@@ -33,10 +33,18 @@ function escape(text: string): string {
  */
 const FAVICON_LINK = `<link rel="icon" href="data:image/svg+xml,${encodeURIComponent(FAVICON)}" type="image/svg+xml">`;
 
-/** Puts each table in a box that scrolls sideways, so a wide one doesn't widen the page. */
-function wrapTables(html: string): string {
-	return html.replace(/<table\b[^>]*>/g, '<div class="table">$&').replace(/<\/table>/g, "</table></div>");
-}
+/**
+ * GFM, with each table the renderer emits in a box that scrolls sideways,
+ * so a wide one doesn't widen the page. Raw HTML passes through untouched.
+ */
+const gfm = new Marked({
+	gfm: true,
+	renderer: {
+		table(token) {
+			return `<div class="table">${Renderer.prototype.table.call(this, token)}</div>\n`;
+		},
+	},
+});
 
 /** A whole HTML page for a Markdown document, titled by `title` or else its first heading. */
 export function markdownPage(markdown: string, title?: string | null): string {
@@ -48,7 +56,7 @@ export function markdownPage(markdown: string, title?: string | null): string {
 <title>${escape(title || heading || "Page")}</title>
 ${FAVICON_LINK}
 <style>${CSS}</style>
-${wrapTables(marked.parse(markdown, { async: false, gfm: true }))}
+${gfm.parse(markdown, { async: false })}
 </html>
 `;
 }

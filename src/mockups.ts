@@ -105,7 +105,7 @@ ${FAVICON_LINK}
 <style>
 :root {
 	--bg: #f4f4f2; --surface: #fff; --text: #18181a; --muted: #6e6e73; --faint: #a1a1a6; --line: #e3e3df; --hover: #c9c9c4;
-	--accent: #1a7f37; --frame: #fff; --shimmer: #ebebe7;
+	--accent: #146c2e; --frame: #fff; --shimmer: #ebebe7;
 	--shadow: 0 1px 2px rgb(0 0 0 / .04), 0 2px 8px rgb(0 0 0 / .04);
 	--shadow-hover: 0 2px 4px rgb(0 0 0 / .05), 0 12px 32px rgb(0 0 0 / .10);
 	--ease: cubic-bezier(.2, .8, .2, 1);

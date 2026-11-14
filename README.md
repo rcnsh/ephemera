@@ -136,7 +136,7 @@ curl -fsS "https://$PAGES_HOST/api/pages/$ID/zip" -H "Authorization: Bearer $EPH
 
 ## Dashboard
 
-`ADMIN_HOST` shows a card per page with a thumbnail, newest-updated first (or sorted by expiry or size), and lets you search and filter by agent. Search, filter and sort live in the URL (`?q=`, `?agent=`, `?sort=`), so a reload or a link keeps them. From a card you can rename, extend, make permanent or temporary, make private or public (making a page public asks first, since it revokes its share links), set a password, make share links, roll back versions and delete. Ticking cards brings up a bar that makes them all temporary or deletes them.
+`ADMIN_HOST` shows a card per page with a thumbnail, newest-updated first (or sorted by expiry or size), and lets you search and filter by agent. Search, filter and sort live in the URL (`?q=`, `?agent=`, `?sort=`), so a reload or a link keeps them. From a card you can rename, extend, make permanent or temporary, make private or public (making a page public asks first, since it revokes its share links), set a password, make share links, roll back versions and delete. Ticking cards brings up a bar that makes them all temporary or deletes them, up to 100 at a time; only a press of its buttons acts, never Enter in a field.
 
 Actions post in the background and swap in the card's new HTML, so the page keeps its place; without script they're plain form posts that redirect back to the card. Expiry counts down in place.
 

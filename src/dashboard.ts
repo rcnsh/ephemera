@@ -28,8 +28,17 @@ type Sort = keyof typeof SORTS;
  */
 const FRAGMENT_HEADER = "x-ephemera-fragment";
 
-/** Most pages one bulk action takes. */
-const BULK_LIMIT = 500;
+/** Sent with every answer to the script, so the totals under the title stay true. URI-encoded: headers are bytes. */
+const USAGE_HEADER = "x-ephemera-usage";
+
+/**
+ * Most pages one bulk action takes, and how many it works on at once. One
+ * invocation may make 1,000 D1 queries (Workers Paid) and keep 6 connections
+ * open; a delete is 3 queries and 2 R2 calls per page, so 100 pages stay well
+ * inside both, in batches of 4.
+ */
+const BULK_LIMIT = 100;
+const BULK_BATCH = 4;
 
 function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -142,7 +151,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const items = () => $$(".card, .set");
 
 for (const button of $$("[data-share]")) if (navigator.share) button.hidden = false;
-for (const button of $$(".bulk [hidden]")) button.hidden = false;
+for (const button of $$(".bulk .all, .bulk .none-selected")) button.hidden = false;
 
 document.addEventListener("click", async (event) => {
 	const copy = event.target.closest("[data-copy]");
@@ -192,7 +201,7 @@ const agent = $("#agent");
 const verdict = $("#verdict");
 const sort = $("#sort");
 function filter() {
-	if (!search) return;
+	if (!search?.isConnected) return;
 	const words = search.value.toLowerCase().split(/\\s+/).filter(Boolean);
 	for (const card of items()) {
 		const text = card.dataset.search;
@@ -218,10 +227,12 @@ function order() {
 	const grid = $(".grid");
 	if (!sort || !grid) return;
 	const number = (card, key) => Number(card.dataset[key] || 0);
+	// As the server sorts (sortPages), ties included: newest, then by id.
+	const newest = (a, b) => number(b, "updated") - number(a, "updated") || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 	const compare = {
-		newest: (a, b) => number(b, "updated") - number(a, "updated"),
-		expiring: (a, b) => (!a.dataset.expires - !b.dataset.expires) || number(a, "expires") - number(b, "expires") || number(b, "updated") - number(a, "updated"),
-		largest: (a, b) => number(b, "size") - number(a, "size"),
+		newest,
+		expiring: (a, b) => (!a.dataset.expires - !b.dataset.expires) || number(a, "expires") - number(b, "expires") || newest(a, b),
+		largest: (a, b) => number(b, "size") - number(a, "size") || newest(a, b),
 	}[sort.value];
 	for (const card of [...grid.children].sort(compare)) grid.append(card);
 }
@@ -260,8 +271,52 @@ function showError(where, message) {
 	p.textContent = message;
 	(where.querySelector(".body") || where).append(p);
 }
-function swap(item, html) {
-	const focused = item.contains(document.activeElement) ? document.activeElement.closest("form")?.getAttribute("action") : null;
+
+// The control someone was using, told apart from its twins: every verdict
+// form in a set shares one action, so a form is its action plus its place
+// among the card's forms with that action, and a control is its tag, name,
+// value and text inside it.
+function controlOf(item, form, submitter) {
+	if (!item) return null;
+	const active = document.activeElement;
+	const control = form.contains(active) && active !== form ? active : submitter;
+	if (!control) return null;
+	const action = form.getAttribute("action");
+	return {
+		action,
+		index: $$("form", item).filter((f) => f.getAttribute("action") === action).indexOf(form),
+		tag: control.tagName,
+		name: control.getAttribute("name") || "",
+		value: control.tagName === "BUTTON" ? control.value : "",
+		text: control.tagName === "BUTTON" ? control.textContent : "",
+	};
+}
+// Never the selection checkbox: Enter there would act on the bulk form.
+const FOCUSABLE = "button, input:not([type=hidden]):not(.select), select, textarea";
+function refocus(next, key) {
+	let target = null;
+	if (key) {
+		const forms = $$("form", next).filter((f) => f.getAttribute("action") === key.action);
+		const form = forms[key.index] || forms[0];
+		if (form) {
+			const controls = $$(FOCUSABLE, form);
+			target =
+				controls.find((c) => c.tagName === key.tag && (c.getAttribute("name") || "") === key.name && (c.tagName !== "BUTTON" || (c.value === key.value && c.textContent === key.text))) ||
+				controls[0] ||
+				null;
+		}
+		// Its form went (make permanent turns into make temporary): the card's actions.
+		if (!target) target = $(".actions " + FOCUSABLE.split(", ").join(", .actions "), next);
+	}
+	target = target || next;
+	// A control inside a closed <details> can't take focus; its summary can.
+	const closed = target.parentElement?.closest("details:not([open])");
+	if (closed) target = closed.querySelector("summary");
+	target.focus({ preventScroll: true });
+	// Back in a text box, the caret goes at the end, where typing carries on.
+	if (target.tagName === "INPUT" && /^(text|search|password|)$/.test(target.getAttribute("type") || "")) target.setSelectionRange(target.value.length, target.value.length);
+}
+function swap(item, html, key) {
 	const kept = new Set($$("details[open][data-keep]", item).map((d) => d.dataset.keep));
 	const selected = $(".select", item)?.checked;
 	const template = document.createElement("template");
@@ -270,16 +325,27 @@ function swap(item, html) {
 	for (const d of $$("details[data-keep]", next)) d.open = kept.has(d.dataset.keep);
 	if (selected && $(".select", next)) $(".select", next).checked = true;
 	item.replaceWith(next);
-	const target = focused && $$("form", next).find((form) => form.getAttribute("action") === focused);
-	(target?.querySelector("button, input:not([type=hidden])") || next).focus({ preventScroll: true });
+	if (key !== undefined) refocus(next, key);
 	return next;
 }
-function remove(item) {
+// Removes a card, and tidies what depended on it: its project heading, the
+// agent menu, and, once nothing is left, the whole list for the empty state.
+function remove(item, focus) {
 	const after = item.nextElementSibling || item.previousElementSibling;
 	const project = item.closest(".project");
 	item.remove();
 	if (project && !project.querySelector(".set")) project.remove();
-	(after?.matches(".card, .set") ? after : $("h1")).focus({ preventScroll: true });
+	if (agent) {
+		const left = new Set(items().map((card) => card.dataset.agent).filter(Boolean));
+		for (const option of [...agent.options]) if (option.value && !left.has(option.value)) option.remove();
+	}
+	if (!items().length) {
+		for (const el of $$(".filters, #count, #none, .grid, .sets, #bulk")) el.remove();
+		$("#empty")?.removeAttribute("hidden");
+		if (focus) $("h1").focus({ preventScroll: true });
+		return;
+	}
+	if (focus) (after?.matches(".card, .set") ? after : $("h1")).focus({ preventScroll: true });
 }
 async function post(form, submitter) {
 	const body = new FormData(form);
@@ -289,39 +355,48 @@ async function post(form, submitter) {
 	});
 	const text = await response.text();
 	if (!response.ok) throw new Error(text.trim() || "That didn't work (" + response.status + ")");
+	const usage = response.headers.get("${USAGE_HEADER}");
+	if (usage && $(".usage")) $(".usage").textContent = decodeURIComponent(usage);
 	return { body, text, status: response.status };
 }
 document.addEventListener("submit", async (event) => {
 	const form = event.target;
 	if (form.method !== "post" || new URL(form.action).pathname.endsWith("/share")) return;
 	event.preventDefault();
+	// Not form.id: the bulk form's checkboxes are named "id", which shadows it.
+	const isBulk = form.getAttribute("id") === "bulk";
+	const submitter = event.submitter;
+	// The bulk form acts only on a press of one of its own buttons.
+	if (isBulk && !(submitter && submitter.name === "do" && (submitter.value === "delete" || submitter.value === "temporary"))) return;
 	const item = form.closest(".card, .set");
 	const busy = item || form;
 	if (busy.classList.contains("busy")) return;
+	const key = controlOf(item, form, submitter);
 	for (const old of $$(".error", busy)) old.remove();
-	const submitter = event.submitter;
+	// Not disabled while it runs: that would drop focus. Busy guards against a second press.
 	busy.classList.add("busy");
 	busy.setAttribute("aria-busy", "true");
-	if (submitter) submitter.disabled = true;
 	try {
 		const { body, text, status } = await post(form, submitter);
-		// Not form.id: the bulk form's checkboxes are named "id", which shadows it.
-		if (form.getAttribute("id") === "bulk") {
+		if (isBulk) {
 			const template = document.createElement("template");
 			template.innerHTML = text;
 			for (const id of body.getAll("id")) {
 				const card = document.getElementById("p-" + id);
 				if (!card) continue;
+				for (const old of $$(".error", card)) old.remove();
 				const fresh = template.content.getElementById("p-" + id);
 				const failed = template.content.querySelector('[data-error-for="' + id + '"]');
 				if (fresh) swap(card, fresh.outerHTML);
 				else if (failed) showError(card, failed.textContent);
-				else remove(card);
+				else remove(card, false);
 			}
 			for (const box of $$(".select")) box.checked = false;
 			form.querySelector("details")?.removeAttribute("open");
-		} else if (status === 204) remove(item);
-		else swap(item, text);
+			// The bar hides with nothing selected: focus moves to the count, which says what's left.
+			($("#count") || $("h1")).focus({ preventScroll: true });
+		} else if (status === 204) remove(item, true);
+		else swap(item, text, key);
 		// Not re-sorted: an action changes updatedAt, and the card should stay where you are.
 		filter();
 		tick();
@@ -331,11 +406,12 @@ document.addEventListener("submit", async (event) => {
 	} finally {
 		busy.classList.remove("busy");
 		busy.removeAttribute("aria-busy");
-		if (submitter?.isConnected) submitter.disabled = false;
 	}
 });
 
 filter();
+// The URL keeps only what the page shows: an agent with no pages, say, is dropped.
+if (search) remember();
 `;
 
 /** The tab a page is shown on, where its actions come back to. */
@@ -501,7 +577,7 @@ function viewOf(url: URL): View {
 	return {
 		q: url.searchParams.get("q") ?? "",
 		agent: url.searchParams.get("agent") ?? "",
-		verdict: url.searchParams.get("verdict") ?? "",
+		verdict: (VERDICTS as readonly string[]).includes(url.searchParams.get("verdict") ?? "") ? url.searchParams.get("verdict")! : "",
 		sort: sort in SORTS ? (sort as Sort) : "newest",
 	};
 }
@@ -516,7 +592,8 @@ function matches(text: string, q: string): boolean {
 
 /** The Pages tab's order. The store's own order (soonest to expire first) is the API's, and stays as it is. */
 function sortPages(pages: Page[], sort: Sort): Page[] {
-	const newest = (a: Page, b: Page) => b.updatedAt - a.updatedAt;
+	// The script sorts the same way, ties included (see `order` in SCRIPT).
+	const newest = (a: Page, b: Page) => b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 	const compare = {
 		newest,
 		expiring: (a: Page, b: Page) => Number(a.permanent) - Number(b.permanent) || (a.expiresAt ?? 0) - (b.expiresAt ?? 0) || newest(a, b),
@@ -547,17 +624,17 @@ ${rendered.map((set) => set.html).join("\n")}
 		.join("\n");
 }
 
-/** Which mockup sets have a root index.html of their own, and so show it instead of the gallery. */
-async function setsWithOwnIndex(pages: Pages, sets: Page[], options: Map<string, MockupOption[]>): Promise<Set<string>> {
-	const own = await Promise.all(sets.map((page) => hasOwnIndex(pages, page, options.get(page.id) ?? [])));
+/** Which mockup sets have a root index.html of their own, and so show it instead of the gallery. Read from D1 (see `Pages.hasRootIndex`). */
+async function setsWithOwnIndex(pages: Pages, sets: Page[]): Promise<Set<string>> {
+	const own = await Promise.all(sets.map((page) => pages.hasRootIndex(page)));
 	return new Set(sets.filter((_, i) => own[i]).map((page) => page.id));
 }
 
-async function hasOwnIndex(pages: Pages, page: Page, options: MockupOption[]): Promise<boolean> {
-	// A set that is just a root index.html has it as its one option.
-	if (options.some((option) => option.path === "")) return true;
-	return pages.files.exists(page, "index.html");
+/** The line of totals under the title. */
+function usageText(usage: Overview["usage"]): string {
+	return `${usage.permanentPages} kept · ${usage.temporaryPages} expiring · ${usage.mockups} mockup set${usage.mockups === 1 ? "" : "s"} · ${bytesText(usage.bytes)}`;
 }
+
 
 /** "3 of 24 pages", or "24 pages" when nothing is filtered out. */
 function countText(shown: number, total: number, noun: string): string {
@@ -567,9 +644,15 @@ function countText(shown: number, total: number, noun: string): string {
 
 /** The bar that acts on the selected cards; shown once one is selected. */
 function bulkBar(csrf: string, back: string): string {
-	return `<form id="bulk" class="bulk" method="post" action="/bulk" aria-label="Selected pages"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="back" value="${back}">
+	// Enter in a field of this form (its checkboxes live in every card)
+	// "clicks" its first enabled submit button; browsers skip a disabled one.
+	// So the first is a hidden button that asks for nothing (`do` empty),
+	// which the script ignores and the server answers by doing nothing. Only
+	// a press of one of the real buttons acts.
+	return `<form id="bulk" class="bulk" method="post" action="/bulk" aria-label="Selected pages"><button type="submit" class="default" name="do" value="" hidden aria-hidden="true" tabindex="-1"></button><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="back" value="${back}">
 <span class="n" aria-live="polite">selected</span>
 <button type="button" class="all" hidden>select all shown</button><button type="button" class="none-selected" hidden>clear</button>
+<span class="muted">at most ${BULK_LIMIT} at once</span>
 <button name="do" value="temporary">make temporary</button>
 <details class="delete"><summary>delete</summary> <button name="do" value="delete" class="danger">really delete selected</button></details>
 </form>`;
@@ -604,6 +687,8 @@ function render(tab: Tab, { pages: all, versions, options, usage }: Overview, ho
 			view.sort,
 		);
 		const agents = [...new Set(pages.map((page) => page.agent).filter((agent): agent is string => !!agent))].sort();
+		// An agent with no pages filters nothing; the script drops it from the URL.
+		if (!agents.includes(view.agent)) view = { ...view, agent: "" };
 		const shown = (page: Page) => matches(pageSearch(page), view.q) && (!view.agent || page.agent === view.agent);
 		const visible = pages.filter(shown).length;
 		const cards = pages.map((page) => card(page, versions.get(page.id) ?? [], host, csrf, now, shown(page))).join("\n");
@@ -612,12 +697,13 @@ function render(tab: Tab, { pages: all, versions, options, usage }: Overview, ho
 <select id="agent" name="agent" aria-label="Agent"><option value="">all agents</option>${agents.map((agent) => (agent === view.agent ? selectOption(agent, agent, true) : `<option>${escape(agent)}</option>`)).join("")}</select>
 <select id="sort" name="sort" aria-label="Sort by">${Object.entries(SORTS).map(([value, label]) => selectOption(value, label, value === view.sort)).join("")}</select>
 <noscript><button>apply</button></noscript></form>
-<p class="count" id="count" aria-live="polite">${countText(visible, pages.length, "page")}</p>
+<p class="count" id="count" tabindex="-1" aria-live="polite">${countText(visible, pages.length, "page")}</p>
 <p class="none" id="none"${visible ? " hidden" : ""}>No pages match. <a href="/">Show all</a></p>
 <div class="grid">
 ${cards}
 </div>
-${bulkBar(csrf, "/")}`
+${bulkBar(csrf, "/")}
+<p class="muted" id="empty" hidden>No live pages.</p>`
 			: '<p class="muted">No live pages.</p>';
 	} else {
 		const sets = all.filter((page) => page.kind === "mockup");
@@ -629,17 +715,20 @@ ${bulkBar(csrf, "/")}`
 			? `<form class="filters" method="get" role="search"><input type="search" id="search" name="q" value="${escape(view.q)}" placeholder="Search projects, names, options, notes" aria-label="Search mockup sets">
 <select id="verdict" name="verdict" aria-label="Verdict"><option value="">any verdict</option>${VERDICTS.map((verdict) => selectOption(verdict, `has ${verdict}`, verdict === view.verdict)).join("")}</select>
 <noscript><button>apply</button></noscript></form>
-<p class="count" id="count" aria-live="polite">${countText(visible, sets.length, "set")}</p>
+<p class="count" id="count" tabindex="-1" aria-live="polite">${countText(visible, sets.length, "set")}</p>
 <p class="none" id="none"${visible ? " hidden" : ""}>No mockup sets match. <a href="/mockups">Show all</a></p>
+<div class="sets">
 ${mockupSets(sets, options, versions, host, csrf, now, ownIndex, view)}
-${bulkBar(csrf, "/mockups")}`
+</div>
+${bulkBar(csrf, "/mockups")}
+<p class="muted" id="empty" hidden>No mockup sets yet. Agents publish them with publish_mockup.</p>`
 			: '<p class="muted">No mockup sets yet. Agents publish them with publish_mockup.</p>';
 	}
 	const tabLink = (name: Tab, href: string, label: string) => `<a href="${href}"${tab === name ? ' class="current" aria-current="page"' : ""}>${label}</a>`;
 	return shell(
 		`ephemera${tab === "mockups" ? " · mockups" : ""}`,
 		`<h1 tabindex="-1">${mark("logo", 7, 'class="logo"')}ephemera</h1>
-<p class="usage">${usage.permanentPages} kept · ${usage.temporaryPages} expiring · ${usage.mockups} mockup set${usage.mockups === 1 ? "" : "s"} · ${bytesText(usage.bytes)}</p>
+<p class="usage">${usageText(usage)}</p>
 <nav class="tabs">${tabLink("pages", "/", "Pages")}${tabLink("mockups", "/mockups", "Mockups")}</nav>
 ${body}`,
 		nonce,
@@ -759,15 +848,17 @@ function backTo(request: Request, form: FormData, adminHost: string): string {
 async function renderOne(pages: Pages, host: string, csrf: string, id: string, now: number): Promise<string> {
 	const page = await pages.get(id);
 	const [versions, options] = await Promise.all([pages.versions(id), page.kind === "mockup" ? pages.options(id) : Promise.resolve([])]);
-	if (page.kind === "mockup") return mockupSet(page, options, versions, host, csrf, now, await hasOwnIndex(pages, page, options));
+	if (page.kind === "mockup") return mockupSet(page, options, versions, host, csrf, now, await pages.hasRootIndex(page));
 	return card(page, versions, host, csrf, now);
 }
 
 /**
- * POST /bulk: makes temporary or deletes every page selected (`id`, repeated),
- * one by one through `Operations`. A page that fails doesn't stop the rest.
- * The script gets the cards that changed, and a `data-error-for` line per
- * page that failed.
+ * POST /bulk: makes temporary or deletes every page selected (`id`,
+ * repeated) through `Operations`, `BULK_BATCH` at a time. Each page has
+ * its own outcome, and one that fails doesn't stop the rest. The script gets
+ * the cards that changed (rendered from one read of everything), a
+ * `data-error-for` line per page that failed, and nothing for a page that's
+ * gone: deleted, here or elsewhere, so its card goes too.
  */
 async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, form: FormData): Promise<{ html: string; status: number }> {
 	const verb = form.get("do");
@@ -776,20 +867,52 @@ async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, f
 	if (!ids.length) return { html: "Select some pages first", status: 400 };
 	if (ids.length > BULK_LIMIT) return { html: `Select at most ${BULK_LIMIT} pages at once`, status: 400 };
 	if (!ids.every((id) => ID_PATTERN.test(id))) return { html: "Unknown page", status: 400 };
-	const results = await Promise.allSettled(ids.map((id) => (verb === "delete" ? ops.delete(id) : ops.makeTemporary(id))));
-	const now = Date.now();
-	const parts = await Promise.all(
-		results.map(async (result, i) => {
-			const id = ids[i]!;
-			if (result.status === "rejected") {
+	const errors = new Map<string, string>();
+	const changed: string[] = [];
+	for (let i = 0; i < ids.length; i += BULK_BATCH) {
+		const batch = ids.slice(i, i + BULK_BATCH);
+		const results = await Promise.allSettled(batch.map((id) => (verb === "delete" ? ops.delete(id) : ops.makeTemporary(id))));
+		results.forEach((result, j) => {
+			const id = batch[j]!;
+			if (result.status === "fulfilled") {
+				if (verb === "temporary") changed.push(id);
+			} else if (result.reason instanceof PageError && (result.reason.status === 404 || result.reason.status === 410)) {
+				// Already gone: nothing to do, and its card should go.
+			} else {
 				if (!(result.reason instanceof PageError)) console.error(`bulk ${verb} of ${id} failed`, result.reason);
-				const message = result.reason instanceof PageError ? result.reason.message : "Something went wrong";
-				return `<p class="error" data-error-for="${id}">${escape(message)}</p>`;
+				errors.set(id, result.reason instanceof PageError ? result.reason.message : "Something went wrong");
 			}
-			return verb === "delete" ? "" : renderOne(pages, host, csrf, id, now);
-		}),
-	);
+		});
+	}
+	const parts: string[] = [];
+	if (changed.length) {
+		const overview = await ops.overview();
+		const live = new Map(overview.pages.map((page) => [page.id, page]));
+		const now = Date.now();
+		for (const id of changed) {
+			const page = live.get(id);
+			if (!page) continue;
+			try {
+				const versions = overview.versions.get(id) ?? [];
+				parts.push(
+					page.kind === "mockup"
+						? mockupSet(page, overview.options.get(id) ?? [], versions, host, csrf, now, await pages.hasRootIndex(page))
+						: card(page, versions, host, csrf, now),
+				);
+			} catch (error) {
+				console.error(`rendering ${id} after bulk ${verb} failed`, error);
+				errors.set(id, "Done, but its card couldn't be shown; reload to see it");
+			}
+		}
+	}
+	for (const [id, message] of errors) parts.push(`<p class="error" data-error-for="${id}">${escape(message)}</p>`);
 	return { html: parts.join("\n"), status: 200 };
+}
+
+/** Adds the current totals to an answer for the script (see `USAGE_HEADER`). */
+async function withUsage(response: Response, pages: Pages): Promise<Response> {
+	response.headers.set(USAGE_HEADER, encodeURIComponent(usageText(await pages.usage())));
+	return response;
 }
 
 /** The admin dashboard on ADMIN_HOST. Only reachable through the Cloudflare Access app with audience ACCESS_AUD. */
@@ -805,7 +928,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		const nonce = crypto.randomUUID().replaceAll("-", "");
 		const [overview, csrf] = await Promise.all([ops.overview(), csrfToken(env.EPHEMERA_TOKEN, user)]);
 		const tab = url.pathname === "/" ? "pages" : "mockups";
-		const ownIndex = tab === "mockups" ? await setsWithOwnIndex(pages, overview.pages.filter((page) => page.kind === "mockup"), overview.options) : new Set<string>();
+		const ownIndex = tab === "mockups" ? await setsWithOwnIndex(pages, overview.pages.filter((page) => page.kind === "mockup")) : new Set<string>();
 		return respond(render(tab, overview, env.PAGES_HOST, csrf, nonce, Date.now(), viewOf(url), ownIndex), 200, nonce);
 	}
 
@@ -850,9 +973,11 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 	const csrf = () => csrfToken(env.EPHEMERA_TOKEN, user);
 
 	if (isBulk) {
+		// Enter in the form, rather than a press of one of its buttons: nothing to do.
+		if (form.get("do") === "") return fragment ? new Response(null, { status: 204 }) : new Response(null, { status: 303, headers: { location: back } });
 		const done = await bulk(ops, pages, env.PAGES_HOST, await csrf(), form);
 		if (done.status !== 200) return fail(done.html, done.status);
-		return fragment ? respond(done.html, 200) : new Response(null, { status: 303, headers: { location: back } });
+		return fragment ? withUsage(respond(done.html, 200), pages) : new Response(null, { status: 303, headers: { location: back } });
 	}
 
 	const [, id, name] = match as unknown as [string, string, string];
@@ -905,7 +1030,7 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 				break;
 			}
 		}
-		if (fragment) return name === "delete" ? new Response(null, { status: 204 }) : respond(await renderOne(pages, env.PAGES_HOST, await csrf(), id, Date.now()), 200);
+		if (fragment) return withUsage(name === "delete" ? new Response(null, { status: 204 }) : respond(await renderOne(pages, env.PAGES_HOST, await csrf(), id, Date.now()), 200), pages);
 	} catch (error) {
 		if (error instanceof PageError) return fail(error.message, error.status);
 		throw error;

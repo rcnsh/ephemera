@@ -354,8 +354,7 @@ export class Operations {
 
 	/** Makes a permanent page temporary, expiring `LIMITS.temporaryTtl` from now. A temporary page stays as it is. */
 	async makeTemporary(id: string) {
-		const page = await this.pages.get(id);
-		return pageView(page.permanent ? await this.pages.extend(id, LIMITS.temporaryTtl) : page, this.host);
+		return pageView(await this.pages.extend(id, LIMITS.temporaryTtl, { onlyIfPermanent: true }), this.host);
 	}
 
 	async delete(id: string) {

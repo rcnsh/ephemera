@@ -4,6 +4,7 @@ import { LIMITS } from "../src/domain.ts";
 import { mockupIndex, mockupOptions, slugify } from "../src/mockups.ts";
 import { ID_PATTERN, Pages } from "../src/pages.ts";
 import { screenshotOptions } from "../src/thumbnails.ts";
+import { VersionFiles } from "../src/version-files.ts";
 import { ADMIN, api, call, PAGES, publish, zip } from "./helpers.ts";
 
 afterEach(async () => {
@@ -563,6 +564,46 @@ describe("the dashboard's mockup set controls", () => {
 		const html = await (await admin("/mockups")).text();
 		expect(html).toContain(`<a class="shot" href="${set.url}a/"`);
 		expect(html).not.toContain(`${set.url}#option=`);
+	});
+
+	it("knows which sets have their own index.html from D1, following patches and rollbacks, without asking R2 on each load", async () => {
+		const exists = vi.spyOn(VersionFiles.prototype, "exists");
+		try {
+			const set = await publishMockup();
+			const shot = async () => /<a class="shot" href="([^"]+)"/.exec(await (await admin("/mockups")).text())![1];
+			expect(await shot()).toBe(`${set.url}#option=a`);
+			await patch(set.id, { files: [{ path: "index.html", content: "<p>own</p>" }] });
+			expect(await shot()).toBe(`${set.url}a/`);
+			await api(`/pages/${set.id}/rollback`, { method: "POST", body: JSON.stringify({ version: 1 }) });
+			expect(await shot()).toBe(`${set.url}#option=a`);
+			expect(exists).not.toHaveBeenCalled();
+		} finally {
+			exists.mockRestore();
+		}
+	});
+
+	it("checks a set synced before the root_index column once, and records the answer", async () => {
+		const set = await publishMockup({ files: [...TWO_OPTIONS, { path: "index.html", content: "<p>custom</p>" }] });
+		await env.DB.prepare("UPDATE pages SET root_index = NULL WHERE id = ?").bind(set.id).run();
+		const exists = vi.spyOn(VersionFiles.prototype, "exists");
+		try {
+			expect(await (await admin("/mockups")).text()).toContain(`<a class="shot" href="${set.url}a/"`);
+			await admin("/mockups");
+			expect(exists).toHaveBeenCalledTimes(1);
+			expect((await env.DB.prepare("SELECT root_index FROM pages WHERE id = ?").bind(set.id).first())!.root_index).toBe(1);
+		} finally {
+			exists.mockRestore();
+		}
+	});
+
+	it("keeps Enter in a note box from changing the verdict, and saves the note through the script", async () => {
+		const set = await publishMockup();
+		await verdict(set.id, { option: "a", verdict: "picked" });
+		const token = await csrf();
+		// What the form sends on Enter: its first button, save, which carries no verdict.
+		const html = await (await fragment(`/pages/${set.id}/verdict`, token, { option: "a", note_was: "", note: "keeps it" })).text();
+		expect(html).toMatch(new RegExp(`^<article class="set" id="p-${set.id}"`));
+		expect((await options(set.id))[0]).toMatchObject({ verdict: "picked", note: "keeps it" });
 	});
 
 	it("renames a set and changes its lifetime, answering the script with the set's new HTML", async () => {

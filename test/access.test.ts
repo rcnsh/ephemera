@@ -23,6 +23,7 @@ function page(overrides: Partial<Page> = {}): Page {
 		visibility: "public",
 		passwordHash: null,
 		shareEpoch: 0,
+		rootIndex: null,
 		kind: "page",
 		project: null,
 		...overrides,
