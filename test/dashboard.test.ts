@@ -2,6 +2,7 @@ import { env, reset } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PageError } from "../src/domain.ts";
 import { Operations } from "../src/operations.ts";
+import { VersionFiles } from "../src/version-files.ts";
 import { screenshots } from "../src/thumbnails.ts";
 import { ADMIN, api, call, PAGES, publish } from "./helpers.ts";
 
@@ -114,7 +115,7 @@ describe("dashboard", () => {
 		const html = await (await admin()).text();
 		expect(html).toContain(`<img src="/thumbnails/${page.id}.png?v=1"`);
 		expect(html).toContain('id="search"');
-		expect(html).toMatch(/<option>claude-code<\/option><option>codex<\/option>/);
+		expect(html).toMatch(/<option value="claude-code">claude-code<\/option><option value="codex">codex<\/option>/);
 		expect(html).toContain('data-search="chart');
 		expect((await admin()).headers.get("content-security-policy")).toContain("img-src 'self'");
 	});
@@ -483,5 +484,88 @@ describe("bulk actions", () => {
 		expect((await fragment("/bulk", csrf, [["do", "delete"], ["id", page.id]], PAGES)).status).toBe(403);
 		expect((await admin("/bulk")).status).toBe(404);
 		expect((await call(page.url)).status).toBe(200);
+	});
+});
+
+describe("agent names the browser would mangle", () => {
+	it("gives every agent option its exact value, so one with doubled spaces still filters", async () => {
+		const page = await publish({ agent: "claude  code" });
+		await publish({ agent: "codex" });
+		expect(await (await admin()).text()).toContain('<option value="claude  code">claude  code</option>');
+		const filtered = await (await admin("/?agent=claude%20%20code")).text();
+		expect(filtered).toContain('<option value="claude  code" selected>');
+		expect(cards(filtered)).toEqual(expect.arrayContaining([{ id: page.id, shown: true }]));
+		expect(filtered).toContain("1 of 2 pages");
+	});
+});
+
+describe("bulk outcomes", () => {
+	function failCleanup() {
+		return vi.spyOn(VersionFiles.prototype, "deletePage").mockRejectedValue(new Error("R2 is down"));
+	}
+
+	it("tells the script a page was deleted even when its files' cleanup failed", async () => {
+		const page = await publish();
+		const csrf = await csrfToken();
+		const spy = failCleanup();
+		try {
+			const html = await (await fragment("/bulk", csrf, [["do", "delete"], ["id", page.id]])).text();
+			expect(html).toContain(`<p class="notice" data-notice-for="${page.id}">Deleted ${page.id}; its files will be cleaned up shortly.</p>`);
+			expect(html).not.toContain("error");
+		} finally {
+			spy.mockRestore();
+		}
+		expect((await call(page.url)).status).toBe(410);
+	});
+
+	it("does the same for a single delete", async () => {
+		const page = await publish();
+		const csrf = await csrfToken();
+		const spy = failCleanup();
+		try {
+			const response = await fragment(`/pages/${page.id}/delete`, csrf);
+			expect(response.status).toBe(204);
+			expect(decodeURIComponent(response.headers.get("x-ephemera-notice")!)).toBe(`Deleted ${page.id}; its files will be cleaned up shortly.`);
+			const other = await publish();
+			const plain = await post(`/pages/${other.id}/delete`, csrf, ADMIN, {}, { referer: `${ADMIN}/?q=x` });
+			expect(plain.headers.get("location")).toBe(`/?q=x&cleanup=${other.id}`);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("carries failures and pending cleanups through the redirect when sent without script, and shows them", async () => {
+		const [a, b, c] = [await publish({ label: "alpha" }), await publish({ label: "bravo" }), await publish()];
+		const csrf = await csrfToken();
+		const real = Operations.prototype.makeTemporary;
+		const busy = vi.spyOn(Operations.prototype, "makeTemporary").mockImplementation(function (this: Operations, id: string) {
+			if (id === b.id) return Promise.reject(new PageError(409, "Page is busy"));
+			return real.call(this, id);
+		});
+		let location: string;
+		try {
+			const response = await post("/bulk", csrf, ADMIN, [["do", "temporary"], ["id", a.id], ["id", b.id]], { referer: `${ADMIN}/?q=x` });
+			location = response.headers.get("location")!;
+		} finally {
+			busy.mockRestore();
+		}
+		expect(location).toBe(`/?q=x&did=temporary&failed=${b.id}`);
+		const shown = await (await admin(location.replace("q=x&", ""))).text();
+		expect(shown).toContain("<p class=\"error\">Couldn't make temporary bravo. Try again.</p>");
+
+		const spy = failCleanup();
+		try {
+			const deleted = await post("/bulk", csrf, ADMIN, [["do", "delete"], ["id", c.id]]);
+			location = deleted.headers.get("location")!;
+		} finally {
+			spy.mockRestore();
+		}
+		expect(location).toBe(`/?cleanup=${c.id}`);
+		expect(await (await admin(location)).text()).toContain('<p class="notice">Deleted 1 page; its files will be cleaned up shortly.</p>');
+		// The next action's redirect drops the last one's outcome, so it isn't said twice.
+		const next = await post(`/pages/${a.id}/label`, csrf, ADMIN, { label: "alpha two" }, { referer: `${ADMIN}/?q=x&did=temporary&failed=${b.id}&cleanup=${c.id}` });
+		expect(next.headers.get("location")).toBe(`/?q=x#p-${a.id}`);
+		// Ids that aren't page ids never reach the page.
+		expect(await (await admin("/?did=delete&failed=%3Cb%3E")).text()).not.toMatch(/<p class="error">Couldn't/);
 	});
 });

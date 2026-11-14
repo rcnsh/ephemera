@@ -28,6 +28,9 @@ type Sort = keyof typeof SORTS;
  */
 const FRAGMENT_HEADER = "x-ephemera-fragment";
 
+/** With a 204 for a delete, what to tell the person about it (URI-encoded); see `deleteKeepingRecord`. */
+const NOTICE_HEADER = "x-ephemera-notice";
+
 /** Sent with every answer to the script, so the totals under the title stay true. URI-encoded: headers are bytes. */
 const USAGE_HEADER = "x-ephemera-usage";
 
@@ -71,6 +74,8 @@ input, select { background: #fff; border: 1px solid #bbb; border-radius: 3px; pa
 .busy { opacity: .6; cursor: progress; }
 .busy * { pointer-events: none; }
 .error { color: #b00; margin: 0; }
+#notices p { margin: 0; }
+#notices:not(:empty) { margin: 0 0 0.75rem; }
 .thumb { display: block; aspect-ratio: 16 / 10; background: #eee; }
 .thumb img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top; }
 .body { padding: .6rem .75rem .75rem; display: flex; flex-direction: column; gap: .4rem; }
@@ -316,12 +321,22 @@ function refocus(next, key) {
 	// Back in a text box, the caret goes at the end, where typing carries on.
 	if (target.tagName === "INPUT" && /^(text|search|password|)$/.test(target.getAttribute("type") || "")) target.setSelectionRange(target.value.length, target.value.length);
 }
-function swap(item, html, key) {
-	const kept = new Set($$("details[open][data-keep]", item).map((d) => d.dataset.keep));
-	const selected = $(".select", item)?.checked;
+// Swaps in a card's new HTML. Another action (a bulk one, say) may have
+// replaced the card while this request was out: then it's the card now on
+// the page that's swapped, and only if this render is no older than it
+// (data-updated is when the page last changed), so responses arriving out of
+// order can't put an older state back.
+function swap(stale, html, key) {
+	const item = stale.isConnected ? stale : document.getElementById(stale.id) || stale;
 	const template = document.createElement("template");
 	template.innerHTML = html;
 	const next = template.content.firstElementChild;
+	if (item.isConnected && Number(next.dataset.updated) < Number(item.dataset.updated)) {
+		if (key !== undefined) refocus(item, key);
+		return item;
+	}
+	const kept = new Set($$("details[open][data-keep]", item).map((d) => d.dataset.keep));
+	const selected = $(".select", item)?.checked;
 	for (const d of $$("details[data-keep]", next)) d.open = kept.has(d.dataset.keep);
 	if (selected && $(".select", next)) $(".select", next).checked = true;
 	item.replaceWith(next);
@@ -331,7 +346,9 @@ function swap(item, html, key) {
 // Removes a card, and tidies what depended on it: its project heading, the
 // agent menu, and, once nothing is left, the whole list for the empty state.
 function remove(item, focus) {
-	const after = item.nextElementSibling || item.previousElementSibling;
+	const visible = items().filter((card) => card === item || !card.closest(".hidden"));
+	const at = visible.indexOf(item);
+	const after = visible[at + 1] || visible[at - 1];
 	const project = item.closest(".project");
 	item.remove();
 	if (project && !project.querySelector(".set")) project.remove();
@@ -345,7 +362,16 @@ function remove(item, focus) {
 		if (focus) $("h1").focus({ preventScroll: true });
 		return;
 	}
-	if (focus) (after?.matches(".card, .set") ? after : $("h1")).focus({ preventScroll: true });
+	if (focus) (after || $("#count") || $("h1")).focus({ preventScroll: true });
+}
+// Says what happened to a page whose card has gone, in the line under the count.
+function notify(message) {
+	const notices = $("#notices");
+	if (!notices) return;
+	const p = document.createElement("p");
+	p.className = "notice";
+	p.textContent = message;
+	notices.append(p);
 }
 async function post(form, submitter) {
 	const body = new FormData(form);
@@ -357,7 +383,8 @@ async function post(form, submitter) {
 	if (!response.ok) throw new Error(text.trim() || "That didn't work (" + response.status + ")");
 	const usage = response.headers.get("${USAGE_HEADER}");
 	if (usage && $(".usage")) $(".usage").textContent = decodeURIComponent(usage);
-	return { body, text, status: response.status };
+	const notice = response.headers.get("${NOTICE_HEADER}");
+	return { body, text, status: response.status, notice: notice && decodeURIComponent(notice) };
 }
 document.addEventListener("submit", async (event) => {
 	const form = event.target;
@@ -377,7 +404,7 @@ document.addEventListener("submit", async (event) => {
 	busy.classList.add("busy");
 	busy.setAttribute("aria-busy", "true");
 	try {
-		const { body, text, status } = await post(form, submitter);
+		const { body, text, status, notice } = await post(form, submitter);
 		if (isBulk) {
 			const template = document.createElement("template");
 			template.innerHTML = text;
@@ -387,18 +414,28 @@ document.addEventListener("submit", async (event) => {
 				for (const old of $$(".error", card)) old.remove();
 				const fresh = template.content.getElementById("p-" + id);
 				const failed = template.content.querySelector('[data-error-for="' + id + '"]');
+				const notice = template.content.querySelector('[data-notice-for="' + id + '"]');
 				if (fresh) swap(card, fresh.outerHTML);
 				else if (failed) showError(card, failed.textContent);
-				else remove(card, false);
+				else {
+					remove(card, false);
+					if (notice) notify(notice.textContent);
+				}
 			}
 			for (const box of $$(".select")) box.checked = false;
 			form.querySelector("details")?.removeAttribute("open");
 			// The bar hides with nothing selected: focus moves to the count, which says what's left.
 			($("#count") || $("h1")).focus({ preventScroll: true });
-		} else if (status === 204) remove(item, true);
+		} else if (status === 204) {
+			remove(item, true);
+			if (notice) notify(notice);
+		}
 		else swap(item, text, key);
 		// Not re-sorted: an action changes updatedAt, and the card should stay where you are.
 		filter();
+		// The filter may have just hidden the card that had focus (renamed out of the search, say), or the one focus moved to.
+		const active = document.activeElement;
+		if (!isBulk && (!active || active === document.body || active.closest(".hidden"))) ($("#count") || $("h1")).focus({ preventScroll: true });
 		tick();
 		for (const button of $$("[data-share]")) if (navigator.share) button.hidden = false;
 	} catch (error) {
@@ -550,7 +587,7 @@ function mockupSet(page: Page, options: MockupOption[], versions: Version[], hos
 		page.permanent ? "" : `<span class="badge">${expiry(page, now)}</span>`,
 	].join(" ");
 	const verdicts = [...new Set(options.map((option) => option.verdict))].join(" ");
-	return `<article class="set${shown ? "" : " hidden"}" id="p-${page.id}" tabindex="-1" data-search="${escape(setSearch(page, options))}" data-verdicts="${verdicts}">
+	return `<article class="set${shown ? "" : " hidden"}" id="p-${page.id}" tabindex="-1" data-search="${escape(setSearch(page, options))}" data-verdicts="${verdicts}" data-updated="${page.updatedAt}">
 ${labelForm(page, csrf)}
 <p class="meta"><a href="${open}" target="_blank" rel="noopener noreferrer">${page.id}</a> <button type="button" data-copy="${url}">copy</button> · ${duration(now - page.createdAt)} old · ${bytesText(page.size)} · v${page.version} ${badges}</p>
 <div class="options">
@@ -564,12 +601,24 @@ ${versionList(page, versions, csrf, now)}
 </article>`;
 }
 
-/** What the dashboard's URL asks to see: `?q=`, `?agent=`, `?verdict=` and `?sort=`. */
+/**
+ * What the dashboard's URL asks to see: `?q=`, `?agent=`, `?verdict=` and
+ * `?sort=`; and, after a bulk action sent without script, what came of it:
+ * `?did=` (the action), `?failed=` and `?cleanup=` (comma-separated ids).
+ */
 interface View {
 	q: string;
 	agent: string;
 	verdict: string;
 	sort: Sort;
+	did: "delete" | "temporary" | null;
+	failed: string[];
+	cleanup: string[];
+}
+
+/** Ids from a comma-separated parameter, the valid ones only. */
+function idList(value: string | null): string[] {
+	return (value ?? "").split(",").filter((id) => ID_PATTERN.test(id)).slice(0, BULK_LIMIT);
 }
 
 function viewOf(url: URL): View {
@@ -579,8 +628,29 @@ function viewOf(url: URL): View {
 		agent: url.searchParams.get("agent") ?? "",
 		verdict: (VERDICTS as readonly string[]).includes(url.searchParams.get("verdict") ?? "") ? url.searchParams.get("verdict")! : "",
 		sort: sort in SORTS ? (sort as Sort) : "newest",
+		did: url.searchParams.get("did") === "delete" ? "delete" : url.searchParams.get("did") === "temporary" ? "temporary" : null,
+		failed: idList(url.searchParams.get("failed")),
+		cleanup: idList(url.searchParams.get("cleanup")),
 	};
 }
+
+const CLEANUP_NOTE = "its files will be cleaned up shortly";
+
+/** The line under the count: what came of a bulk action sent without script. Failed pages are named by label where they still exist. */
+function noticesHtml(view: View, all: Page[]): string {
+	const lines: string[] = [];
+	if (view.failed.length && view.did) {
+		const byId = new Map(all.map((page) => [page.id, page]));
+		const names = view.failed.map((id) => escape(byId.get(id)?.label ?? id)).join(", ");
+		lines.push(`<p class="error">Couldn't ${view.did === "delete" ? "delete" : "make temporary"} ${names}. Try again.</p>`);
+	}
+	if (view.cleanup.length) {
+		const n = view.cleanup.length;
+		lines.push(`<p class="notice">Deleted ${n} page${n === 1 ? "" : "s"}; ${n === 1 ? CLEANUP_NOTE : "their files will be cleaned up shortly"}.</p>`);
+	}
+	return `<div id="notices" role="status" aria-live="polite">${lines.join("")}</div>`;
+}
+
 
 function matches(text: string, q: string): boolean {
 	return q
@@ -705,7 +775,7 @@ function render(tab: Tab, { pages: all, versions, options, usage }: Overview, ho
 		const cards = pages.map((page) => card(page, versions.get(page.id) ?? [], host, csrf, now, shown(page))).join("\n");
 		body = pages.length
 			? `<form class="filters" method="get" role="search"><input type="search" id="search" name="q" value="${escape(view.q)}" placeholder="Search labels, ids, agents" aria-label="Search pages">
-<select id="agent" name="agent" aria-label="Agent"><option value="">all agents</option>${agents.map((agent) => (agent === view.agent ? selectOption(agent, agent, true) : `<option>${escape(agent)}</option>`)).join("")}</select>
+<select id="agent" name="agent" aria-label="Agent"><option value="">all agents</option>${agents.map((agent) => selectOption(agent, agent, agent === view.agent)).join("")}</select>
 <select id="sort" name="sort" aria-label="Sort by">${Object.entries(SORTS).map(([value, label]) => selectOption(value, label, value === view.sort)).join("")}</select>
 <noscript><button>apply</button></noscript></form>
 <p class="count" id="count" tabindex="-1" aria-live="polite">${countText(visible, pages.length, "page")}</p>
@@ -741,6 +811,7 @@ ${bulkBar(csrf, "/mockups")}
 		`<h1 tabindex="-1">${mark("logo", 7, 'class="logo"')}ephemera</h1>
 <p class="usage">${usageText(usage)}</p>
 <nav class="tabs">${tabLink("pages", "/", "Pages")}${tabLink("mockups", "/mockups", "Mockups")}</nav>
+${noticesHtml(view, all)}
 ${body}`,
 		nonce,
 	);
@@ -964,6 +1035,8 @@ const ACTIONS = new RegExp(`^/pages/(${ID_SOURCE})/(extend|permanent|temporary|d
  * Where an action that redirects comes back to: the tab it was sent from,
  * search and sort included, so the dashboard looks as it did. Taken from the
  * Referer when it's one of the dashboard's tabs, else the form's `back`.
+ * What came of the last action (`?did=`, `?failed=`, `?cleanup=`) is left
+ * behind: it was said once, and this action's own outcome replaces it.
  */
 function backTo(request: Request, form: FormData, adminHost: string): string {
 	const origin = `https://${adminHost}`;
@@ -971,7 +1044,10 @@ function backTo(request: Request, form: FormData, adminHost: string): string {
 		if (typeof candidate !== "string" || !candidate) continue;
 		try {
 			const url = new URL(candidate, origin);
-			if (url.origin === origin && (url.pathname === "/" || url.pathname === "/mockups")) return url.pathname + url.search;
+			if (url.origin === origin && (url.pathname === "/" || url.pathname === "/mockups")) {
+				for (const outcome of ["did", "failed", "cleanup"]) if (url.searchParams.has(outcome)) url.searchParams.delete(outcome);
+				return url.pathname + url.search;
+			}
 		} catch {
 			// Not a URL: try the next.
 		}
@@ -995,7 +1071,7 @@ async function renderOne(pages: Pages, host: string, csrf: string, id: string, n
  * `data-error-for` line per page that failed, and nothing for a page that's
  * gone: deleted, here or elsewhere, so its card goes too.
  */
-async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, form: FormData): Promise<{ html: string; status: number }> {
+async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, form: FormData): Promise<{ html: string; status: number; verb?: "delete" | "temporary"; failed?: string[]; cleanup?: string[] }> {
 	const verb = form.get("do");
 	if (verb !== "delete" && verb !== "temporary") return { html: "Unknown bulk action", status: 400 };
 	const ids = [...new Set(form.getAll("id").map(String))];
@@ -1004,13 +1080,15 @@ async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, f
 	if (!ids.every((id) => ID_PATTERN.test(id))) return { html: "Unknown page", status: 400 };
 	const errors = new Map<string, string>();
 	const changed: string[] = [];
+	const cleanup: string[] = [];
 	for (let i = 0; i < ids.length; i += BULK_BATCH) {
 		const batch = ids.slice(i, i + BULK_BATCH);
-		const results = await Promise.allSettled(batch.map((id) => (verb === "delete" ? ops.delete(id) : ops.makeTemporary(id))));
+		const results = await Promise.allSettled(batch.map((id) => (verb === "delete" ? deleteKeepingRecord(ops, pages, id) : ops.makeTemporary(id))));
 		results.forEach((result, j) => {
 			const id = batch[j]!;
 			if (result.status === "fulfilled") {
 				if (verb === "temporary") changed.push(id);
+				else if (result.value === "cleanup") cleanup.push(id);
 			} else if (result.reason instanceof PageError && (result.reason.status === 404 || result.reason.status === 410)) {
 				// Already gone: nothing to do, and its card should go.
 			} else {
@@ -1041,7 +1119,26 @@ async function bulk(ops: Operations, pages: Pages, host: string, csrf: string, f
 		}
 	}
 	for (const [id, message] of errors) parts.push(`<p class="error" data-error-for="${id}">${escape(message)}</p>`);
-	return { html: parts.join("\n"), status: 200 };
+	for (const id of cleanup) parts.push(`<p class="notice" data-notice-for="${id}">Deleted ${id}; ${CLEANUP_NOTE}.</p>`);
+	return { html: parts.join("\n"), status: 200, verb, failed: [...errors.keys()], cleanup };
+}
+
+/**
+ * Deletes a page. If something fails after the page is already deleted (its
+ * files' cleanup in R2, say), that's not a failure to delete: the page is
+ * gone and the sweep removes its files later, so this answers `"cleanup"`
+ * rather than throwing. Anything else throws as before.
+ */
+async function deleteKeepingRecord(ops: Operations, pages: Pages, id: string): Promise<"deleted" | "cleanup"> {
+	try {
+		await ops.delete(id);
+		return "deleted";
+	} catch (error) {
+		if (error instanceof PageError) throw error;
+		if ((await pages.lookup(id, { fresh: true })).state === "live") throw error;
+		console.error(`deleted ${id}, but cleaning up its files failed; the sweep will retry`, error);
+		return "cleanup";
+	}
 }
 
 /** Adds the current totals to an answer for the script (see `USAGE_HEADER`). */
@@ -1112,7 +1209,15 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 		if (form.get("do") === "") return fragment ? new Response(null, { status: 204 }) : new Response(null, { status: 303, headers: { location: back } });
 		const done = await bulk(ops, pages, env.PAGES_HOST, await csrf(), form);
 		if (done.status !== 200) return fail(done.html, done.status);
-		return fragment ? withUsage(respond(done.html, 200), pages) : new Response(null, { status: 303, headers: { location: back } });
+		if (fragment) return withUsage(respond(done.html, 200), pages);
+		// Without script, what came of it rides along in the URL for the page to say.
+		const location = new URL(back, `https://${env.ADMIN_HOST}`);
+		if (done.failed?.length) {
+			location.searchParams.set("did", done.verb!);
+			location.searchParams.set("failed", done.failed.join(","));
+		}
+		if (done.cleanup?.length) location.searchParams.set("cleanup", done.cleanup.join(","));
+		return new Response(null, { status: 303, headers: { location: location.pathname + location.search } });
 	}
 
 	const [, id, name] = match as unknown as [string, string, string];
@@ -1152,7 +1257,15 @@ export async function handleDashboard(request: Request, env: Env, ctx: Execution
 				await ops.rollback(id, Number(url.searchParams.get("version")));
 				break;
 			case "delete":
-				await ops.delete(id);
+				if ((await deleteKeepingRecord(ops, pages, id)) === "cleanup") {
+					if (fragment) {
+						const gone = new Response(null, { status: 204, headers: { [NOTICE_HEADER]: encodeURIComponent(`Deleted ${id}; ${CLEANUP_NOTE}.`) } });
+						return withUsage(gone, pages);
+					}
+					const location = new URL(back, `https://${env.ADMIN_HOST}`);
+					location.searchParams.set("cleanup", id);
+					return new Response(null, { status: 303, headers: { location: location.pathname + location.search } });
+				}
 				break;
 			case "verdict": {
 				// No verdict (the save button) keeps the verdict there is now.
