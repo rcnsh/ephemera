@@ -57,10 +57,19 @@ function escape(text: string): string {
 	return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-/** Keeps a path that gets passed along inside the page. */
+/**
+ * Keeps a path that gets passed along inside the page. It's checked decoded,
+ * since URL parsers treat "%2e%2e" as "..".
+ */
 function safeRest(rest: string): string {
 	const clean = rest.replace(/^\/+/, "");
-	return clean.split("/").some((segment) => segment === ".." || segment === ".") || clean.includes("\\") ? "" : clean;
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(clean);
+	} catch {
+		return "";
+	}
+	return decoded.split("/").some((segment) => segment === ".." || segment === ".") || decoded.includes("\\") ? "" : clean;
 }
 
 export function gate(env: Env, page: Page, rest: string, message = "", status = 401): Response {
