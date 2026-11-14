@@ -292,6 +292,16 @@ describe("storage failures", () => {
 		expect(await pageRows()).toBe(0);
 	});
 
+	it("drops a remembered row once it reads the page as deleted", async () => {
+		const { pages } = store();
+		const page = await pages.publish({ files: INDEX, ttl: "permanent" });
+		expect((await pages.lookup(page.id)).state).toBe("live");
+		// Deleted through another isolate: this one still remembers the row.
+		await env.DB.prepare("UPDATE pages SET deleted_at = ? WHERE id = ?").bind(START, page.id).run();
+		await expect(pages.get(page.id)).rejects.toMatchObject({ status: 410 });
+		expect((await pages.lookup(page.id)).state).toBe("gone");
+	});
+
 	it("never takes a live page for an abandoned reservation", async () => {
 		const { pages, clock } = store();
 		const page = await pages.publish({ files: INDEX, ttl: "permanent" });

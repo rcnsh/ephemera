@@ -269,7 +269,12 @@ export class Pages {
 		// A deleted row (a gone page, or an id reserved by a publish still
 		// running) isn't kept: a reservation comes to life when it commits, and
 		// another isolate's memo would answer 410 for it until it aged out.
-		if (writes !== before || row?.deleted_at != null) return row;
+		if (row?.deleted_at != null) {
+			// Whatever this isolate remembered of the page is stale now.
+			lookupMemo.delete(id);
+			return row;
+		}
+		if (writes !== before) return row;
 		lookupMemo.delete(id);
 		if (lookupMemo.size >= LOOKUP_MEMO_SIZE) lookupMemo.delete(lookupMemo.keys().next().value!);
 		lookupMemo.set(id, { row, at: this.now() });

@@ -396,10 +396,14 @@ async function waitForShot(env: Env, pages: Pages, page: Page, option: string | 
 		const done = outcomes.get(key);
 		if (done) return done.outcome;
 		const now = Date.now();
+		// Another request's tidying may have dropped a job this one is still waiting for.
+		if (!jobs.has(key)) jobs.set(key, { page, option, queuedAt: now, takenUntil: 0 });
 		if (lease.until <= now && [...jobs.values()].some((job) => job.takenUntil <= now)) await shoot(env, pages);
 		else await sleep(POLL);
 	}
-	return "timeout";
+	// A batch this request shot itself can run past the deadline with its own shot long done.
+	const done = outcomes.get(key);
+	return done ? done.outcome : "timeout";
 }
 
 /** Takes the lease and shoots up to `BATCH_SIZE` free jobs in one browser, keeping each shot (or its failure) in R2 as it comes. */
@@ -447,6 +451,9 @@ async function shoot(env: Env, pages: Pages): Promise<void> {
 			const { key, job } = wanted[i]!;
 			if (!jobs.has(key)) return;
 			try {
+				// The page may have been deleted or updated while its shot was queued; a thumbnail kept then would never be cleaned up.
+				const current = await pages.lookup(job.page.id, { fresh: true });
+				if (current.state !== "live" || current.page.version !== job.page.version) return finish(key, undefined);
 				if (result instanceof Uint8Array) await pages.files.saveThumbnail(job.page, result, job.option);
 				else if (result === "failed") await pages.files.saveThumbnailFailure(job.page, Date.now(), job.option);
 			} catch (error) {
@@ -476,7 +483,8 @@ async function shoot(env: Env, pages: Pages): Promise<void> {
  * browser could be had, or the shot took too long, the next load tries again.
  */
 async function thumbnail(env: Env, pages: Pages, id: string, option?: string): Promise<Response> {
-	const found = await pages.lookup(id);
+	// Read fresh: a shot of a page that has just gone private, taken from a stale row, would photograph its gate and be kept.
+	const found = await pages.lookup(id, { fresh: true });
 	if (found.state !== "live" || (option !== undefined && found.page.kind !== "mockup")) return new Response("Not found", { status: 404 });
 	const page = found.page;
 	const headers = { "content-type": "image/png", "cache-control": "private, max-age=86400" };
